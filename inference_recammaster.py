@@ -11,6 +11,37 @@ from PIL import Image
 import numpy as np
 import json
 
+def save_video_from_tensor(source_video: torch.Tensor, 
+      output_dir: str, batch_idx: int, fps: int = 30):
+    """
+    将PyTorch张量保存为视频文件 (使用 imageio)。
+
+    Args:
+        source_video (torch.Tensor): 输入张量，形状为 (C, T, H, W)。
+        output_dir (str): 保存视频文件的目录。
+        batch_idx (int): 要包含在文件名中的批处理索引。
+        fps (int, optional): 输出视频的每秒帧数。默认为 30。
+    """
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 将张量从 (C, T, H, W) 转换为 (T, H, W, C)
+    video_tensor = source_video.permute(1, 2, 3, 0)
+
+    # 将浮点张量 (假设范围为 [-1, 1] or [0, 1]) 转换为 uint8 [0, 255]
+    # 归一化到 [0, 1]
+    video_tensor = (video_tensor - video_tensor.min()) / (video_tensor.max() - video_tensor.min())
+    video_tensor = (video_tensor.clamp(0, 1) * 255).to(torch.uint8)
+
+    # 转换为 NumPy 数组
+    video_np = video_tensor.cpu().numpy()
+
+    # 定义输出路径
+    output_path = os.path.join(output_dir, f"source_video_{batch_idx}.mp4")
+
+    # 使用 imageio 保存视频
+    imageio.mimsave(output_path, video_np, fps=fps)
+
 class Camera(object):
     def __init__(self, c2w):
         c2w_mat = np.array(c2w).reshape(4, 4)
@@ -125,7 +156,17 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             raise ValueError(f"{path} is not a valid video.")
         num_frames = video.shape[1]
         assert num_frames == 81
-        data = {"text": text, "video": video, "path": path}
+        
+        video_static = video[:,0,:,:]
+        video_static = video_static.unsqueeze(1)  # C, 1, H, W
+        video_static = video_static.repeat(1, num_frames, 1, 1)
+        ## check video and video_static type and shape
+
+        data = {"text": text, "video": video_static, "path": path}
+        
+        ## TEST: static scene
+
+        
 
         # load camera
         tgt_camera_path = "./example_test_data/cameras/camera_extrinsics.json"
@@ -218,7 +259,39 @@ if __name__ == '__main__':
 
     # 3. Load ReCamMaster checkpoint
     state_dict = torch.load(args.ckpt_path, map_location="cpu")
-    pipe.dit.load_state_dict(state_dict, strict=True)
+
+    # --- Start: Gemini Coder fix for state_dict key mismatch ---
+    # The checkpoint might be nested or have a prefix. Let's inspect and fix it.
+    
+    # If the checkpoint is a dictionary containing the state_dict, extract it.
+    if 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
+
+    # Common prefixes to check for and remove
+    prefixes_to_remove = ['model.', 'module.', 'pipe.dit.']
+    
+    # Check if any keys have a common prefix
+    has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
+
+    if has_prefix:
+        print("Prefix detected in checkpoint keys. Attempting to strip them.")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            for p in prefixes_to_remove:
+                if k.startswith(p):
+                    k = k[len(p):]
+                    break
+            new_state_dict[k] = v
+        state_dict = new_state_dict
+        print("Prefixes stripped. Using the new state_dict.")
+
+    # print("--- First 5 Model Keys ---")
+    # print(list(pipe.dit.state_dict().keys())[:5])
+    # print("--- First 5 Checkpoint Keys ---")
+    # print(list(state_dict.keys())[:5])
+    
+    pipe.dit.load_state_dict(state_dict, strict=False)
+    # --- End: Gemini Coder fix ---
     pipe.to("cuda")
     pipe.to(dtype=torch.bfloat16)
 
@@ -255,3 +328,4 @@ if __name__ == '__main__':
             seed=0, tiled=True
         )
         save_video(video, os.path.join(output_dir, f"video{batch_idx}.mp4"), fps=30, quality=5)
+        save_video_from_tensor(source_video[0], output_dir, batch_idx, fps=30)

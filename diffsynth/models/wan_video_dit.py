@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from prope import _prepare_apply_fns
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
@@ -144,6 +145,52 @@ class SelfAttention(nn.Module):
         return self.o(x)
 
 
+class PRoPE_SelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        
+        self.attn = AttentionModule(self.num_heads)
+
+    def forward(self, x, freqs,viewmats,Ks=None):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(x))
+        v = self.v(x)
+        
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
+        head_dim=self.dim,
+        viewmats=viewmats,
+        Ks=Ks,
+        patches_x=52,
+        patches_y=30,
+        image_width=832,
+        image_height=480,
+        coeffs_x=None,
+        coeffs_y=None,
+    )
+        q = rope_apply(q, freqs, self.num_heads)
+        k = rope_apply(k, freqs, self.num_heads)
+        
+        assert len(q.shape) == len(k.shape) ==len(v.shape) ==3
+##  EXP: o的位置
+        q = apply_fn_q(q)
+        k = apply_fn_kv(k)
+        v = apply_fn_kv(v)
+        x = self.attn(q, k, v)
+        x = apply_fn_o(x)
+        o = self.o(x)
+        return o
+
+
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False):
         super().__init__()
@@ -190,7 +237,8 @@ class DiTBlock(nn.Module):
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
+        self.self_attn = PRoPE_SelfAttention(dim, num_heads, eps)
+        # self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -205,14 +253,28 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-
+        # cam_emb: torch.Size([1, 21, 12])
+        # x.shape   torch.Size([1, 65520, 1536]) 
         # encode camera
-        cam_emb = self.cam_encoder(cam_emb)
-        cam_emb = cam_emb.repeat(1, 2, 1)
-        cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, 30, 52, 1)
-        cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
-        input_x = input_x + cam_emb
-        x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
+
+        N = cam_emb.shape[1]
+        reshaped_cam_emb = cam_emb.view(N, 3, 4)
+        bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device)
+        bottom_row = bottom_row.unsqueeze(0).expand(N, -1, -1)
+        cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=1)
+        cam_emb = cam_emb.unsqueeze(0)
+        cam_emb = cam_emb.repeat(1,2,1,1)
+        
+        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=cam_emb.device).unsqueeze(0).repeat(2*N,1,1).unsqueeze(0)
+        x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
+
+
+        # cam_emb = self.cam_encoder(cam_emb)
+        # cam_emb = cam_emb.repeat(1, 2, 1)
+        # cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, 30, 52, 1)
+        # cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
+        # input_x = input_x + cam_emb
+        # x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
         
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)

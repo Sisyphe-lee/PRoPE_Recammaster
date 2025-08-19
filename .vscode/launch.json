@@ -1,0 +1,52 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 懸停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_recammaster.py",
+            "args": [
+                "--task",
+                "train"
+            ],
+            "console": "integratedTerminal",
+            "python": "/home/cyli/anaconda3/envs/recammaster/bin/python"
+        },
+        {
+            "name": "Python: Attach to Remote",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 6869,
+            },
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}",
+                    "remoteRoot": "."
+                }
+            ]
+        }
+    ]
+    // "configurations": [
+    //     {
+    //         "name": "Python: Current File",
+    //         "type": "python",
+    //         "request": "launch",
+    //         "program": "${workspaceFolder}/generate_caption.py",
+    //         // "args": ["--cam_type", "1"],
+    //         "console": "integratedTerminal",
+    //         "python": "/home/cyli/anaconda3/envs/caption_gen/bin/python",
+    //         "env": {
+    //                 "http_proxy": "",
+    //                 "https_proxy": "",
+    //                 "all_proxy": ""
+    //             }
+    //     }
+    // ]
+}
