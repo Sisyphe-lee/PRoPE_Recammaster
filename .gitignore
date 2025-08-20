@@ -1,5 +1,6 @@
 *__pycache__
 *.ckpt
+*.whl
 Wan-AI
 
 # Folders with results and models

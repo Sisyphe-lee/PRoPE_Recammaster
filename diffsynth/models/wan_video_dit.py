@@ -263,9 +263,12 @@ class DiTBlock(nn.Module):
         bottom_row = bottom_row.unsqueeze(0).expand(N, -1, -1)
         cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=1)
         cam_emb = cam_emb.unsqueeze(0)
-        cam_emb = cam_emb.repeat(1,2,1,1)
         
-        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=cam_emb.device).unsqueeze(0).repeat(2*N,1,1).unsqueeze(0)
+        
+        # cam_emb = cam_emb.repeat(1,2,1,1)
+        N = cam_emb.shape[1]
+        
+        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=cam_emb.device).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
         x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
 
 

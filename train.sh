@@ -7,7 +7,7 @@ OUTPUT_DIR="./models/train"
 # If you want to train from scratch, you can remove the --resume_ckpt_path line.
 RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/ReCamMaster/checkpoints/step20000.ckpt"
 
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,7" python train_recammaster.py  \
+CUDA_VISIBLE_DEVICES="2,3,4,5,6,7" python train_recammaster.py  \
  --task train  \
  --dataset_path /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10  \
  --output_path "$OUTPUT_DIR"   \
@@ -15,8 +15,9 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,7" python train_recammaster.py  \
  --vae_path "$MODEL_BASE_PATH/Wan2.1_VAE.pth"   \
  --steps_per_epoch 4000   \
  --max_epochs 100   \
- --learning_rate 1e-4   \
+ --learning_rate 5e-5   \
  --accumulate_grad_batches 4   \
  --use_gradient_checkpointing  \
  --dataloader_num_workers 4 \
- --resume_ckpt_path "$RESUME_CHECKPOINT_PATH"
+ --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
+#  --debug

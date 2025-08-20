@@ -251,12 +251,22 @@ class TensorDataset(torch.utils.data.Dataset):
                     multiview_c2ws.append(c2ws)
                 cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
                 tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
-                relative_poses = []
-                for i in range(len(tgt_cam_params)):
-                    relative_pose = self.get_relative_pose([cond_cam_params[0], tgt_cam_params[i]])
-                    relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
-                pose_embedding = torch.stack(relative_poses, dim=0)  # 21x3x4
-                pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
+                
+                # relative_poses = []
+                # for i in range(len(tgt_cam_params)):
+                #     relative_pose = self.get_relative_pose([cond_cam_params[0], tgt_cam_params[i]])
+                #     relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
+                # pose_embedding = torch.stack(relative_poses, dim=0)  # 21x3x4
+                # pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
+                
+                
+                cond_poses = torch.tensor(np.array([p.c2w_mat[:3,:] for p in  cond_cam_params]), dtype=torch.float32)
+                tgt_poses = torch.tensor(np.array([p.c2w_mat[:3,:] for p in tgt_cam_params]), dtype=torch.float32)
+                cond_embedding = rearrange(cond_poses, 'b c d -> b (c d)')                           
+                tgt_embedding = rearrange(tgt_poses, 'b c d -> b (c d)')                             
+                pose_embedding = torch.cat([cond_embedding, tgt_embedding], dim=0)
+                
+                
                 data['camera'] = pose_embedding.to(torch.bfloat16)
                 break
             except Exception as e:
@@ -358,6 +368,62 @@ class LightningModelForTrain(pl.LightningModule):
         self.pipe.requires_grad_(False)
         self.pipe.eval()
         self.pipe.denoising_model().train()
+
+    def decode_video_and_log(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep):
+        # 1. PREPARE PREDICTED AND GT LATENTS
+        # Prepare predicted latent
+        noise_pred_sample = noise_pred[0:1, :, :tgt_latent_len, ...]
+        noisy_latents_sample = noisy_latents[0:1, :, :tgt_latent_len, ...]
+
+        # For FlowMatch, the formula to get the original sample is: noisy_sample - sigma * velocity
+        # Here, noise_pred is the velocity. We need to find the sigma for the current timestep.
+        with torch.no_grad():
+            timestep_id_index = torch.argmin(torch.abs(self.pipe.scheduler.timesteps.to(self.device) - timestep))
+        sigma = self.pipe.scheduler.sigmas[timestep_id_index].to(self.device)
+        pred_original_sample = noisy_latents_sample - sigma * noise_pred_sample
+
+        # Prepare ground truth latent
+        gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
+
+        # 2. DECODE BOTH (load VAE only once for efficiency)
+        self.pipe.load_models_to_device(['vae'])
+        
+        # Decode prediction
+        pred_frames_tensor = self.pipe.decode_video(pred_original_sample.to(dtype=self.pipe.torch_dtype))[0]
+        
+        # Decode ground truth
+        gt_frames_tensor = self.pipe.decode_video(gt_original_sample.to(dtype=self.pipe.torch_dtype))[0]
+        
+        self.pipe.load_models_to_device([])
+
+        # 3. CALCULATE PSNR
+        # Normalize frame tensors from [-1, 1] to [0, 1] for PSNR calculation
+        pred_frames_norm = (pred_frames_tensor.clamp(-1, 1) + 1) / 2
+        gt_frames_norm = (gt_frames_tensor.clamp(-1, 1) + 1) / 2
+        
+        # Calculate MSE and then PSNR
+        mse = torch.nn.functional.mse_loss(pred_frames_norm, gt_frames_norm)
+        psnr_value = 100.0 if mse == 0 else 20 * torch.log10(1.0 / torch.sqrt(mse))
+            
+        # 4. LOG TO WANDB
+        self.log("val/psnr", psnr_value, on_step=True, on_epoch=False, prog_bar=True, logger=True, rank_zero_only=True)
+
+        # 5. SAVE VIDEOS
+        # Convert tensors to video format (list of numpy arrays)
+        
+        pred_video_frames = self.pipe.tensor2video(pred_frames_tensor)
+        gt_video_frames = self.pipe.tensor2video(gt_frames_tensor)
+        
+        # Ensure the output path exists
+        os.makedirs(self.latent_path, exist_ok=True)
+        
+        # Save predicted video
+        pred_video_path = os.path.join(self.latent_path, f"{self.global_step}_pred.mp4")
+        imageio.mimsave(pred_video_path, pred_video_frames, fps=8, quality=8)
+        
+        # Save ground truth video
+        gt_video_path = os.path.join(self.latent_path, f"{self.global_step}_gt.mp4")
+        imageio.mimsave(gt_video_path, gt_video_frames, fps=8, quality=8)
         
     def training_step(self, batch, batch_idx):
         # Data
@@ -370,7 +436,7 @@ class LightningModelForTrain(pl.LightningModule):
             image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
-        
+
         cam_emb = batch["camera"].to(self.device)
 
         # Loss
@@ -392,62 +458,10 @@ class LightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
 
-        if self.global_rank == 0 and self.global_step > 0 and self.global_step % 20 == 0:
+        if self.global_rank == 0 and self.global_step % 10 == 0:
             try:
                 with torch.no_grad():
-                    # 1. PREPARE PREDICTED AND GT LATENTS
-                    # Prepare predicted latent
-                    noise_pred_sample = noise_pred[0:1, :, :tgt_latent_len, ...]
-                    noisy_latents_sample = noisy_latents[0:1, :, :tgt_latent_len, ...]
-
-                    # For FlowMatch, the formula to get the original sample is: noisy_sample - sigma * velocity
-                    # Here, noise_pred is the velocity. We need to find the sigma for the current timestep.
-                    with torch.no_grad():
-                        timestep_id_index = torch.argmin(torch.abs(self.pipe.scheduler.timesteps.to(self.device) - timestep))
-                    sigma = self.pipe.scheduler.sigmas[timestep_id_index].to(self.device)
-                    pred_original_sample = noisy_latents_sample - sigma * noise_pred_sample
-
-                    # Prepare ground truth latent
-                    gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
-
-                    # 2. DECODE BOTH (load VAE only once for efficiency)
-                    self.pipe.load_models_to_device(['vae'])
-                    
-                    # Decode prediction
-                    pred_frames_tensor = self.pipe.decode_video(pred_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-                    
-                    # Decode ground truth
-                    gt_frames_tensor = self.pipe.decode_video(gt_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-                    
-                    self.pipe.load_models_to_device([])
-
-                    # 3. CALCULATE PSNR
-                    # Normalize frame tensors from [-1, 1] to [0, 1] for PSNR calculation
-                    pred_frames_norm = (pred_frames_tensor.clamp(-1, 1) + 1) / 2
-                    gt_frames_norm = (gt_frames_tensor.clamp(-1, 1) + 1) / 2
-                    
-                    # Calculate MSE and then PSNR
-                    mse = torch.nn.functional.mse_loss(pred_frames_norm, gt_frames_norm)
-                    psnr_value = 100.0 if mse == 0 else 20 * torch.log10(1.0 / torch.sqrt(mse))
-                        
-                    # 4. LOG TO WANDB
-                    self.log("val/psnr", psnr_value, on_step=True, on_epoch=False, prog_bar=True, logger=True, rank_zero_only=True)
-
-                    # 5. SAVE VIDEOS
-                    # Convert tensors to video format (list of numpy arrays)
-                    pred_video_frames = self.pipe.tensor2video(pred_frames_tensor)
-                    gt_video_frames = self.pipe.tensor2video(gt_frames_tensor)
-                    
-                    # Ensure the output path exists
-                    os.makedirs(self.latent_path, exist_ok=True)
-                    
-                    # Save predicted video
-                    pred_video_path = os.path.join(self.latent_path, f"{self.global_step}_pred.mp4")
-                    imageio.mimsave(pred_video_path, pred_video_frames, fps=8, quality=8)
-                    
-                    # Save ground truth video
-                    gt_video_path = os.path.join(self.latent_path, f"{self.global_step}_gt.mp4")
-                    imageio.mimsave(gt_video_path, gt_video_frames, fps=8, quality=8)
+                    self.decode_video_and_log(noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep)
             except Exception as e:
                     print(f"Rank {self.global_rank} failed to generate validation video at step {self.global_step}:  Error: {e}")
 
@@ -698,7 +712,7 @@ def train(args):
     if args.debug:
         print("Debug mode is enabled.") 
         import debugpy
-        debugpy.listen(6869)
+        debugpy.listen(6867)
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
@@ -731,9 +745,10 @@ def train(args):
 
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
+        wandb_name = f"{time_str}_{args.wandb_name}"
         wandb_logger = WandbLogger(
             project=args.wandb_project,
-            name=args.wandb_name,
+            name=wandb_name,
             config=vars(args),
             save_dir=os.path.join(args.output_path, "wandb"),
         )
