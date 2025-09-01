@@ -174,8 +174,8 @@ class Camera(object):
 
 class TensorDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, steps_per_epoch):
-        metadata = pd.read_csv('./metadata.csv')
-        self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["video_absolute_path"]]
+        metadata = pd.read_csv('/data1/lcy/projects/ReCamMaster/metadata_inference.csv')
+        self.path = [os.path.join(file_name) for file_name in metadata["file_name"]]
         print(len(self.path), "videos in metadata.")
         self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
         print(len(self.path), "tensors cached in metadata.")
@@ -252,22 +252,34 @@ class TensorDataset(torch.utils.data.Dataset):
                 cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
                 tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
                 
-                # relative_poses = []
-                # for i in range(len(tgt_cam_params)):
-                #     relative_pose = self.get_relative_pose([cond_cam_params[0], tgt_cam_params[i]])
-                #     relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
-                # pose_embedding = torch.stack(relative_poses, dim=0)  # 21x3x4
-                # pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-                
-                
-                cond_poses = torch.tensor(np.array([p.c2w_mat[:3,:] for p in  cond_cam_params]), dtype=torch.float32)
-                tgt_poses = torch.tensor(np.array([p.c2w_mat[:3,:] for p in tgt_cam_params]), dtype=torch.float32)
-                cond_embedding = rearrange(cond_poses, 'b c d -> b (c d)')                           
-                tgt_embedding = rearrange(tgt_poses, 'b c d -> b (c d)')                             
+                # --- Start: Calculate relative camera poses ---
+                # The reference pose is the first frame of the conditional camera trajectory.
+                ref_cam = cond_cam_params[0]
+
+                # Calculate relative poses for the conditional trajectory
+                relative_cond_poses = []
+                for i in range(len(cond_cam_params)):
+                    # get_relative_pose expects a list of [reference_camera, target_camera]
+                    # It returns an array where the second element is the relative pose of the target.
+                    relative_pose_matrix = self.get_relative_pose([ref_cam, cond_cam_params[i]])
+                    relative_cond_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
+
+                # Calculate relative poses for the target trajectory
+                relative_tgt_poses = []
+                for i in range(len(tgt_cam_params)):
+                    relative_pose_matrix = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
+                    relative_tgt_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
+
+                # Stack, rearrange, and concatenate to form the final pose embedding
+                cond_embedding = torch.stack(relative_cond_poses, dim=0)
+                tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
+                cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
+                tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
                 pose_embedding = torch.cat([cond_embedding, tgt_embedding], dim=0)
+                # --- End: Calculate relative camera poses ---
                 
                 
-                data['camera'] = pose_embedding.to(torch.bfloat16)
+                data['camera'] = tgt_embedding.to(torch.bfloat16)
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
@@ -361,6 +373,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.learning_rate = learning_rate
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.last_decode_step = -1
         
         
     def freeze_parameters(self):
@@ -458,12 +471,13 @@ class LightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
 
-        if self.global_rank == 0 and self.global_step % 10 == 0:
+        if self.global_rank == 0 and self.global_step % 10 == 0 and self.last_decode_step != self.global_step:
+            self.last_decode_step = self.global_step
             try:
                 with torch.no_grad():
                     self.decode_video_and_log(noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep)
             except Exception as e:
-                    print(f"Rank {self.global_rank} failed to generate validation video at step {self.global_step}:  Error: {e}")
+                print(f"Rank {self.global_rank} failed to generate validation video at step {self.global_step}:  Error: {e}")
 
         loss = torch.nn.functional.mse_loss(noise_pred[:, :, :tgt_latent_len, ...].float(), training_target[:, :, :tgt_latent_len, ...].float())
         loss = loss * self.pipe.scheduler.training_weight(timestep)
@@ -718,7 +732,7 @@ def train(args):
         print('Attached, continue...')
     dataset = TensorDataset(
         args.dataset_path,
-        os.path.join(args.dataset_path, "metadata.csv"),
+        "/data1/lcy/projects/ReCamMaster/metadata_inference.csv",
         steps_per_epoch=args.steps_per_epoch,
     )
     dataloader = torch.utils.data.DataLoader(

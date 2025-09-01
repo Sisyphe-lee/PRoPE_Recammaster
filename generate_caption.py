@@ -47,7 +47,8 @@ def generate_internlm_captions(
     path: str = "/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10", 
     model_type: str = 'internlmx',
     category: str = 'all',
-    gpu_id: int = 4
+    gpu_id: int = 4,
+    gpu_count: int = 8
 ):    
     # init model and tokenizer
     if model_type == 'internlmx':
@@ -61,35 +62,8 @@ def generate_internlm_captions(
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float16).cuda()
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    basedirs = []
-    if "dl3dv" in path.lower(): #prasing dl3dv
-        img_folder_name = 'images_4'
-        for scene_id in tqdm(sorted(os.listdir(os.path.join(path))), desc="Searching basedirs", leave=False):
-            if not os.path.isdir(os.path.join(path, scene_id)) or not os.path.exists(os.path.join(path, scene_id, img_folder_name)) or \
-                os.path.exists(os.path.join(path, scene_id, 'captions.txt')):
-                continue
-            basedirs.append(os.path.join(path, scene_id))
-    elif "multicamvideo" in path.lower():
-        img_folder_name = 'videos'
-        for scene_id in tqdm(sorted(os.listdir(os.path.join(path))), desc="Searching basedirs", leave=False):
-            if not os.path.isdir(os.path.join(path, scene_id)) or not os.path.exists(os.path.join(path, scene_id, img_folder_name)) or \
-                os.path.exists(os.path.join(path, scene_id, 'captions.txt')):
-                continue
-            basedirs.append(os.path.join(path, scene_id))
-    else:
-        raise ValueError
-    
-    result = subprocess.run(['nvidia-smi', '-L'], stdout=subprocess.PIPE, text=True)
-    gpu_count = result.stdout.count('GPU ')
-
-    begin, end = int(gpu_id * len(basedirs)//gpu_count), int((gpu_id + 1) * len(basedirs)//gpu_count)
-    if gpu_id == gpu_count - 1:
-        basedirs = basedirs[begin:]
-    else:
-        basedirs = basedirs[begin:end]
-
     # --- CSV INITIALIZATION & PROCESSED VIDEO CHECK ---
-    output_csv_path = "metadata.csv"
+    output_csv_path = "metadata_debug.csv"
     processed_videos = set()
     if os.path.exists(output_csv_path):
         with open(output_csv_path, 'r', newline='', encoding='utf-8') as f:
@@ -106,10 +80,57 @@ def generate_internlm_captions(
             writer = csv.writer(f)
             writer.writerow(["video_absolute_path", "caption"])
 
+    # --- GATHER ALL SCENES (BASEDIRS) ---
+    all_basedirs = []
+    img_folder_name = ''
+    if "multicamvideo" in path.lower():
+        img_folder_name = 'videos'
+        for scene_id in tqdm(sorted(os.listdir(os.path.join(path))), desc="Searching for all scenes", leave=False):
+            if not os.path.isdir(os.path.join(path, scene_id)) or not os.path.exists(os.path.join(path, scene_id, img_folder_name)) or \
+                os.path.exists(os.path.join(path, scene_id, 'captions.txt')):
+                continue
+            all_basedirs.append(os.path.join(path, scene_id))
+    else:
+        raise ValueError
 
+    # --- FILTER SCENES TO FIND THOSE REQUIRING PROCESSING ---
+    pending_basedirs = []
+    for basedir in tqdm(all_basedirs, desc="Checking scene completion status"):
+        video_folder_path = os.path.join(basedir, img_folder_name)
+        try:
+            filenames = [f for f in sorted(os.listdir(video_folder_path)) if f.endswith('mp4')]
+        except FileNotFoundError:
+            continue
+
+        if not filenames:
+            continue
+
+        num_videos_in_scene = len(filenames)
+        processed_count = 0
+        for filename in filenames:
+            video_abs_path = os.path.abspath(os.path.join(video_folder_path, filename))
+            if video_abs_path in processed_videos:
+                processed_count += 1
+        
+        if processed_count < num_videos_in_scene:
+            pending_basedirs.append(basedir)
+
+    tqdm.write(f"Found {len(all_basedirs)} total scenes. {len(pending_basedirs)} scenes require processing.")
+
+    # --- DISTRIBUTE PENDING SCENES AMONG GPUS ---
+    if len(pending_basedirs) > 0:
+        begin, end = int(gpu_id * len(pending_basedirs)//gpu_count), int((gpu_id + 1) * len(pending_basedirs)//gpu_count)
+        if gpu_id == gpu_count - 1:
+            basedirs = pending_basedirs[begin:]
+        else:
+            basedirs = pending_basedirs[begin:end]
+    else:
+        basedirs = []
+
+    tqdm.write(f"GPU {gpu_id} is processing {len(basedirs)} scenes.")
 
     # loop over data
-    for idx, basedir in enumerate(tqdm(basedirs, desc="Generate Captions")):
+    for idx, basedir in enumerate(tqdm(basedirs, desc=f"GPU {gpu_id} - Generate Captions")):
         # get sequence, category from batch
         filenames = [f for f in sorted(os.listdir(os.path.join(basedir, img_folder_name))) if (f.endswith('mp4'))]
         for filename in tqdm(filenames, desc="Generate Captions in One Scene"):

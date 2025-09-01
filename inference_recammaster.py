@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData
 import torch, os, imageio, argparse
+from datetime import datetime
 from torchvision.transforms import v2
 from einops import rearrange
 import pandas as pd
@@ -10,37 +11,6 @@ import torchvision
 from PIL import Image
 import numpy as np
 import json
-
-def save_video_from_tensor(source_video: torch.Tensor, 
-      output_dir: str, batch_idx: int, fps: int = 30):
-    """
-    将PyTorch张量保存为视频文件 (使用 imageio)。
-
-    Args:
-        source_video (torch.Tensor): 输入张量，形状为 (C, T, H, W)。
-        output_dir (str): 保存视频文件的目录。
-        batch_idx (int): 要包含在文件名中的批处理索引。
-        fps (int, optional): 输出视频的每秒帧数。默认为 30。
-    """
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 将张量从 (C, T, H, W) 转换为 (T, H, W, C)
-    video_tensor = source_video.permute(1, 2, 3, 0)
-
-    # 将浮点张量 (假设范围为 [-1, 1] or [0, 1]) 转换为 uint8 [0, 255]
-    # 归一化到 [0, 1]
-    video_tensor = (video_tensor - video_tensor.min()) / (video_tensor.max() - video_tensor.min())
-    video_tensor = (video_tensor.clamp(0, 1) * 255).to(torch.uint8)
-
-    # 转换为 NumPy 数组
-    video_np = video_tensor.cpu().numpy()
-
-    # 定义输出路径
-    output_path = os.path.join(output_dir, f"source_video_{batch_idx}.mp4")
-
-    # 使用 imageio 保存视频
-    imageio.mimsave(output_path, video_np, fps=fps)
 
 class Camera(object):
     def __init__(self, c2w):
@@ -51,7 +21,7 @@ class Camera(object):
 class TextVideoCameraDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, args, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
-        self.path = [os.path.join(base_path, "videos", file_name) for file_name in metadata["file_name"]]
+        self.path = [os.path.join(file_name) for file_name in metadata["file_name"]]
         self.text = metadata["text"].to_list()
         
         self.max_num_frames = max_num_frames
@@ -156,40 +126,68 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             raise ValueError(f"{path} is not a valid video.")
         num_frames = video.shape[1]
         assert num_frames == 81
-        
-        video_static = video[:,0,:,:]
-        video_static = video_static.unsqueeze(1)  # C, 1, H, W
-        video_static = video_static.repeat(1, num_frames, 1, 1)
-        ## check video and video_static type and shape
+        data = {"text": text, "video": video, "path": path}
 
-        data = {"text": text, "video": video_static, "path": path}
-        
-        ## TEST: static scene
-
-        
-
-        # load camera
-        tgt_camera_path = "./example_test_data/cameras/camera_extrinsics.json"
+        # load camera: derive target camera json path and condition cam id from video path
+        # Example path: /.../scene3294/videos/cam10.mp4
+        # -> cond_cam_type_id = 10
+        # -> tgt_camera_path = /.../scene3294/cameras/camera_extrinsics.json
+        videos_dir = os.path.dirname(path)
+        scene_dir = os.path.dirname(videos_dir)
+        tgt_camera_path = os.path.join(scene_dir, "cameras", "camera_extrinsics.json")
         with open(tgt_camera_path, 'r') as file:
             cam_data = json.load(file)
 
         cam_idx = list(range(num_frames))[::4]
-        traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(self.cam_type):02d}"]) for idx in cam_idx]
-        traj = np.stack(traj).transpose(0, 2, 1)
-        c2ws = []
-        for c2w in traj:
+
+        # 1) Use the cam id parsed from file name as the condition video pose
+        cam_fname = os.path.basename(path)  # e.g., cam10.mp4
+        cam_stem = os.path.splitext(cam_fname)[0]  # cam10
+        cond_cam_type_id = int(cam_stem[3:]) if cam_stem.startswith("cam") and cam_stem[3:].isdigit() else 6
+        cond_traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cond_cam_type_id):02d}"]) for idx in cam_idx]
+        cond_traj = np.stack(cond_traj).transpose(0, 2, 1)
+        cond_c2ws = []
+        for c2w in cond_traj:
             c2w = c2w[:, [1, 2, 0, 3]]
             c2w[:3, 1] *= -1.
             c2w[:3, 3] /= 100
-            c2ws.append(c2w)
-        tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
-        relative_poses = []
-        for i in range(len(tgt_cam_params)):
-            relative_pose = self.get_relative_pose([tgt_cam_params[0], tgt_cam_params[i]])
-            relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
-        pose_embedding = torch.stack(relative_poses, dim=0)  # 21x3x4
-        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-        data['camera'] = pose_embedding.to(torch.bfloat16)
+            cond_c2ws.append(c2w)
+        cond_cam_params = [Camera(cam_param) for cam_param in cond_c2ws]
+        ref_cam = cond_cam_params[0]
+        # 2) Compute condition poses relative to its own first frame
+        cond_relative_poses = []
+        for i in range(len(cond_cam_params)):
+            cond_relative_pose = self.get_relative_pose([ref_cam, cond_cam_params[i]])
+            cond_relative_poses.append(torch.as_tensor(cond_relative_pose)[:,:3,:][1])
+        cond_pose_embedding = torch.stack(cond_relative_poses, dim=0)  # 21x3x4
+        cond_pose_embedding = rearrange(cond_pose_embedding, 'b c d -> b (c d)')  # 21x12
+
+        # 3) For each target camera, compute relative poses using condition's first frame as reference
+        camera_list = []
+        for cam_type_id in range(1, 11):
+            traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type_id):02d}"]) for idx in cam_idx]
+            traj = np.stack(traj).transpose(0, 2, 1)
+            c2ws = []
+            for c2w in traj:
+                c2w = c2w[:, [1, 2, 0, 3]]
+                c2w[:3, 1] *= -1.
+                c2w[:3, 3] /= 100
+                c2ws.append(c2w)
+            tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
+
+            tgt_relative_poses = []
+            for i in range(len(tgt_cam_params)):
+                # Use condition's first frame as the reference instead of target's first frame
+                relative_pose = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
+                tgt_relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
+            tgt_pose_embedding = torch.stack(tgt_relative_poses, dim=0)  # 21x3x4
+            tgt_pose_embedding = rearrange(tgt_pose_embedding, 'b c d -> b (c d)')  # 21x12
+
+            # 4) Concatenate condition pose and target pose along the feature dimension
+            combined_embedding = torch.cat([cond_pose_embedding, tgt_pose_embedding], dim=0)  # 42x12
+            camera_list.append(combined_embedding.to(torch.bfloat16))
+
+        data['camera'] = camera_list
         return data
     
 
@@ -259,18 +257,12 @@ if __name__ == '__main__':
 
     # 3. Load ReCamMaster checkpoint
     state_dict = torch.load(args.ckpt_path, map_location="cpu")
-
-    # --- Start: Gemini Coder fix for state_dict key mismatch ---
-    # The checkpoint might be nested or have a prefix. Let's inspect and fix it.
-    
-    # If the checkpoint is a dictionary containing the state_dict, extract it.
+    # Check if any keys have a common prefix
     if 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
 
     # Common prefixes to check for and remove
     prefixes_to_remove = ['model.', 'module.', 'pipe.dit.']
-    
-    # Check if any keys have a common prefix
     has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
 
     if has_prefix:
@@ -285,17 +277,14 @@ if __name__ == '__main__':
         state_dict = new_state_dict
         print("Prefixes stripped. Using the new state_dict.")
 
-    # print("--- First 5 Model Keys ---")
-    # print(list(pipe.dit.state_dict().keys())[:5])
-    # print("--- First 5 Checkpoint Keys ---")
-    # print(list(state_dict.keys())[:5])
-    
-    pipe.dit.load_state_dict(state_dict, strict=False)
-    # --- End: Gemini Coder fix ---
+    # 3.1 Load ReCamMaster checkpoint
+    pipe.dit.load_state_dict(state_dict, strict=True)
     pipe.to("cuda")
     pipe.to(dtype=torch.bfloat16)
 
-    output_dir = os.path.join(args.output_dir, f"cam_type{args.cam_type}")
+    # Create timestamped output directory under ./result
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join("./result", timestamp)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -316,16 +305,29 @@ if __name__ == '__main__':
     for batch_idx, batch in enumerate(dataloader):
         target_text = batch["text"]
         source_video = batch["video"]
-        target_camera = batch["camera"]
+        camera_list = batch["camera"]  # list of 10 pose embeddings (batched tensors)
+        # Derive naming components from dataset path
+        source_path = batch["path"][0]
+        videos_dir = os.path.dirname(source_path)
+        scene_dir = os.path.dirname(videos_dir)
+        scene_name = os.path.basename(scene_dir)  # e.g., scene3294
+        cam_fname = os.path.basename(source_path)  # e.g., cam10.mp4
+        cam_stem = os.path.splitext(cam_fname)[0]  # cam10
+        cond_cam_type_id = int(cam_stem[3:]) if cam_stem.startswith("cam") and cam_stem[3:].isdigit() else 6
 
-        video = pipe(
-            prompt=target_text,
-            negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-            source_video=source_video,
-            target_camera=target_camera,
-            cfg_scale=args.cfg_scale,
-            num_inference_steps=50,
-            seed=0, tiled=True
-        )
-        save_video(video, os.path.join(output_dir, f"video{batch_idx}.mp4"), fps=30, quality=5)
-        save_video_from_tensor(source_video[0], output_dir, batch_idx, fps=30)
+        for cam_type_id, target_camera in enumerate(camera_list, start=1):
+            cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
+            if not os.path.exists(cam_output_dir):
+                os.makedirs(cam_output_dir)
+
+            video = pipe(
+                prompt=target_text,
+                negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                source_video=source_video,
+                target_camera=target_camera,
+                cfg_scale=args.cfg_scale,
+                num_inference_steps=50,
+                seed=0, tiled=True
+            )
+            filename = f"{scene_name}_cam{cond_cam_type_id}_camtype{cam_type_id}.mp4"
+            save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)

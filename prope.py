@@ -1,7 +1,7 @@
 # MIT License
 #
 # Copyright (c) Authors of
-# "PRoPE: Projective Positional Encoding for Multiview Transformers"
+# "Cameras as Relative Positional Encoding" https://arxiv.org/pdf/2507.10496
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -253,8 +253,6 @@ def _prepare_apply_fns(
     """Prepare transforms for PRoPE-style positional encoding."""
     device = viewmats.device
     (batch, cameras, _, _) = viewmats.shape
-    
-    ## TODO: viewmats.dtype
 
     # Normalize camera intrinsics.
     if Ks is not None:
@@ -290,7 +288,7 @@ def _prepare_apply_fns(
     # broadcasting.
     if coeffs_x is None:
         coeffs_x = _rope_precompute_coeffs(
-            torch.tile(torch.arange(patches_x, device=device), (patches_y * cameras,)),
+            torch.tile(torch.arange(patches_x, device=device, dtype=viewmats.dtype), (patches_y * cameras,)),
             freq_base=100.0,
             freq_scale=1.0,
             feat_dim=head_dim // 4,
@@ -299,7 +297,7 @@ def _prepare_apply_fns(
         coeffs_y = _rope_precompute_coeffs(
             torch.tile(
                 torch.repeat_interleave(
-                    torch.arange(patches_y, device=device), patches_x
+                    torch.arange(patches_y, device=device, dtype=viewmats.dtype), patches_x
                 ),
                 (cameras,),
             ),
@@ -333,23 +331,22 @@ def _prepare_apply_fns(
 
 
 def _apply_tiled_projmat(
-    feats: torch.Tensor,  # (batch, seqlen, feat_dim)
+    feats: torch.Tensor,  # (batch, num_heads, seqlen, feat_dim)
     matrix: torch.Tensor,  # (batch, cameras, D, D)
 ) -> torch.Tensor:
     """Apply projection matrix to features."""
     # - seqlen => (cameras, patches_x * patches_y)
     # - feat_dim => (feat_dim // 4, 4)
-    (batch, seqlen, feat_dim) = feats.shape
+    (batch, num_heads, seqlen, feat_dim) = feats.shape
     cameras = matrix.shape[1]
     assert seqlen > cameras and seqlen % cameras == 0
     D = matrix.shape[-1]
     assert matrix.shape == (batch, cameras, D, D)
     assert feat_dim % D == 0
-
     return torch.einsum(
-        "bcij,bcpkj->bcpki",
-        matrix.to(feats.dtype),
-        feats.reshape((batch, cameras, -1, feat_dim // D, D)),
+        "bcij,bncpkj->bncpki",
+        matrix,
+        feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
     ).reshape(feats.shape)
 
 
@@ -366,14 +363,14 @@ def _rope_precompute_coeffs(
     freqs = freq_scale * (
         freq_base
         ** (
-            -torch.arange(num_freqs, device=positions.device)[None, None, :]
+            -torch.arange(num_freqs, device=positions.device, dtype=positions.dtype)[None, None, None, :]
             / num_freqs
         )
     )
-    angles = positions[None, :, None] * freqs
+    angles = positions[None, None, :, None] * freqs
     # Shape should be: `(batch, num_heads, seqlen, num_freqs)`; we're
     # broadcasting across `batch` and `num_heads`.
-    assert angles.shape == (1, positions.shape[0], num_freqs)
+    assert angles.shape == (1, 1, positions.shape[0], num_freqs)
     return torch.cos(angles), torch.sin(angles)
 
 
@@ -388,11 +385,11 @@ def _rope_apply_coeffs(
     # We allow (cos, sin) to be either with shape (1, 1, seqlen, feat_dim // 2),
     # or (1, 1, seqlen_per_image, feat_dim // 2) and we repeat it to
     # match the shape of feats.
-    if cos.shape[1] != feats.shape[1]:
-        n_repeats = feats.shape[1] // cos.shape[1]
-        cos = cos.repeat(1, n_repeats, 1)
-        sin = sin.repeat(1, n_repeats, 1)
-    assert len(feats.shape) == len(cos.shape) == len(sin.shape) == 3
+    if cos.shape[2] != feats.shape[2]:
+        n_repeats = feats.shape[2] // cos.shape[2]
+        cos = cos.repeat(1, 1, n_repeats, 1)
+        sin = sin.repeat(1, 1, n_repeats, 1)
+    assert len(feats.shape) == len(cos.shape) == len(sin.shape) == 4
     assert cos.shape[-1] == sin.shape[-1] == feats.shape[-1] // 2
     x_in = feats[..., : feats.shape[-1] // 2]
     y_in = feats[..., feats.shape[-1] // 2 :]
@@ -426,7 +423,7 @@ def _apply_block_diagonal(
         dim=-1,
     )
     assert out.shape == feats.shape, "Input/output shapes should match."
-    return out.to(feats.dtype)
+    return out
 
 
 def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
@@ -443,7 +440,7 @@ def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
 def _lift_K(Ks: torch.Tensor) -> torch.Tensor:
     """Lift 3x3 matrices to homogeneous 4x4 matrices."""
     assert Ks.shape[-2:] == (3, 3)
-    out = torch.zeros(Ks.shape[:-2] + (4, 4), device=Ks.device)
+    out = torch.zeros(Ks.shape[:-2] + (4, 4), device=Ks.device, dtype=Ks.dtype)
     out[..., :3, :3] = Ks
     out[..., 3, 3] = 1.0
     return out

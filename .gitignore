@@ -1,6 +1,7 @@
 *__pycache__
 *.ckpt
 *.whl
+*.csv
 Wan-AI
 
 # Folders with results and models
@@ -8,6 +9,7 @@ GTA_result/
 models/
 latents_debug/
 results/
+result/
 exp/
 metadata.csv
 metadata_all.csv

@@ -26,36 +26,65 @@ except ModuleNotFoundError:
     
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
-    if compatibility_mode:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn_interface.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    # Check if inputs are already in multi-head format by checking tensor dimensions
+    # len(shape) == 4 means (batch, num_heads, seqlen, head_dim)
+    # len(shape) == 3 means (batch, seqlen, dim)
+    already_multihead = len(q.shape) == 4
+    
+    if already_multihead:
+        # Inputs are already in (batch, num_heads, seqlen, head_dim) format
+        if compatibility_mode:
+            x = F.scaled_dot_product_attention(q, k, v)
+        elif FLASH_ATTN_3_AVAILABLE:
+            # Rearrange to (batch, seqlen, num_heads, head_dim) for flash_attn_3
+            q = rearrange(q, "b n s d -> b s n d", n=num_heads)
+            k = rearrange(k, "b n s d -> b s n d", n=num_heads)
+            v = rearrange(v, "b n s d -> b s n d", n=num_heads)
+            x = flash_attn_interface.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b n s d", n=num_heads)
+        elif FLASH_ATTN_2_AVAILABLE:
+            # Rearrange to (batch, seqlen, num_heads, head_dim) for flash_attn_2
+            q = rearrange(q, "b n s d -> b s n d", n=num_heads)
+            k = rearrange(k, "b n s d -> b s n d", n=num_heads)
+            v = rearrange(v, "b n s d -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b n s d", n=num_heads)
+        elif SAGE_ATTN_AVAILABLE:
+            x = sageattn(q, k, v)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v)
     else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        # Original behavior: inputs are in (batch, seqlen, dim) format
+        if compatibility_mode:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        elif FLASH_ATTN_3_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn_interface.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        elif FLASH_ATTN_2_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        elif SAGE_ATTN_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = sageattn(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        else:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
 
 
@@ -89,6 +118,8 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    # Ensure freqs has the same dtype as x for complex operations
+    freqs = freqs.to(dtype=x.dtype, device=x.device)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
@@ -145,7 +176,7 @@ class SelfAttention(nn.Module):
         return self.o(x)
 
 
-class PRoPE_SelfAttention(nn.Module):
+class  PRoPE_SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -161,34 +192,56 @@ class PRoPE_SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs,viewmats,Ks=None):
+    def forward(self, x, freqs, viewmats, Ks=None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         
-        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
-        head_dim=self.dim,
-        viewmats=viewmats,
-        Ks=Ks,
-        patches_x=52,
-        patches_y=30,
-        image_width=832,
-        image_height=480,
-        coeffs_x=None,
-        coeffs_y=None,
-    )
+        # Apply RoPE first
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         
-        assert len(q.shape) == len(k.shape) ==len(v.shape) ==3
-##  EXP: o的位置
+        # Rearrange to multi-head format: (batch, seqlen, dim) -> (batch, num_heads, seqlen, head_dim)
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        
+        # Ensure data type consistency for PRoPE operations
+        target_dtype = q.dtype
+        target_device = q.device
+        
+        # Convert viewmats and Ks to match input tensor dtype and device
+        viewmats = viewmats.to(dtype=target_dtype, device=target_device)
+        if Ks is not None:
+            Ks = Ks.to(dtype=target_dtype, device=target_device)
+        
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
+            head_dim=self.head_dim,
+            viewmats=viewmats,
+            Ks=Ks,
+            patches_x=52,
+            patches_y=30,
+            image_width=832,
+            image_height=480,
+            coeffs_x=None,
+            coeffs_y=None,
+        )
+        
+        # Apply PRoPE transforms
         q = apply_fn_q(q)
         k = apply_fn_kv(k)
         v = apply_fn_kv(v)
+        
+        # Apply attention (inputs are already in multi-head format)
         x = self.attn(q, k, v)
+        
+        # Apply output transform
         x = apply_fn_o(x)
-        o = self.o(x)
-        return o
+        
+        # Rearrange back to original format: (batch, num_heads, seqlen, head_dim) -> (batch, seqlen, dim)
+        x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+        
+        return self.o(x)
 
 
 class CrossAttention(nn.Module):
@@ -259,16 +312,15 @@ class DiTBlock(nn.Module):
 
         N = cam_emb.shape[1]
         reshaped_cam_emb = cam_emb.view(N, 3, 4)
-        bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device)
+        bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
         bottom_row = bottom_row.unsqueeze(0).expand(N, -1, -1)
         cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=1)
         cam_emb = cam_emb.unsqueeze(0)
-        
-        
-        # cam_emb = cam_emb.repeat(1,2,1,1)
+
         N = cam_emb.shape[1]
         
-        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=cam_emb.device).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
+        # Ensure Ks has the same dtype and device as input_x
+        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=input_x.device, dtype=input_x.dtype).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
         x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
 
 
