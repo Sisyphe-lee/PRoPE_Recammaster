@@ -21,5 +21,7 @@ CUDA_VISIBLE_DEVICES="2,3,4,5,6,7" python train_recammaster.py  \
  --use_gradient_checkpointing  \
  --dataloader_num_workers 4 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
- --metadata_file_name "metadata_inference.csv"
-#  --debug
+ --metadata_file_name "metadata.csv" \
+ --wandb_name "Exp03f" \
+#  --debug \
+

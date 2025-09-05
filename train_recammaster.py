@@ -174,8 +174,8 @@ class Camera(object):
 
 class TensorDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, steps_per_epoch):
-        metadata = pd.read_csv('/data1/lcy/projects/ReCamMaster/metadata_inference.csv')
-        self.path = [os.path.join(file_name) for file_name in metadata["file_name"]]
+        metadata = pd.read_csv('./metadata.csv')
+        self.path = [os.path.join(file_name) for file_name in metadata["video_absolute_path"]]
         print(len(self.path), "videos in metadata.")
         self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
         print(len(self.path), "tensors cached in metadata.")
@@ -238,7 +238,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 with open(tgt_camera_path, 'r') as file:
                     cam_data = json.load(file)
                 multiview_c2ws = []
-                cam_idx = list(range(81))[::4]
+                cam_idx = list(range(81))[::4] 
                 for view_idx in [cond_idx, tgt_idx]:
                     traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{view_idx:02d}"]) for idx in cam_idx]
                     traj = np.stack(traj).transpose(0, 2, 1)
@@ -279,7 +279,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 # --- End: Calculate relative camera poses ---
                 
                 
-                data['camera'] = tgt_embedding.to(torch.bfloat16)
+                data['camera'] = pose_embedding.to(torch.bfloat16)
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
@@ -471,7 +471,7 @@ class LightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
 
-        if self.global_rank == 0 and self.global_step % 10 == 0 and self.last_decode_step != self.global_step:
+        if self.global_rank == 0 and self.global_step > 0 and self.global_step % 10 == 0 and self.last_decode_step != self.global_step:
             self.last_decode_step = self.global_step
             try:
                 with torch.no_grad():
@@ -744,7 +744,8 @@ def train(args):
 
     ## TODO: lantent_path = './latents/{date-time}/   if don't exist, then mkdir
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
-    latent_path = os.path.join(args.output_path, "latents_debug", time_str)
+    folder_name = f"{time_str}_{args.wandb_name}"
+    latent_path = os.path.join(args.output_path, "latents_debug", folder_name)
     if os.environ.get("LOCAL_RANK", "0") == "0":
         os.makedirs(latent_path, exist_ok=True)
     model = LightningModelForTrain(
@@ -760,24 +761,33 @@ def train(args):
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
         wandb_name = f"{time_str}_{args.wandb_name}"
+        run_dir = os.path.join(args.output_path, "wandb", wandb_name)
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            os.makedirs(run_dir, exist_ok=True)
         wandb_logger = WandbLogger(
             project=args.wandb_project,
             name=wandb_name,
+            id=wandb_name,
             config=vars(args),
-            save_dir=os.path.join(args.output_path, "wandb"),
+            save_dir=run_dir,
         )
         logger = [wandb_logger]
     else:
         logger = None
+        run_dir = args.output_path
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
         devices="auto",
         precision="bf16",
         strategy=args.training_strategy,
-        default_root_dir=args.output_path,
+        default_root_dir=run_dir,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
+        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
+            save_top_k=-1,
+            dirpath=os.path.join(run_dir, "checkpoints"),
+            filename="{epoch}-{step}"
+        )],
         logger=logger,
         log_every_n_steps=1,
     )

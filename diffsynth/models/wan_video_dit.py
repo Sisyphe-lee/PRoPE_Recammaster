@@ -115,14 +115,46 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-
-def rope_apply(x, freqs, num_heads):
+def rope_apply_(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    # Ensure freqs has the same dtype as x for complex operations
-    freqs = freqs.to(dtype=x.dtype, device=x.device)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
+    return x_out.to(x.dtype)
+
+def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_highfreq_ratio: float = 0.0):
+    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    # Ensure freqs has the same dtype as x for complex operations
+    freqs = freqs.to( device=x.device)
+    x_out = torch.view_as_complex(x.to(torch.float32).reshape(
+        x.shape[0], x.shape[1], x.shape[2], -1, 2))
+
+    if mask_first_head_fraction > 0 and t_highfreq_ratio > 0:
+        # Build per-head complex-frequency coefficients so we can mask specific heads
+        # freqs shape: (seqlen, 1, Lc)
+        seqlen, _, Lc = freqs.shape
+        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction))
+        # Assume 3D split order [t, h, w] across complex bins
+        tLc = Lc - 2 * (Lc // 3)
+        t_start = 0
+        t_end = t_start + tLc
+        t_lo = max(1, int(tLc * t_highfreq_ratio + 1e-6))
+        # Lowest frequencies are at the end of the t segment (from back to front)
+        t_lo_start = max(t_start, t_end - t_lo)
+        t_lo_end = t_end
+        # Create head-aware freqs tensor aligned as (1, seqlen, num_heads, Lc) to avoid s x s broadcast
+        freqs_heads = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc).clone()
+        # Mask rotation for selected heads on t-lowfreq complex bins by setting multiplier to 1+0j
+        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device)
+        freqs_heads[:, :, :heads_to_mask, t_lo_start:t_lo_end] = one_c
+        # Broadcast to x_out shape (b, s, n, Lc)
+        freqs_effective = freqs_heads
+    else:
+        # Broadcast original freqs across heads aligned as (1, s, n, Lc)
+        seqlen, _, Lc = freqs.shape
+        freqs_effective = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc)
+
+    x_out = torch.view_as_real(x_out * freqs_effective).flatten(2)
     return x_out.to(x.dtype)
 
 
@@ -192,14 +224,14 @@ class  PRoPE_SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, viewmats, Ks=None):
+    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.2):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         
-        # Apply RoPE first
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
+        # Apply 3D RoPE first, but mask low-frequency t channels on the first fraction of heads
+        q = rope_apply(q, freqs, self.num_heads, mask_first_head_fraction=mask_first_head_fraction, t_highfreq_ratio=t_highfreq_ratio)
+        k = rope_apply(k, freqs, self.num_heads, mask_first_head_fraction=mask_first_head_fraction, t_highfreq_ratio=t_highfreq_ratio)
         
         # Rearrange to multi-head format: (batch, seqlen, dim) -> (batch, num_heads, seqlen, head_dim)
         q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
@@ -223,20 +255,21 @@ class  PRoPE_SelfAttention(nn.Module):
             patches_y=30,
             image_width=832,
             image_height=480,
-            coeffs_x=None,
-            coeffs_y=None,
+            num_heads=self.num_heads,
+            head_fraction=mask_first_head_fraction,
+            t_highfreq_ratio=t_highfreq_ratio,
         )
         
         # Apply PRoPE transforms
         q = apply_fn_q(q)
         k = apply_fn_kv(k)
-        v = apply_fn_kv(v)
+        # v = apply_fn_kv(v)
         
         # Apply attention (inputs are already in multi-head format)
         x = self.attn(q, k, v)
         
         # Apply output transform
-        x = apply_fn_o(x)
+        # x = apply_fn_o(x)
         
         # Rearrange back to original format: (batch, num_heads, seqlen, head_dim) -> (batch, seqlen, dim)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
@@ -306,6 +339,10 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        
+        
+        
+        ## TODO:
         # cam_emb: torch.Size([1, 21, 12])
         # x.shape   torch.Size([1, 65520, 1536]) 
         # encode camera
@@ -330,6 +367,9 @@ class DiTBlock(nn.Module):
         # cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
         # input_x = input_x + cam_emb
         # x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
+
+        
+        
         
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -448,6 +488,11 @@ class WanModel(torch.nn.Module):
             context = torch.cat([clip_embdding, context], dim=1)
         
         x, (f, h, w) = self.patchify(x)
+        
+        # 获取 self.freqs[0][:f] 并修改倒数五个通道
+        # freq_0 = self.freqs[0][:f].clone()  # 形状: [f, 22]
+        # 将倒数五个通道设置为 1.0000+0.0000e+00j
+        # freq_0[:, -5:] = torch.complex(torch.ones_like(freq_0[:, -5:].real), torch.zeros_like(freq_0[:, -5:].imag))
         
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),

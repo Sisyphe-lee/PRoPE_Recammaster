@@ -15,7 +15,8 @@
                 "train"
             ],
             "console": "integratedTerminal",
-            "python": "/home/cyli/anaconda3/envs/recammaster/bin/python"
+            "python": "/home/cyli/anaconda3/envs/recammaster/bin/python",
+            "justMyCode": false,
         },
         {
             "name": "Python: Attach to Remote",
@@ -25,6 +26,7 @@
                 "host": "localhost",
                 "port": 6867,
             },
+            "justMyCode": false,
             "pathMappings": [
                 {
                     "localRoot": "${workspaceFolder}",

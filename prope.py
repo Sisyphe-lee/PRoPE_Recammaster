@@ -243,14 +243,20 @@ def _prepare_apply_fns(
     patches_y: int,  # How many patches tall is each image?
     image_width: int,  # Width of the image. Used to normalize intrinsics.
     image_height: int,  # Height of the image. Used to normalize intrinsics.
-    coeffs_x: Optional[torch.Tensor] = None,
-    coeffs_y: Optional[torch.Tensor] = None,
+    *,
+    num_heads: Optional[int] = None,
+    head_fraction: float = 0.0,  # e.g., 0.25 means first quarter heads
+    t_highfreq_ratio: float = 0.0,  # e.g., 0.2 means last 20% of t block
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
 ]:
-    """Prepare transforms for PRoPE-style positional encoding."""
+    """Prepare transforms for PRoPE-style positional encoding.
+
+    Modified: remove x/y RoPE; only apply projection matrices to a subset of heads
+    and only to the low-frequency tail of the t-channel block (last portion of head_dim).
+    """
     device = viewmats.device
     (batch, cameras, _, _) = viewmats.shape
 
@@ -284,49 +290,49 @@ def _prepare_apply_fns(
 
     assert P.shape == P_inv.shape == (batch, cameras, 4, 4)
 
-    # Precompute cos/sin terms for RoPE. We use tiles/repeats for 'row-major'
-    # broadcasting.
-    if coeffs_x is None:
-        coeffs_x = _rope_precompute_coeffs(
-            torch.tile(torch.arange(patches_x, device=device, dtype=viewmats.dtype), (patches_y * cameras,)),
-            freq_base=100.0,
-            freq_scale=1.0,
-            feat_dim=head_dim // 4,
-        )
-    if coeffs_y is None:
-        coeffs_y = _rope_precompute_coeffs(
-            torch.tile(
-                torch.repeat_interleave(
-                    torch.arange(patches_y, device=device, dtype=viewmats.dtype), patches_x
-                ),
-                (cameras,),
-            ),
-            freq_base=100.0,
-            freq_scale=1.0,
-            feat_dim=head_dim // 4,
-        )
-
-    # Block-diagonal transforms to the inputs and outputs of the attention operator.
+    # Configure subset selection
     assert head_dim % 4 == 0
-    transforms_q = [
-        (partial(_apply_tiled_projmat, matrix=P_T), head_dim // 2),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_x), head_dim // 4),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_y), head_dim // 4),
-    ]
-    transforms_kv = [
-        (partial(_apply_tiled_projmat, matrix=P_inv), head_dim // 2),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_x), head_dim // 4),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_y), head_dim // 4),
-    ]
-    transforms_o = [
-        (partial(_apply_tiled_projmat, matrix=P), head_dim // 2),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_x, inverse=True), head_dim // 4),
-        (partial(_rope_apply_coeffs, coeffs=coeffs_y, inverse=True), head_dim // 4),
-    ]
+    # Align t-feature block with 3D RoPE's t bins in real space: size = 2 * tLc
+    # where Lc = head_dim // 2, tLc = Lc - 2 * (Lc // 3)
+    Lc = head_dim // 2
+    tLc = Lc - 2 * (Lc // 3)
+    t_block_start = 0
+    t_block_end = 2 * tLc
+    if t_highfreq_ratio > 0:
+        t_lo_len = int((t_block_end - t_block_start) * t_highfreq_ratio)
+        # ensure multiple of 4 for 4x4 projection blocks
+        t_lo_len = max(0, (t_lo_len // 4) * 4)
+    else:
+        t_lo_len = 0
+    # Lowest frequencies are at the end of t block (from back to front)
+    t_lo_start = max(t_block_start, t_block_end - t_lo_len)
+    t_lo_end = t_block_end
 
-    apply_fn_q = partial(_apply_block_diagonal, func_size_pairs=transforms_q)
-    apply_fn_kv = partial(_apply_block_diagonal, func_size_pairs=transforms_kv)
-    apply_fn_o = partial(_apply_block_diagonal, func_size_pairs=transforms_o)
+    if num_heads is None or head_fraction <= 0:
+        head_indices = None  # no-op
+    else:
+        head_indices = torch.arange(max(1, int(num_heads * head_fraction)), device=device)
+
+    def _apply_proj_subset(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+        # feats: (batch, num_heads, seqlen, head_dim)
+        if t_lo_len == 0 or head_indices is None:
+            return feats
+        (batch, nheads, seqlen, feat_dim) = feats.shape
+        assert feat_dim == head_dim
+        # Slice the subset to transform
+
+        if feats[:, head_indices, :, t_lo_start:t_lo_end].shape[-1] == 0:
+            return feats
+        assert feats[:, head_indices, :, t_lo_start:t_lo_end].shape[-1] % 4 == 0
+        # Apply tiled projection
+        # Write back
+        # feats = feats.clone()
+        feats[:, head_indices, :, t_lo_start:t_lo_end] = _apply_tiled_projmat(feats[:, head_indices, :, t_lo_start:t_lo_end], matrix)
+        return feats
+
+    apply_fn_q = partial(_apply_proj_subset, matrix=P_T)
+    apply_fn_kv = partial(_apply_proj_subset, matrix=P_inv)
+    apply_fn_o = partial(_apply_proj_subset, matrix=P)
     return apply_fn_q, apply_fn_kv, apply_fn_o
 
 
