@@ -15,154 +15,8 @@ import json
 import torch.nn as nn
 import torch.nn.functional as F
 import shutil
-import wandb
 from datetime import datetime
-
-
-class TextVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
-        metadata = pd.read_csv('./metadata.csv')
-        self.path = [os.path.join( file_name) for file_name in metadata["video_absolute_path"]]
-        self.text = metadata["caption"].to_list()
-        
-        self.max_num_frames = max_num_frames
-        self.frame_interval = frame_interval
-        self.num_frames = num_frames
-        self.height = height
-        self.width = width
-        self.is_i2v = is_i2v
-            
-        self.frame_process = v2.Compose([
-            v2.CenterCrop(size=(height, width)),
-            v2.Resize(size=(height, width), antialias=True),
-            v2.ToTensor(),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
-        
-        
-    def crop_and_resize(self, image):
-        width, height = image.size
-        scale = max(self.width / width, self.height / height)
-        image = torchvision.transforms.functional.resize(
-            image,
-            (round(height*scale), round(width*scale)),
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
-        )
-        return image
-
-
-    def load_frames_using_imageio(self, file_path, max_num_frames, start_frame_id, interval, num_frames, frame_process):
-        reader = imageio.get_reader(file_path)
-        if reader.count_frames() < max_num_frames or reader.count_frames() - 1 < start_frame_id + (num_frames - 1) * interval:
-            reader.close()
-            return None
-        
-        frames = []
-        first_frame = None
-        for frame_id in range(num_frames):
-            frame = reader.get_data(start_frame_id + frame_id * interval)
-            frame = Image.fromarray(frame)
-            frame = self.crop_and_resize(frame)
-            if first_frame is None:
-                first_frame = np.array(frame)
-            frame = frame_process(frame)
-            frames.append(frame)
-        reader.close()
-
-        frames = torch.stack(frames, dim=0)
-        frames = rearrange(frames, "T C H W -> C T H W")
-
-        if self.is_i2v:
-            return frames, first_frame
-        else:
-            return frames
-
-
-    def load_video(self, file_path):
-        start_frame_id = 0
-        frames = self.load_frames_using_imageio(file_path, self.max_num_frames, start_frame_id, self.frame_interval, self.num_frames, self.frame_process)
-        return frames
-    
-    
-    def is_image(self, file_path):
-        file_ext_name = file_path.split(".")[-1]
-        if file_ext_name.lower() in ["jpg", "jpeg", "png", "webp"]:
-            return True
-        return False
-    
-    
-    def load_image(self, file_path):
-        frame = Image.open(file_path).convert("RGB")
-        frame = self.crop_and_resize(frame)
-        first_frame = frame
-        frame = self.frame_process(frame)
-        frame = rearrange(frame, "C H W -> C 1 H W")
-        return frame
-
-
-    def __getitem__(self, data_id):
-        while True:
-            try:
-                text = self.text[data_id]
-                path = self.path[data_id]
-                if self.is_image(path):
-                    if self.is_i2v:
-                        raise ValueError(f"{path} is not a video. I2V model doesn't support image-to-image training.")
-                    video = self.load_image(path)
-                else:
-                    video = self.load_video(path)
-                if self.is_i2v:
-                    video, first_frame = video
-                    data = {"text": text, "video": video, "path": path, "first_frame": first_frame}
-                else:
-                    data = {"text": text, "video": video, "path": path}
-                break
-            except:
-                data_id += 1
-        return data
-    
-
-    def __len__(self):
-        return len(self.path)
-
-
-
-class LightningModelForDataProcess(pl.LightningModule):
-    def __init__(self, text_encoder_path, vae_path, image_encoder_path=None, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        super().__init__()
-        model_path = [text_encoder_path, vae_path]
-        if image_encoder_path is not None:
-            model_path.append(image_encoder_path)
-        model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-        model_manager.load_models(model_path)
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
-
-        self.tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-        
-    def test_step(self, batch, batch_idx):
-        text, video, path = batch["text"][0], batch["video"], batch["path"][0]
-        
-        self.pipe.device = self.device
-        if video is not None:
-            pth_path = path + ".tensors.pth"
-            if not os.path.exists(pth_path):
-                # prompt
-                prompt_emb = self.pipe.encode_prompt(text)
-                # video
-                video = video.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-                
-                latents = self.pipe.encode_video(video, **self.tiler_kwargs)[0]
-                # image
-                if "first_frame" in batch:
-                    first_frame = Image.fromarray(batch["first_frame"][0].cpu().numpy())
-                    _, _, num_frames, height, width = video.shape
-                    image_emb = self.pipe.encode_image(first_frame, num_frames, height, width)
-                else:
-                    image_emb = {}
-                data = {"latents": latents, "prompt_emb": prompt_emb, "image_emb": image_emb}
-                torch.save(data, pth_path)
-            else:
-                print(f"File {pth_path} already exists, skipping.")
+from wandb_module import WandBVideoLogger, VideoDecoder
 
 class Camera(object):
     def __init__(self, c2w):
@@ -170,17 +24,20 @@ class Camera(object):
         self.c2w_mat = c2w_mat
         self.w2c_mat = np.linalg.inv(c2w_mat)
 
-
-
 class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, steps_per_epoch):
+    def __init__(self, base_path, metadata_path, steps_per_epoch, paths=None, deterministic=False, fixed_length=None):
         metadata = pd.read_csv('./metadata.csv')
-        self.path = [os.path.join(file_name) for file_name in metadata["video_absolute_path"]]
-        print(len(self.path), "videos in metadata.")
-        self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
+        if paths is None:
+            self.path = [os.path.join(file_name) for file_name in metadata["video_absolute_path"]]
+            print(len(self.path), "videos in metadata.")
+            self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
+        else:
+            self.path = paths
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
         self.steps_per_epoch = steps_per_epoch
+        self.deterministic = deterministic
+        self.fixed_length = fixed_length
 
 
     def parse_matrix(self, matrix_str):
@@ -215,22 +72,38 @@ class TensorDataset(torch.utils.data.Dataset):
         while True:
             try:
                 data = {}
-                data_id = torch.randint(0, len(self.path), (1,))[0]
-                data_id = (data_id + index) % len(self.path) # For fixed seed.
+                if self.deterministic:
+                    data_id = index % len(self.path)
+                else:
+                    data_id = torch.randint(0, len(self.path), (1,))[0]
+                    data_id = (data_id + index) % len(self.path) # For fixed seed.
                 path_tgt = self.path[data_id]
                 data_tgt = torch.load(path_tgt, weights_only=True, map_location="cpu")
 
                 # load the condition latent
                 match = re.search(r'cam(\d+)', path_tgt)
                 tgt_idx = int(match.group(1))
-                cond_idx = random.randint(1, 10)
-                while cond_idx == tgt_idx:
+                if self.deterministic:
+                    cond_idx = 1 if tgt_idx != 1 else 2
+                else:
                     cond_idx = random.randint(1, 10)
+                    while cond_idx == tgt_idx:
+                        cond_idx = random.randint(1, 10)
                 path_cond = re.sub(r'cam(\d+)', f'cam{cond_idx:02}', path_tgt)
                 data_cond = torch.load(path_cond, weights_only=True, map_location="cpu")
                 data['latents'] = torch.cat((data_tgt['latents'],data_cond['latents']),dim=1)
                 data['prompt_emb'] = data_tgt['prompt_emb']
                 data['image_emb'] = {}
+
+                # Extract scene information from path
+                scene_match = re.search(r'scene(\d+)', path_tgt.lower())
+                scene_id = scene_match.group(1) if scene_match else 'unknown'
+                
+                # Store camera type information
+                data['scene_id'] = scene_id
+                data['condition_cam_type'] = f"cam{cond_idx:02d}"
+                data['target_cam_type'] = f"cam{tgt_idx:02d}"
+                data['path'] = path_tgt  # Keep original path for reference
 
                 # load the target trajectory
                 base_path = path_tgt.rsplit('/', 2)[0]
@@ -288,6 +161,8 @@ class TensorDataset(torch.utils.data.Dataset):
     
 
     def __len__(self):
+        if self.fixed_length is not None:
+            return self.fixed_length
         return self.steps_per_epoch
 
 
@@ -300,7 +175,13 @@ class LightningModelForTrain(pl.LightningModule):
         latent_path,
         learning_rate=1e-5,
         use_gradient_checkpointing=True, use_gradient_checkpointing_offload=False,
-        resume_ckpt_path=None
+        resume_ckpt_path=None,
+        wandb_video_strategy="selective",  # "none", "selective", "quality_based", "all"
+        wandb_max_videos_per_epoch=5,
+        wandb_video_quality_threshold=25.0,  # PSNR threshold for quality-based selection
+        wandb_compress_videos=True,
+        wandb_video_fps=4,  # Reduced FPS for WandB uploads
+        wandb_video_scale=0.5  # Scale factor for WandB videos (0.5 = half resolution)
     ):
         super().__init__()
         self.latent_path = latent_path
@@ -374,6 +255,21 @@ class LightningModelForTrain(pl.LightningModule):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.last_decode_step = -1
+        self._has_started_training = False
+        
+        # Initialize WandB video logger
+        self.wandb_logger = WandBVideoLogger(
+            strategy=wandb_video_strategy,
+            max_videos_per_epoch=wandb_max_videos_per_epoch,
+            quality_threshold=wandb_video_quality_threshold,
+            compress_videos=wandb_compress_videos,
+            video_fps=wandb_video_fps,
+            video_scale=wandb_video_scale,
+            output_dir=os.path.join(latent_path, "wandb_temp")
+        )
+        
+        # Initialize video decoder
+        self.video_decoder = VideoDecoder(self.pipe)
         
         
     def freeze_parameters(self):
@@ -382,61 +278,34 @@ class LightningModelForTrain(pl.LightningModule):
         self.pipe.eval()
         self.pipe.denoising_model().train()
 
-    def decode_video_and_log(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep):
-        # 1. PREPARE PREDICTED AND GT LATENTS
-        # Prepare predicted latent
-        noise_pred_sample = noise_pred[0:1, :, :tgt_latent_len, ...]
-        noisy_latents_sample = noisy_latents[0:1, :, :tgt_latent_len, ...]
 
-        # For FlowMatch, the formula to get the original sample is: noisy_sample - sigma * velocity
-        # Here, noise_pred is the velocity. We need to find the sigma for the current timestep.
-        with torch.no_grad():
-            timestep_id_index = torch.argmin(torch.abs(self.pipe.scheduler.timesteps.to(self.device) - timestep))
-        sigma = self.pipe.scheduler.sigmas[timestep_id_index].to(self.device)
-        pred_original_sample = noisy_latents_sample - sigma * noise_pred_sample
 
-        # Prepare ground truth latent
-        gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
-
-        # 2. DECODE BOTH (load VAE only once for efficiency)
-        self.pipe.load_models_to_device(['vae'])
+    def decode_video_and_log(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch):
+        """Simplified video decoding using the VideoDecoder module"""
+        # Extract metadata for file naming
+        try:
+            scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
+            condition_cam_type = batch.get('condition_cam_type', ['unknown'])[0] if isinstance(batch.get('condition_cam_type'), list) else str(batch.get('condition_cam_type', 'unknown'))
+            target_cam_type = batch.get('target_cam_type', ['unknown'])[0] if isinstance(batch.get('target_cam_type'), list) else str(batch.get('target_cam_type', 'unknown'))
+        except Exception as e:
+            print(f"Error extracting metadata from batch: {e}")
+            scene_id = "unknown"
+            condition_cam_type = "unknown"
+            target_cam_type = "unknown"
         
-        # Decode prediction
-        pred_frames_tensor = self.pipe.decode_video(pred_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        
-        # Decode ground truth
-        gt_frames_tensor = self.pipe.decode_video(gt_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        
-        self.pipe.load_models_to_device([])
-
-        # 3. CALCULATE PSNR
-        # Normalize frame tensors from [-1, 1] to [0, 1] for PSNR calculation
-        pred_frames_norm = (pred_frames_tensor.clamp(-1, 1) + 1) / 2
-        gt_frames_norm = (gt_frames_tensor.clamp(-1, 1) + 1) / 2
-        
-        # Calculate MSE and then PSNR
-        mse = torch.nn.functional.mse_loss(pred_frames_norm, gt_frames_norm)
-        psnr_value = 100.0 if mse == 0 else 20 * torch.log10(1.0 / torch.sqrt(mse))
-            
-        # 4. LOG TO WANDB
-        self.log("val/psnr", psnr_value, on_step=True, on_epoch=False, prog_bar=True, logger=True, rank_zero_only=True)
-
-        # 5. SAVE VIDEOS
-        # Convert tensors to video format (list of numpy arrays)
-        
-        pred_video_frames = self.pipe.tensor2video(pred_frames_tensor)
-        gt_video_frames = self.pipe.tensor2video(gt_frames_tensor)
-        
-        # Ensure the output path exists
+        # Create output path
         os.makedirs(self.latent_path, exist_ok=True)
+        combined_video_path = os.path.join(
+            self.latent_path, 
+            f"step{self.global_step}_SceneID{scene_id}_SourcePoseType{condition_cam_type}_TargetPoseType{target_cam_type}.mp4"
+        )
         
-        # Save predicted video
-        pred_video_path = os.path.join(self.latent_path, f"{self.global_step}_pred.mp4")
-        imageio.mimsave(pred_video_path, pred_video_frames, fps=8, quality=8)
+        # Use VideoDecoder to handle the complex decoding logic
+        psnr_value, combined_frames, metadata = self.video_decoder.decode_and_create_combined_video(
+            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch, combined_video_path
+        )
         
-        # Save ground truth video
-        gt_video_path = os.path.join(self.latent_path, f"{self.global_step}_gt.mp4")
-        imageio.mimsave(gt_video_path, gt_video_frames, fps=8, quality=8)
+        return psnr_value, None, None, combined_video_path, combined_frames
         
     def training_step(self, batch, batch_idx):
         # Data
@@ -471,20 +340,124 @@ class LightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
 
-        if self.global_rank == 0 and self.global_step > 0 and self.global_step % 10 == 0 and self.last_decode_step != self.global_step:
-            self.last_decode_step = self.global_step
-            try:
-                with torch.no_grad():
-                    self.decode_video_and_log(noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep)
-            except Exception as e:
-                print(f"Rank {self.global_rank} failed to generate validation video at step {self.global_step}:  Error: {e}")
+        # Remove ad-hoc decode/eval from training loop; validation loop will handle evaluation
 
         loss = torch.nn.functional.mse_loss(noise_pred[:, :, :tgt_latent_len, ...].float(), training_target[:, :, :tgt_latent_len, ...].float())
         loss = loss * self.pipe.scheduler.training_weight(timestep)
 
         # Record log
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch['pixel_values'].shape[0])
         return loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        # Store current batch_idx for video naming
+        self._current_batch_idx = batch_idx
+        
+        latents = batch["latents"].to(self.device)
+        prompt_emb = batch["prompt_emb"]
+        prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
+        image_emb = batch["image_emb"]
+        if "clip_feature" in image_emb:
+            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
+        if "y" in image_emb:
+            image_emb["y"] = image_emb["y"][0].to(self.device)
+        cam_emb = batch["camera"].to(self.device)
+
+        self.pipe.device = self.device
+        noise = torch.randn_like(latents)
+        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
+        timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+        extra_input = self.pipe.prepare_extra_input(latents)
+        origin_latents = copy.deepcopy(latents)
+        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
+        tgt_latent_len = noisy_latents.shape[2] // 2
+        noisy_latents[:, :, tgt_latent_len:, ...] = origin_latents[:, :, tgt_latent_len:, ...]
+
+        noise_pred = self.pipe.denoising_model()(noisy_latents, timestep=timestep, cam_emb=cam_emb, **prompt_emb, **extra_input, **image_emb,
+            use_gradient_checkpointing=self.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload)
+
+        # Decode, compute PSNR, save videos locally
+        psnr_value, pred_frames, gt_frames, combined_path, combined_frames = self.decode_video_and_log(
+            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch
+        )
+
+        # Accumulate for epoch-average
+        if not hasattr(self, "_val_psnr_sum"):
+            self._val_psnr_sum = 0.0
+            self._val_count = 0
+        self._val_psnr_sum += float(psnr_value)
+        self._val_count += 1
+
+        # Queue video for WandB upload (only rank 0)
+        if self.global_rank == 0:
+            try:
+                # Extract metadata from batch
+                scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
+                condition_cam_type = batch.get('condition_cam_type', ['unknown'])[0] if isinstance(batch.get('condition_cam_type'), list) else str(batch.get('condition_cam_type', 'unknown'))
+                target_cam_type = batch.get('target_cam_type', ['unknown'])[0] if isinstance(batch.get('target_cam_type'), list) else str(batch.get('target_cam_type', 'unknown'))
+                
+                metadata = {
+                    'scene_id': scene_id,
+                    'condition_cam_type': condition_cam_type,
+                    'target_cam_type': target_cam_type
+                }
+                
+                # Queue video using WandB logger
+                self.wandb_logger.queue_video(combined_frames, metadata, psnr_value, batch_idx)
+                
+            except Exception as e:
+                print(f"Failed to queue validation video for WandB: {e}")
+        
+        # Print info for all ranks about saved videos
+        print(f"Rank {self.global_rank}: Saved validation videos for batch {batch_idx} at step {self.global_step}")
+
+        return {"psnr": psnr_value}
+
+    def on_validation_epoch_start(self):
+        # Reset accumulators
+        self._val_psnr_sum = 0.0
+        self._val_count = 0
+        
+        # Reset WandB video tracking for new epoch
+        if self.global_rank == 0:
+            self.wandb_logger.reset_epoch()
+            print(f"Rank {self.global_rank}: Starting validation epoch. WandB strategy: {self.wandb_logger.strategy}, max videos: {self.wandb_logger.max_videos_per_epoch}")
+        
+        # Save checkpoint during validation (except for the initial validation before training)
+        if hasattr(self, '_has_started_training') and self._has_started_training and self.global_rank == 0:
+            self.save_validation_checkpoint()
+
+    def on_validation_epoch_end(self):
+        # Log average PSNR across the validation set
+        if getattr(self, "_val_count", 0) > 0:
+            avg_psnr = self._val_psnr_sum / self._val_count
+            self.log("val/psnr", avg_psnr, on_step=False, on_epoch=True, prog_bar=True, logger=True, rank_zero_only=True, batch_size=self._val_count)
+        
+        # Upload all queued videos to WandB at epoch end (only rank 0)
+        if self.global_rank == 0 and hasattr(self.logger, "experiment") and self.logger is not None:
+            self.wandb_logger.upload_videos(self.logger, self.global_step)
+
+    def save_validation_checkpoint(self):
+        """Save checkpoint during validation"""
+        try:
+            checkpoint_dir = self.trainer.checkpoint_callback.dirpath if self.trainer.checkpoint_callback else "./checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            current_step = self.global_step
+            state_dict = self.pipe.denoising_model().state_dict()
+            
+            checkpoint_path = os.path.join(checkpoint_dir, f"validation_step{current_step}.ckpt")
+            torch.save(state_dict, checkpoint_path)
+            print(f"Saved validation checkpoint at step {current_step}: {checkpoint_path}")
+        except Exception as e:
+            print(f"Failed to save validation checkpoint: {e}")
+
+    def on_train_start(self):
+        """Called when training starts"""
+        self._has_started_training = True
+        print("Training started - validation checkpoints will be saved from now on")
 
 
     def configure_optimizers(self):
@@ -504,7 +477,7 @@ class LightningModelForTrain(pl.LightningModule):
         trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
         state_dict = self.pipe.denoising_model().state_dict()
         if not (os.path.exists(os.path.join(checkpoint_dir))):
-            os.makedirs(checkpoint_dir)
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
         torch.save(state_dict, os.path.join(checkpoint_dir, f"step{current_step}.ckpt"))
 
@@ -518,10 +491,10 @@ def parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        default="data_process",
-        required=True,
-        choices=["data_process", "train"],
-        help="Task. `data_process` or `train`.",
+        default="train",
+        required=False,
+        choices=["train"],
+        help="Task. Only `train` is supported.",
     )
     parser.add_argument(
         "--dataset_path",
@@ -536,18 +509,7 @@ def parse_args():
         default="./",
         help="Path to save the model.",
     )
-    parser.add_argument(
-        "--text_encoder_path",
-        type=str,
-        default=None,
-        help="Path of text encoder.",
-    )
-    parser.add_argument(
-        "--image_encoder_path",
-        type=str,
-        default=None,
-        help="Path of image encoder.",
-    )
+
     parser.add_argument(
         "--vae_path",
         type=str,
@@ -560,36 +522,7 @@ def parse_args():
         default=None,
         help="Path of DiT.",
     )
-    parser.add_argument(
-        "--tiled",
-        default=False,
-        action="store_true",
-        help="Whether enable tile encode in VAE. This option can reduce VRAM required.",
-    )
-    parser.add_argument(
-        "--tile_size_height",
-        type=int,
-        default=34,
-        help="Tile size (height) in VAE.",
-    )
-    parser.add_argument(
-        "--tile_size_width",
-        type=int,
-        default=34,
-        help="Tile size (width) in VAE.",
-    )
-    parser.add_argument(
-        "--tile_stride_height",
-        type=int,
-        default=18,
-        help="Tile stride (height) in VAE.",
-    )
-    parser.add_argument(
-        "--tile_stride_width",
-        type=int,
-        default=16,
-        help="Tile stride (width) in VAE.",
-    )
+
     parser.add_argument(
         "--steps_per_epoch",
         type=int,
@@ -685,59 +618,101 @@ def parse_args():
         type=str,
         default=None,
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--wandb_video_strategy",
+        type=str,
+        default="selective",
+        choices=["none", "selective", "quality_based", "all"],
+        help="Strategy for uploading validation videos to WandB. 'none': no upload, 'selective': first few + every Nth, 'quality_based': based on PSNR thresholds, 'all': upload all videos"
+    )
+    parser.add_argument(
+        "--wandb_max_videos_per_epoch",
+        type=int,
+        default=5,
+        help="Maximum number of validation videos to upload to WandB per epoch"
+    )
+    parser.add_argument(
+        "--wandb_video_quality_threshold",
+        type=float,
+        default=25.0,
+        help="PSNR threshold for quality-based video selection (only used with quality_based strategy)"
+    )
+    parser.add_argument(
+        "--wandb_compress_videos",
+        action="store_true",
+        default=True,
+        help="Whether to compress videos before uploading to WandB (reduces resolution and FPS)"
+    )
+    parser.add_argument(
+        "--wandb_video_fps",
+        type=int,
+        default=4,
+        help="FPS for WandB video uploads (lower FPS reduces file size)"
+    )
+    parser.add_argument(
+        "--wandb_video_scale",
+        type=float,
+        default=0.5,
+        help="Scale factor for WandB videos (0.5 = half resolution, reduces file size)"
+    )
     args = parser.parse_args()
     return args
 
 
-def data_process(args):
-    dataset = TextVideoDataset(
-        args.dataset_path,
-        os.path.join(args.dataset_path, args.metadata_file_name),
-        max_num_frames=args.num_frames,
-        frame_interval=1,
-        num_frames=args.num_frames,
-        height=args.height,
-        width=args.width,
-        is_i2v=args.image_encoder_path is not None
-    )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        shuffle=False,
-        batch_size=1,
-        num_workers=args.dataloader_num_workers
-    )
-    model = LightningModelForDataProcess(
-        text_encoder_path=args.text_encoder_path,
-        image_encoder_path=args.image_encoder_path,
-        vae_path=args.vae_path,
-        tiled=args.tiled,
-        tile_size=(args.tile_size_height, args.tile_size_width),
-        tile_stride=(args.tile_stride_height, args.tile_stride_width),
-    )
-    trainer = pl.Trainer(
-        accelerator="gpu",
-        devices="auto",
-        default_root_dir=args.output_path,
-    )
-    trainer.test(model, dataloader)
+
     
     
 def train(args):
     if args.debug:
         print("Debug mode is enabled.") 
         import debugpy
-        debugpy.listen(6867)
+        debugpy.listen(6862)
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
-    dataset = TensorDataset(
+    # Build datasets: create deterministic 10-sample validation split
+    full_dataset = TensorDataset(
         args.dataset_path,
         "/data1/lcy/projects/ReCamMaster/metadata_inference.csv",
         steps_per_epoch=args.steps_per_epoch,
     )
+    # Use actual dataset paths, not the string value of dataset_path
+    all_paths = list(full_dataset.path)
+    # Deterministic first 48 samples for validation
+    val_paths = all_paths[:48] if len(all_paths) >= 48 else all_paths[:len(all_paths)]
+    train_paths = [p for p in all_paths if p not in val_paths]
+
+    train_dataset = TensorDataset(
+        args.dataset_path,
+        "/data1/lcy/projects/ReCamMaster/metadata.csv",
+        steps_per_epoch=args.steps_per_epoch,
+        paths=train_paths,
+        deterministic=False,
+        fixed_length=None,
+    )
+    val_dataset = TensorDataset(
+        args.dataset_path,
+        "/data1/lcy/projects/ReCamMaster/metadata.csv",
+        steps_per_epoch=48,
+        paths=val_paths,
+        deterministic=True,
+        fixed_length=48 if len(val_paths) >= 48 else len(val_paths),
+    )
+
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         shuffle=True,
+        batch_size=args.batch_size,
+        num_workers=args.dataloader_num_workers
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        shuffle=False,
         batch_size=1,
         num_workers=args.dataloader_num_workers
     )
@@ -745,7 +720,7 @@ def train(args):
     ## TODO: lantent_path = './latents/{date-time}/   if don't exist, then mkdir
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
     folder_name = f"{time_str}_{args.wandb_name}"
-    latent_path = os.path.join(args.output_path, "latents_debug", folder_name)
+    latent_path = os.path.join("./wandb", folder_name, "video_debug")
     if os.environ.get("LOCAL_RANK", "0") == "0":
         os.makedirs(latent_path, exist_ok=True)
     model = LightningModelForTrain(
@@ -756,12 +731,18 @@ def train(args):
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         resume_ckpt_path=args.resume_ckpt_path,
+        wandb_video_strategy=getattr(args, 'wandb_video_strategy', 'selective'),
+        wandb_max_videos_per_epoch=getattr(args, 'wandb_max_videos_per_epoch', 5),
+        wandb_video_quality_threshold=getattr(args, 'wandb_video_quality_threshold', 25.0),
+        wandb_compress_videos=getattr(args, 'wandb_compress_videos', True),
+        wandb_video_fps=getattr(args, 'wandb_video_fps', 4),
+        wandb_video_scale=getattr(args, 'wandb_video_scale', 0.5),
     )
 
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
         wandb_name = f"{time_str}_{args.wandb_name}"
-        run_dir = os.path.join(args.output_path, "wandb", wandb_name)
+        run_dir = os.path.join("./wandb", wandb_name)
         if os.environ.get("LOCAL_RANK", "0") == "0":
             os.makedirs(run_dir, exist_ok=True)
         wandb_logger = WandbLogger(
@@ -783,6 +764,9 @@ def train(args):
         strategy=args.training_strategy,
         default_root_dir=run_dir,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        val_check_interval=300,
+        limit_val_batches=48,
+        num_sanity_val_steps=0,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
             save_top_k=-1,
             dirpath=os.path.join(run_dir, "checkpoints"),
@@ -791,13 +775,12 @@ def train(args):
         logger=logger,
         log_every_n_steps=1,
     )
-    trainer.fit(model, dataloader)
+    # Run an initial validation at step 0 for debugging/baseline
+    trainer.validate(model, val_dataloader)
+    trainer.fit(model, dataloader, val_dataloader)
 
 
 if __name__ == '__main__':
     args = parse_args()
     os.makedirs(os.path.join(args.output_path, "checkpoints"), exist_ok=True)
-    if args.task == "data_process":
-        data_process(args)
-    elif args.task == "train":
-        train(args)
+    train(args)

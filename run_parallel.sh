@@ -6,7 +6,7 @@
 #  unset all_proxy
 
 # 1. 设置您想要使用的GPU列表
-GPUS_TO_USE=(6 7)
+GPUS_TO_USE=(4 5 6 7)
 
 # 2. 循环遍历GPU列表，为每个GPU启动一个后台进程
 echo "Starting parallel processing..."

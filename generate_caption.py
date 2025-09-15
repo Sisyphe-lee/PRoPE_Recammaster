@@ -44,7 +44,7 @@ querys = [
 
 @torch.no_grad()
 def generate_internlm_captions(
-    path: str = "/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10", 
+    path: str = "/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f24_aperture5", 
     model_type: str = 'internlmx',
     category: str = 'all',
     gpu_id: int = 4,
@@ -63,7 +63,7 @@ def generate_internlm_captions(
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
     # --- CSV INITIALIZATION & PROCESSED VIDEO CHECK ---
-    output_csv_path = "metadata_debug.csv"
+    output_csv_path = "metadata_f24_aperture5.csv"
     processed_videos = set()
     if os.path.exists(output_csv_path):
         with open(output_csv_path, 'r', newline='', encoding='utf-8') as f:

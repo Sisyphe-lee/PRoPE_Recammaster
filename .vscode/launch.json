@@ -24,7 +24,7 @@
             "request": "attach",
             "connect": {
                 "host": "localhost",
-                "port": 6867,
+                "port": 6862,
             },
             "justMyCode": false,
             "pathMappings": [

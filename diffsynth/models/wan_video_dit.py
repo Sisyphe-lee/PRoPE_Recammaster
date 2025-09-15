@@ -224,7 +224,7 @@ class  PRoPE_SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.2):
+    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.5):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
@@ -347,12 +347,13 @@ class DiTBlock(nn.Module):
         # x.shape   torch.Size([1, 65520, 1536]) 
         # encode camera
 
-        N = cam_emb.shape[1]
-        reshaped_cam_emb = cam_emb.view(N, 3, 4)
+        B, N, _ = cam_emb.shape
+        reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
         bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
         bottom_row = bottom_row.unsqueeze(0).expand(N, -1, -1)
-        cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=1)
-        cam_emb = cam_emb.unsqueeze(0)
+        bottom_row = bottom_row.unsqueeze(0).expand(B, -1, -1, -1)
+        cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
+        # cam_emb = cam_emb.unsqueeze(0)
 
         N = cam_emb.shape[1]
         
