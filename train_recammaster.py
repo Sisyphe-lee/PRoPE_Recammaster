@@ -346,7 +346,7 @@ class LightningModelForTrain(pl.LightningModule):
         loss = loss * self.pipe.scheduler.training_weight(timestep)
 
         # Record log
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch['pixel_values'].shape[0])
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=latents.shape[0])
         return loss
 
     @torch.no_grad()
