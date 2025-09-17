@@ -317,11 +317,12 @@ class CrossAttention(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, enable_cam_layers: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.enable_cam_layers = enable_cam_layers
 
         self.self_attn = PRoPE_SelfAttention(dim, num_heads, eps)
         # self.self_attn = SelfAttention(dim, num_heads, eps)
@@ -333,6 +334,9 @@ class DiTBlock(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        
+        # Camera layers are registered externally in training script
+        # This class only controls whether to use projector or not
 
     def forward(self, x, context, cam_emb, t_mod, freqs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -359,7 +363,11 @@ class DiTBlock(nn.Module):
         
         # Ensure Ks has the same dtype and device as input_x
         Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=input_x.device, dtype=input_x.dtype).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
-        x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
+        
+        if self.enable_cam_layers:
+            x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
+        else:
+            x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks)
 
 
         # cam_emb = self.cam_encoder(cam_emb)
@@ -422,6 +430,7 @@ class WanModel(torch.nn.Module):
         num_heads: int,
         num_layers: int,
         has_image_input: bool,
+        enable_cam_layers: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -444,7 +453,7 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)  # Always start with False, will be set dynamically
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -453,6 +462,7 @@ class WanModel(torch.nn.Module):
 
         if has_image_input:
             self.img_emb = MLP(1280, dim)  # clip_feature_dim = 1280
+    
 
     def patchify(self, x: torch.Tensor):
         x = self.patch_embedding(x)
