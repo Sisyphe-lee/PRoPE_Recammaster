@@ -161,6 +161,8 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             cond_relative_poses.append(torch.as_tensor(cond_relative_pose)[:,:3,:][1])
         cond_pose_embedding = torch.stack(cond_relative_poses, dim=0)  # 21x3x4
         cond_pose_embedding = rearrange(cond_pose_embedding, 'b c d -> b (c d)')  # 21x12
+        
+        
 
         # 3) For each target camera, compute relative poses using condition's first frame as reference
         camera_list = []
@@ -329,5 +331,6 @@ if __name__ == '__main__':
                 num_inference_steps=50,
                 seed=0, tiled=True
             )
+            
             filename = f"{scene_name}_cam{cond_cam_type_id}_camtype{cam_type_id}.mp4"
             save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)

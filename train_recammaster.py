@@ -148,7 +148,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
                 cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
                 tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
-                pose_embedding = torch.cat([cond_embedding, tgt_embedding], dim=0)
+                pose_embedding = torch.cat([tgt_embedding  , tgt_embedding], dim=0)
                 # --- End: Calculate relative camera poses ---
                 
                 

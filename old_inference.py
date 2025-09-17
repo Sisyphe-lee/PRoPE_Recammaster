@@ -148,6 +148,14 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
         pose_embedding = torch.stack(relative_poses, dim=0)  # 21x3x4
         pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
+        
+        cond_embedding = tgt_cam_params[0]
+        cond_embedding = cond_embedding.unsqueeze(0)
+        cond_embedding = cond_embedding.repeat(21, 1, 1)
+        cond_embedding = cond_embedding.to(torch.bfloat16)
+        pose_embedding = torch.cat([cond_embedding, pose_embedding], dim=0)
+        
+        
         data['camera'] = pose_embedding.to(torch.bfloat16)
         return data
     
