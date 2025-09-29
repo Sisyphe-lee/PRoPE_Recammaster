@@ -23,7 +23,7 @@ else
     ENABLE_CAM_LAYERS="--enable_cam_layers"
 fi
 
-CUDA_VISIBLE_DEVICES="0" python train_recammaster.py  \
+CUDA_VISIBLE_DEVICES="1,2,3,5,6,7" python train_recammaster.py  \
  --task train  \
  --dataset_path /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10  \
  --output_path "$OUTPUT_DIR"   \
@@ -36,8 +36,13 @@ CUDA_VISIBLE_DEVICES="0" python train_recammaster.py  \
  --use_gradient_checkpointing  \
  --dataloader_num_workers 4 \
  --batch_size 2 \
+ --val_size 48 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
- --metadata_file_name "metadata.csv" \
- --wandb_name "Exp04b" \
+ --ckpt_type "$CHECKPOINT_TYPE" \
+ $ENABLE_CAM_LAYERS \
+ --metadata_path "./metadata.csv" \
+ --wandb_name "Exp04e" \
+ --val_check_interval_batches 300 \
+ --training_strategy deepspeed_stage_2 \
 #  --debug \
 

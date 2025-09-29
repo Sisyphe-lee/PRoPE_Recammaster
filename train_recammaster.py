@@ -528,7 +528,7 @@ def parse_args():
     parser.add_argument(
         "--wandb_video_strategy",
         type=str,
-        default="selective",
+        default="all",
         choices=["none", "selective", "quality_based", "all"],
         help="Strategy for uploading validation videos to WandB. 'none': no upload, 'selective': first few + every Nth, 'quality_based': based on PSNR thresholds, 'all': upload all videos"
     )
@@ -585,6 +585,18 @@ def parse_args():
         type=int,
         default=42,
         help="Random seed for ValidationDataset scene selection"
+    )
+    parser.add_argument(
+        "--val_check_interval",
+        type=int,
+        default=50,
+        help="Number of training steps between validation runs (default: 50)"
+    )
+    parser.add_argument(
+        "--val_check_interval_batches",
+        type=int,
+        default=None,
+        help="Number of batches between validation runs (overrides val_check_interval if set)"
     )
     args = parser.parse_args()
     return args
@@ -675,7 +687,7 @@ def train(args):
         strategy=args.training_strategy,
         default_root_dir=run_dir,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        val_check_interval=300,
+        val_check_interval=args.val_check_interval_batches if args.val_check_interval_batches is not None else args.val_check_interval,  # Use batch-based or step-based validation frequency
         limit_val_batches=len(val_dataset),
         num_sanity_val_steps=0,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
@@ -687,7 +699,7 @@ def train(args):
         log_every_n_steps=1,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    trainer.validate(model, val_dataloader)
+    # trainer.validate(model, val_dataloader)
     trainer.fit(model, dataloader, val_dataloader)
 
 
