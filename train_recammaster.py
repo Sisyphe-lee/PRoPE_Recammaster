@@ -1,9 +1,7 @@
 import copy
 import os
-import re
 import torch, os, imageio, argparse
 from torchvision.transforms import v2
-from einops import rearrange
 import lightning as pl
 import pandas as pd
 from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
@@ -17,153 +15,8 @@ import torch.nn.functional as F
 import shutil
 from datetime import datetime
 from wandb_module import WandBVideoLogger, VideoDecoder
+from dataset import create_datasets
 
-class Camera(object):
-    def __init__(self, c2w):
-        c2w_mat = np.array(c2w).reshape(4, 4)
-        self.c2w_mat = c2w_mat
-        self.w2c_mat = np.linalg.inv(c2w_mat)
-
-class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, steps_per_epoch, paths=None, deterministic=False, fixed_length=None):
-        metadata = pd.read_csv('./metadata.csv')
-        if paths is None:
-            self.path = [os.path.join(file_name) for file_name in metadata["video_absolute_path"]]
-            print(len(self.path), "videos in metadata.")
-            self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
-        else:
-            self.path = paths
-        print(len(self.path), "tensors cached in metadata.")
-        assert len(self.path) > 0
-        self.steps_per_epoch = steps_per_epoch
-        self.deterministic = deterministic
-        self.fixed_length = fixed_length
-
-
-    def parse_matrix(self, matrix_str):
-        rows = matrix_str.strip().split('] [')
-        matrix = []
-        for row in rows:
-            row = row.replace('[', '').replace(']', '')
-            matrix.append(list(map(float, row.split())))
-        return np.array(matrix)
-
-
-    def get_relative_pose(self, cam_params):
-        abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
-        abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
-        target_cam_c2w = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-        abs2rel = target_cam_c2w @ abs_w2cs[0]
-        ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
-        ret_poses = np.array(ret_poses, dtype=np.float32)
-        return ret_poses
-
-
-    def __getitem__(self, index):
-        # Return: 
-        # data['latents']: torch.Size([16, 21*2, 60, 104])
-        # data['camera']: torch.Size([21, 3, 4])
-        # data['prompt_emb']['context'][0]: torch.Size([512, 4096])
-        while True:
-            try:
-                data = {}
-                if self.deterministic:
-                    data_id = index % len(self.path)
-                else:
-                    data_id = torch.randint(0, len(self.path), (1,))[0]
-                    data_id = (data_id + index) % len(self.path) # For fixed seed.
-                path_tgt = self.path[data_id]
-                data_tgt = torch.load(path_tgt, weights_only=True, map_location="cpu")
-
-                # load the condition latent
-                match = re.search(r'cam(\d+)', path_tgt)
-                tgt_idx = int(match.group(1))
-                if self.deterministic:
-                    cond_idx = 1 if tgt_idx != 1 else 2
-                else:
-                    cond_idx = random.randint(1, 10)
-                    while cond_idx == tgt_idx:
-                        cond_idx = random.randint(1, 10)
-                path_cond = re.sub(r'cam(\d+)', f'cam{cond_idx:02}', path_tgt)
-                data_cond = torch.load(path_cond, weights_only=True, map_location="cpu")
-                data['latents'] = torch.cat((data_tgt['latents'],data_cond['latents']),dim=1)
-                data['prompt_emb'] = data_tgt['prompt_emb']
-                data['image_emb'] = {}
-
-                # Extract scene information from path
-                scene_match = re.search(r'scene(\d+)', path_tgt.lower())
-                scene_id = scene_match.group(1) if scene_match else 'unknown'
-                
-                # Store camera type information
-                data['scene_id'] = scene_id
-                data['condition_cam_type'] = f"cam{cond_idx:02d}"
-                data['target_cam_type'] = f"cam{tgt_idx:02d}"
-                data['path'] = path_tgt  # Keep original path for reference
-
-                # load the target trajectory
-                base_path = path_tgt.rsplit('/', 2)[0]
-                tgt_camera_path = os.path.join(base_path, "cameras", "camera_extrinsics.json")              
-                with open(tgt_camera_path, 'r') as file:
-                    cam_data = json.load(file)
-                multiview_c2ws = []
-                cam_idx = list(range(81))[::4] 
-                for view_idx in [cond_idx, tgt_idx]:
-                    traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{view_idx:02d}"]) for idx in cam_idx]
-                    traj = np.stack(traj).transpose(0, 2, 1)
-                    c2ws = []
-                    for c2w in traj:
-                        c2w = c2w[:, [1, 2, 0, 3]]
-                        c2w[:3, 1] *= -1.
-                        c2w[:3, 3] /= 100
-                        c2ws.append(c2w)
-                    multiview_c2ws.append(c2ws)
-                cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
-                tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
-                
-                # --- Start: Calculate relative camera poses ---
-                # The reference pose is the first frame of the conditional camera trajectory.
-                ref_cam = cond_cam_params[0]
-
-                # Calculate relative poses for the conditional trajectory
-                relative_cond_poses = []
-                for i in range(len(cond_cam_params)):
-                    # get_relative_pose expects a list of [reference_camera, target_camera]
-                    # It returns an array where the second element is the relative pose of the target.
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, cond_cam_params[i]])
-                    relative_cond_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-
-                # Calculate relative poses for the target trajectory
-                relative_tgt_poses = []
-                for i in range(len(tgt_cam_params)):
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
-                    relative_tgt_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-
-                # Stack, rearrange, and concatenate to form the final pose embedding
-                cond_embedding = torch.stack(relative_cond_poses, dim=0)
-                tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
-                cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
-                tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
-                pose_embedding = torch.cat([tgt_embedding  , tgt_embedding], dim=0)
-                # --- End: Calculate relative camera poses ---
-                
-                
-                data['camera'] = pose_embedding.to(torch.bfloat16)
-                break
-            except Exception as e:
-                print(f"ERROR WHEN LOADING: {e}")
-                index = random.randrange(len(self.path))
-        return data
-    
-
-    def __len__(self):
-        if self.fixed_length is not None:
-            return self.fixed_length
-        return self.steps_per_epoch
 
 
 
@@ -176,6 +29,8 @@ class LightningModelForTrain(pl.LightningModule):
         learning_rate=1e-5,
         use_gradient_checkpointing=True, use_gradient_checkpointing_offload=False,
         resume_ckpt_path=None,
+        ckpt_type="recammaster",
+        enable_cam_layers=False,
         wandb_video_strategy="selective",  # "none", "selective", "quality_based", "all"
         wandb_max_videos_per_epoch=5,
         wandb_video_quality_threshold=25.0,  # PSNR threshold for quality-based selection
@@ -197,50 +52,76 @@ class LightningModelForTrain(pl.LightningModule):
         self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-        dim=self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-        for block in self.pipe.dit.blocks:
-            block.cam_encoder = nn.Linear(12, dim)
-            block.projector = nn.Linear(dim, dim)
-            block.cam_encoder.weight.data.zero_()
-            block.cam_encoder.bias.data.zero_()
-            block.projector.weight = nn.Parameter(torch.eye(dim))
-            block.projector.bias = nn.Parameter(torch.zeros(dim))
+        # Store parameters for later use
+        self.ckpt_type = ckpt_type
+        self.enable_cam_layers = enable_cam_layers
+        ## TODO:
+        # Only inject camera layers if enabled (for ReCamMaster training)
+        if self.enable_cam_layers:
+            dim=self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+            for block in self.pipe.dit.blocks:
+                block.cam_encoder = nn.Linear(12, dim)
+                block.projector = nn.Linear(dim, dim)
+                block.cam_encoder.weight.data.zero_()
+                block.cam_encoder.bias.data.zero_()
+                block.projector.weight = nn.Parameter(torch.eye(dim))
+                block.projector.bias = nn.Parameter(torch.zeros(dim))
+                # Set enable_cam_layers to True so the forward method uses projector
+                block.enable_cam_layers = True
         
         if resume_ckpt_path is not None:
             print(f"Loading checkpoint from: {resume_ckpt_path}")
-            state_dict = torch.load(resume_ckpt_path, map_location="cpu")
-
-            # If the checkpoint is a deepspeed checkpoint, it might have a different format
-            if "module" in state_dict:
-                state_dict = state_dict["module"]
-
-            # Strip prefix from state_dict keys if necessary
-            prefixes_to_remove = ["module.", "model."]
-            has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
-            if has_prefix:
-                print("Prefix detected in checkpoint keys. Stripping prefixes...")
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    for p in prefixes_to_remove:
-                        if k.startswith(p):
-                            k = k[len(p):]
-                            break
-                    new_state_dict[k] = v
-                state_dict = new_state_dict
-                print("Prefixes stripped.")
-                self.pipe.dit.load_state_dict(state_dict, strict=False)
-            else:
-                self.pipe.dit.load_state_dict(state_dict, strict=True)
-
+            print(f"Checkpoint type: {self.ckpt_type}")
             
+            if self.ckpt_type == "wan21":
+                # Load Wan2.1 original model - use safetensors format
+                from safetensors.torch import load_file
+                state_dict = load_file(resume_ckpt_path)
+                print("Loading Wan2.1 original model...")
+                self.pipe.dit.load_state_dict(state_dict, strict=True)
+            else:
+                # Load ReCamMaster fine-tuned model - use torch format
+                state_dict = torch.load(resume_ckpt_path, map_location="cpu")
+
+                # If the checkpoint is a deepspeed checkpoint, it might have a different format
+                if "module" in state_dict:
+                    state_dict = state_dict["module"]
+
+                # Strip prefix from state_dict keys if necessary
+                prefixes_to_remove = ["module.", "model."]
+                has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
+                if has_prefix:
+                    print("Prefix detected in checkpoint keys. Stripping prefixes...")
+                    new_state_dict = {}
+                    for k, v in state_dict.items():
+                        for p in prefixes_to_remove:
+                            if k.startswith(p):
+                                k = k[len(p):]
+                                break
+                        new_state_dict[k] = v
+                    state_dict = new_state_dict
+                    print("Prefixes stripped.")
+                    self.pipe.dit.load_state_dict(state_dict, strict=False)
+                else:
+                    self.pipe.dit.load_state_dict(state_dict, strict=True)
+
             print("Have Loaded Checkpoint")
 
         self.freeze_parameters()
-        for name, module in self.pipe.denoising_model().named_modules():
-            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn"]):
-                # print(f"Trainable: {name}")
-                for param in module.parameters():
-                    param.requires_grad = True
+        # Only set camera layers as trainable if they are enabled
+        if self.enable_cam_layers:
+            for name, module in self.pipe.denoising_model().named_modules():
+                if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn"]):
+                    # print(f"Trainable: {name}")
+                    for param in module.parameters():
+                        param.requires_grad = True
+        else:
+            # If camera layers are not enabled, only make self_attn trainable
+            for name, module in self.pipe.denoising_model().named_modules():
+                if "self_attn" in name:
+                    # print(f"Trainable: {name}")
+                    for param in module.parameters():
+                        param.requires_grad = True
 
         trainable_params = 0
         seen_params = set()
@@ -401,7 +282,8 @@ class LightningModelForTrain(pl.LightningModule):
                 metadata = {
                     'scene_id': scene_id,
                     'condition_cam_type': condition_cam_type,
-                    'target_cam_type': target_cam_type
+                    'target_cam_type': target_cam_type,
+                    'current_step': self.global_step  # Store current step in metadata
                 }
                 
                 # Queue video using WandB logger
@@ -608,15 +490,35 @@ def parse_args():
         default="train",
         help="WandB run name.",
     )
+    # Replaced metadata_file_name with metadata_path
     parser.add_argument(
-        "--metadata_file_name",
+        "--metadata_path",
         type=str,
-        default="metadata.csv",
+        required=True,
+        help="Absolute path to the metadata CSV file.",
+    )
+    parser.add_argument(
+        "--val_size",
+        type=int,
+        default=48,
+        help="Number of samples to use for validation (taken from the beginning of metadata).",
     )
     parser.add_argument(
         "--resume_ckpt_path",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--ckpt_type",
+        type=str,
+        default="recammaster",
+        choices=["wan21", "recammaster"],
+        help="Type of checkpoint to load: 'wan21' for original Wan2.1 model, 'recammaster' for ReCamMaster fine-tuned model"
+    )
+    parser.add_argument(
+        "--enable_cam_layers",
+        action="store_true",
+        help="Enable camera encoder and projector layers injection (only for ReCamMaster training)"
     )
     parser.add_argument(
         "--batch_size",
@@ -660,6 +562,30 @@ def parse_args():
         default=0.5,
         help="Scale factor for WandB videos (0.5 = half resolution, reduces file size)"
     )
+    parser.add_argument(
+        "--use_validation_dataset",
+        action="store_true",
+        default=False,
+        help="Use ValidationDataset (3 scenes, 10x10 combinations each = 300 samples) instead of simple split"
+    )
+    parser.add_argument(
+        "--num_val_scenes",
+        type=int,
+        default=3,
+        help="Number of scenes to use for ValidationDataset"
+    )
+    parser.add_argument(
+        "--cameras_per_scene",
+        type=int,
+        default=10,
+        help="Number of cameras per scene for ValidationDataset"
+    )
+    parser.add_argument(
+        "--val_seed",
+        type=int,
+        default=42,
+        help="Random seed for ValidationDataset scene selection"
+    )
     args = parser.parse_args()
     return args
 
@@ -675,33 +601,16 @@ def train(args):
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
-    # Build datasets: create deterministic 10-sample validation split
-    full_dataset = TensorDataset(
-        args.dataset_path,
-        "/data1/lcy/projects/ReCamMaster/metadata_inference.csv",
-        steps_per_epoch=args.steps_per_epoch,
-    )
-    # Use actual dataset paths, not the string value of dataset_path
-    all_paths = list(full_dataset.path)
-    # Deterministic first 48 samples for validation
-    val_paths = all_paths[:48] if len(all_paths) >= 48 else all_paths[:len(all_paths)]
-    train_paths = [p for p in all_paths if p not in val_paths]
+    # Create datasets using the new create_datasets function
 
-    train_dataset = TensorDataset(
-        args.dataset_path,
-        "/data1/lcy/projects/ReCamMaster/metadata.csv",
+    train_dataset, val_dataset = create_datasets(
+        metadata_path=args.metadata_path,
+        val_size=args.val_size,
         steps_per_epoch=args.steps_per_epoch,
-        paths=train_paths,
-        deterministic=False,
-        fixed_length=None,
-    )
-    val_dataset = TensorDataset(
-        args.dataset_path,
-        "/data1/lcy/projects/ReCamMaster/metadata.csv",
-        steps_per_epoch=48,
-        paths=val_paths,
-        deterministic=True,
-        fixed_length=48 if len(val_paths) >= 48 else len(val_paths),
+        use_validation_dataset=args.use_validation_dataset,
+        num_val_scenes=args.num_val_scenes,
+        cameras_per_scene=args.cameras_per_scene,
+        seed=args.val_seed
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -731,6 +640,8 @@ def train(args):
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         resume_ckpt_path=args.resume_ckpt_path,
+        ckpt_type=args.ckpt_type,
+        enable_cam_layers=args.enable_cam_layers,
         wandb_video_strategy=getattr(args, 'wandb_video_strategy', 'selective'),
         wandb_max_videos_per_epoch=getattr(args, 'wandb_max_videos_per_epoch', 5),
         wandb_video_quality_threshold=getattr(args, 'wandb_video_quality_threshold', 25.0),
@@ -738,7 +649,7 @@ def train(args):
         wandb_video_fps=getattr(args, 'wandb_video_fps', 4),
         wandb_video_scale=getattr(args, 'wandb_video_scale', 0.5),
     )
-
+    
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
         wandb_name = f"{time_str}_{args.wandb_name}"
@@ -765,7 +676,7 @@ def train(args):
         default_root_dir=run_dir,
         accumulate_grad_batches=args.accumulate_grad_batches,
         val_check_interval=300,
-        limit_val_batches=48,
+        limit_val_batches=len(val_dataset),
         num_sanity_val_steps=0,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
             save_top_k=-1,

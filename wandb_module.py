@@ -80,10 +80,8 @@ class WandBVideoLogger:
         if self.strategy == "all":
             return True
         elif self.strategy == "selective":
-            # Upload first few samples and then every Nth sample
-            if batch_idx < 3:  # First 3 samples
-                return True
-            elif batch_idx % 10 == 0:  # Every 10th sample
+            # Upload every Nth sample
+            if batch_idx % 5 == 0:  # Every 5th sample
                 return True
             return False
         elif self.strategy == "quality_based":
@@ -157,7 +155,7 @@ class WandBVideoLogger:
         
         Args:
             logger: WandB logger instance
-            global_step: Current training step
+            global_step: Current training step (fallback if metadata doesn't contain step)
         """
         if not self.queued_videos:
             print("[W&B] No videos queued for upload this epoch")
@@ -168,66 +166,79 @@ class WandBVideoLogger:
             return
         
         try:
-            step_int = int(global_step)
-            
-            # Sort videos by PSNR for better organization
-            sorted_videos = sorted(self.queued_videos, key=lambda x: x['psnr'], reverse=True)
-            
-            upload_data = {}
-            table_data = []
-            
-            for i, video_info in enumerate(sorted_videos):
-                frames = video_info['frames']
+            # Group videos by step (from metadata) for better organization
+            videos_by_step = {}
+            for video_info in self.queued_videos:
                 metadata = video_info['metadata']
-                psnr = video_info['psnr']
-                batch_idx = video_info['batch_idx']
+                # Use step from metadata if available, otherwise fallback to global_step
+                step_int = metadata.get('current_step', global_step)
+                step_int = int(step_int)
                 
-                # Create compressed video for WandB
-                compressed_frames = self.compress_video_frames(frames)
+                if step_int not in videos_by_step:
+                    videos_by_step[step_int] = []
+                videos_by_step[step_int].append(video_info)
+            
+            # Upload videos grouped by step
+            for step_int, videos in videos_by_step.items():
+                # Sort videos by PSNR for better organization
+                sorted_videos = sorted(videos, key=lambda x: x['psnr'], reverse=True)
                 
-                # Create temporary file for WandB upload
-                temp_path = os.path.join(
-                    self.output_dir, 
-                    f"wandb_temp_step{step_int}_batch{batch_idx}.mp4"
+                upload_data = {}
+                table_data = []
+                
+                for i, video_info in enumerate(sorted_videos):
+                    frames = video_info['frames']
+                    metadata = video_info['metadata']
+                    psnr = video_info['psnr']
+                    batch_idx = video_info['batch_idx']
+                    
+                    # Create compressed video for WandB
+                    compressed_frames = self.compress_video_frames(frames)
+                    
+                    # Create temporary file for WandB upload
+                    temp_path = os.path.join(
+                        self.output_dir, 
+                        f"wandb_temp_step{step_int}_batch{batch_idx}.mp4"
+                    )
+                    imageio.mimsave(temp_path, compressed_frames, fps=self.video_fps, quality=6)
+                    
+                    # Create descriptive key for WandB - separate from PSNR metrics
+                    scene_id = metadata.get('scene_id', 'unknown')
+                    cond_cam = metadata.get('condition_cam_type', 'unknown')
+                    tgt_cam = metadata.get('target_cam_type', 'unknown')
+                    
+                    # Create separate video section for each step
+                    video_key = f"videos/step_{step_int}/scene_{scene_id}_{cond_cam}_to_{tgt_cam}_psnr_{psnr:.1f}"
+                    upload_data[video_key] = wandb.Video(temp_path, fps=self.video_fps, format="mp4")
+                    
+                    # Add to metadata table
+                    table_data.append([
+                        step_int, batch_idx, scene_id, cond_cam, tgt_cam, f"{psnr:.2f}"
+                    ])
+                
+                # Upload all videos for this step at once
+                logger.experiment.log(upload_data, step=step_int)
+                
+                # Upload metadata table in a separate section
+                table = wandb.Table(
+                    columns=["Step", "Batch", "Scene", "Source_Cam", "Target_Cam", "PSNR"],
+                    data=table_data
                 )
-                imageio.mimsave(temp_path, compressed_frames, fps=self.video_fps, quality=6)
+                logger.experiment.log({f"videos/step_{step_int}/metadata": table}, step=step_int)
                 
-                # Create descriptive key for WandB
-                scene_id = metadata.get('scene_id', 'unknown')
-                cond_cam = metadata.get('condition_cam_type', 'unknown')
-                tgt_cam = metadata.get('target_cam_type', 'unknown')
+                print(f"[W&B] Successfully uploaded {len(sorted_videos)} validation videos at step {step_int}")
                 
-                video_key = f"val/video_step{step_int}_scene{scene_id}_{cond_cam}to{tgt_cam}_psnr{psnr:.1f}"
-                upload_data[video_key] = wandb.Video(temp_path, fps=self.video_fps, format="mp4")
-                
-                # Add to metadata table
-                table_data.append([
-                    step_int, batch_idx, scene_id, cond_cam, tgt_cam, f"{psnr:.2f}"
-                ])
-            
-            # Upload all videos at once
-            logger.experiment.log(upload_data, step=step_int)
-            
-            # Upload metadata table
-            table = wandb.Table(
-                columns=["Step", "Batch", "Scene", "Source_Cam", "Target_Cam", "PSNR"],
-                data=table_data
-            )
-            logger.experiment.log({f"val/video_metadata_step{step_int}": table}, step=step_int)
-            
-            print(f"[W&B] Successfully uploaded {len(sorted_videos)} validation videos at step {step_int}")
-            
-            # Clean up temporary files
-            for video_info in sorted_videos:
-                batch_idx = video_info['batch_idx']
-                temp_path = os.path.join(
-                    self.output_dir, 
-                    f"wandb_temp_step{step_int}_batch{batch_idx}.mp4"
-                )
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
+                # Clean up temporary files for this step
+                for video_info in sorted_videos:
+                    batch_idx = video_info['batch_idx']
+                    temp_path = os.path.join(
+                        self.output_dir, 
+                        f"wandb_temp_step{step_int}_batch{batch_idx}.mp4"
+                    )
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
                     
         except Exception as e:
             print(f"Failed to upload videos to WandB: {e}")
@@ -274,11 +285,11 @@ class VideoDecoder:
         noise_pred_sample = noise_pred[0:1, :, :tgt_latent_len, ...]
         noisy_latents_sample = noisy_latents[0:1, :, :tgt_latent_len, ...]
 
-        # For FlowMatch, calculate predicted original sample
-        with torch.no_grad():
-            timestep_id_index = torch.argmin(torch.abs(self.pipe.scheduler.timesteps.to(noise_pred.device) - timestep))
-        sigma = self.pipe.scheduler.sigmas[timestep_id_index].to(noise_pred.device)
-        pred_original_sample = noisy_latents_sample - sigma * noise_pred_sample
+        # For FlowMatch, project to the final (sigma=0) in one step using scheduler
+        # This aligns validation restoration with the pipeline's inference update rule
+        pred_original_sample = self.pipe.scheduler.step(
+            noise_pred_sample, timestep, noisy_latents_sample, to_final=True
+        )
 
         # Prepare ground truth and condition latents
         gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
@@ -337,8 +348,28 @@ class VideoDecoder:
             'target_cam_type': target_cam_type
         }
         
-        # 7. SAVE LOCAL VIDEO
-        imageio.mimsave(output_path, combined_frames, fps=8, quality=8)
+        # 7. COMPRESS FRAMES FOR LOCAL STORAGE (optimized for storage)
+        local_scale = 0.5   # 1/2 resolution
+        frame_skip = 2      # Skip every other frame (1/2 frames)
+        local_fps = 4       # Reduced FPS from 8 to 4
+        local_quality = 4   # Lower quality for smaller file size
+        
+        compressed_combined_frames = []
+        for i, frame in enumerate(combined_frames):
+            # Skip frames for further compression
+            if i % frame_skip != 0:
+                continue
+                
+            # Resize frame using PIL for better quality
+            h, w = frame.shape[:2]
+            new_h, new_w = int(h * local_scale), int(w * local_scale)
+            frame_pil = Image.fromarray(frame)
+            frame_pil = frame_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            compressed_frame = np.array(frame_pil)
+            compressed_combined_frames.append(compressed_frame)
+        
+        # 8. SAVE LOCAL VIDEO (heavily compressed for storage)
+        imageio.mimsave(output_path, compressed_combined_frames, fps=local_fps, quality=local_quality)
         
         return psnr_value.detach().float().cpu().item(), combined_frames, metadata
 
