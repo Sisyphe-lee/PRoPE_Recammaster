@@ -20,12 +20,15 @@ class Camera(object):
 
 
 class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, steps_per_epoch, paths=None, deterministic=False, fixed_length=None):
+    def __init__(self, steps_per_epoch, paths=None, fixed_length=None, seed=42):
         self.path = paths
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
         self.steps_per_epoch = steps_per_epoch
-        self.deterministic = deterministic
+        self.seed = seed
+        # Set random seed for this dataset
+        random.seed(seed)
+        np.random.seed(seed)
         self.fixed_length = fixed_length
 
     def parse_matrix(self, matrix_str):
@@ -58,23 +61,21 @@ class TensorDataset(torch.utils.data.Dataset):
         while True:
             try:
                 data = {}
-                if self.deterministic:
-                    data_id = index % len(self.path)
-                else:
-                    data_id = torch.randint(0, len(self.path), (1,))[0]
-                    data_id = (data_id + index) % len(self.path) # For fixed seed.
+                # Use deterministic random selection based on seed and index
+                torch.manual_seed(self.seed + index)
+                data_id = torch.randint(0, len(self.path), (1,))[0]
+                data_id = (data_id + index) % len(self.path) # For fixed seed.
                 path_tgt = self.path[data_id]
                 data_tgt = torch.load(path_tgt, weights_only=True, map_location="cpu")
 
                 # load the condition latent
                 match = re.search(r'cam(\d+)', path_tgt)
                 tgt_idx = int(match.group(1))
-                if self.deterministic:
-                    cond_idx = 1 if tgt_idx != 1 else 2
-                else:
+                # Use deterministic random selection for condition camera
+                random.seed(self.seed + index + 1000)  # Different seed offset for condition selection
+                cond_idx = random.randint(1, 10)
+                while cond_idx == tgt_idx:
                     cond_idx = random.randint(1, 10)
-                    while cond_idx == tgt_idx:
-                        cond_idx = random.randint(1, 10)
                 path_cond = re.sub(r'cam(\d+)', f'cam{cond_idx:02}', path_tgt)
                 data_cond = torch.load(path_cond, weights_only=True, map_location="cpu")
                 data['latents'] = torch.cat((data_tgt['latents'],data_cond['latents']),dim=1)
@@ -142,7 +143,8 @@ class TensorDataset(torch.utils.data.Dataset):
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
-                index = random.randrange(len(self.path))
+                # Use deterministic fallback for reproducibility
+                index = (index + 1) % len(self.path)
         return data
     
 
@@ -324,7 +326,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
             cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
             tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
-            pose_embedding = torch.cat([cond_embedding, tgt_embedding], dim=0)
+            pose_embedding = torch.cat([tgt_embedding, cond_embedding], dim=0)
             
             data['camera'] = pose_embedding.to(torch.bfloat16)
             
@@ -332,9 +334,9 @@ class ValidationDataset(torch.utils.data.Dataset):
             
         except Exception as e:
             print(f"ERROR WHEN LOADING VALIDATION SAMPLE: {e}")
-            # Return a random sample if loading fails
-            random_idx = random.randint(0, len(self.val_combinations) - 1)
-            return self.__getitem__(random_idx)
+            # Return a deterministic sample if loading fails (use index % length for reproducibility)
+            fallback_idx = index % len(self.val_combinations)
+            return self.__getitem__(fallback_idx)
     
     def __len__(self):
         return len(self.val_combinations)
@@ -390,8 +392,8 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
         train_dataset = TensorDataset(
             steps_per_epoch=steps_per_epoch,
             paths=train_paths,
-            deterministic=False,
             fixed_length=None,
+            seed=seed,
         )
         
         return train_dataset, val_dataset
@@ -407,14 +409,14 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
         train_dataset = TensorDataset(
             steps_per_epoch=steps_per_epoch,
             paths=train_paths,
-            deterministic=False,
             fixed_length=None,
+            seed=seed,
         )
         val_dataset = TensorDataset(
             steps_per_epoch=val_size,
             paths=val_paths,
-            deterministic=True,
             fixed_length=val_size,
+            seed=seed + 10000,  # Different seed for validation dataset
         )
         
         return train_dataset, val_dataset

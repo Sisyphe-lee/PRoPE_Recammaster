@@ -21,7 +21,9 @@ class Camera(object):
 class TextVideoCameraDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, args, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
-        self.path = [os.path.join(file_name) for file_name in metadata["file_name"]]
+        self.base_path = base_path
+        raw_paths = metadata["file_name"].to_list()
+        self.path = [self._resolve_video_path(p) for p in raw_paths]
         self.text = metadata["text"].to_list()
         
         self.max_num_frames = max_num_frames
@@ -40,7 +42,30 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
         
+    def _resolve_video_path(self, file_name: str) -> str:
+        # If absolute and exists, return
+        if os.path.isabs(file_name) and os.path.exists(file_name):
+            return file_name
+        # Candidate 1: relative as-is from CWD
+        if os.path.exists(file_name):
+            return file_name
+        # Candidate 2: base_path + file_name
+        cand2 = os.path.join(self.base_path, file_name)
+        if os.path.exists(cand2):
+            return cand2
+        # Candidate 3: base_path/videos + file_name
+        cand3 = os.path.join(self.base_path, "videos", file_name)
+        if os.path.exists(cand3):
+            return cand3
+        # Candidate 4: if file_name already contains "videos/...", try base_path + that
+        if not os.path.isabs(file_name) and ("videos" in file_name):
+            cand4 = os.path.join(self.base_path, file_name)
+            if os.path.exists(cand4):
+                return cand4
+        # Fallback: return base_path/videos/file_name (may error later but is most likely)
+        return cand3
         
+    
     def crop_and_resize(self, image):
         width, height = image.size
         scale = max(self.width / width, self.height / height)
@@ -59,24 +84,17 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             return None
         
         frames = []
-        first_frame = None
         for frame_id in range(num_frames):
             frame = reader.get_data(start_frame_id + frame_id * interval)
             frame = Image.fromarray(frame)
             frame = self.crop_and_resize(frame)
-            if first_frame is None:
-                first_frame = np.array(frame)
             frame = frame_process(frame)
             frames.append(frame)
         reader.close()
 
         frames = torch.stack(frames, dim=0)
         frames = rearrange(frames, "T C H W -> C T H W")
-
-        if self.is_i2v:
-            return frames, first_frame
-        else:
-            return frames
+        return frames
 
 
     def is_image(self, file_path):
@@ -117,6 +135,56 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         ret_poses = np.array(ret_poses, dtype=np.float32)
         return ret_poses
 
+    def _convert_c2w_convention(self, c2w: np.ndarray) -> np.ndarray:
+        """Match the convention used for tgt camera JSON: reorder axes, flip Y, scale translation.
+        Input: 4x4 c2w
+        Output: 4x4 c2w after convention conversion
+        """
+        c2w = c2w.copy()
+        c2w = c2w[:, [1, 2, 0, 3]]  # reorder axes
+        c2w[:3, 1] *= -1.            # flip Y
+        c2w[:3, 3] /= 100.           # scale translation
+        return c2w
+
+    def _to_homogeneous(self, mats: np.ndarray) -> np.ndarray:
+        """Ensure poses are T x 4 x 4 homogeneous matrices."""
+        if mats.ndim != 3:
+            raise ValueError(f"Pose array must be 3D, got shape {mats.shape}")
+        T, h, w = mats.shape
+        if h == 4 and w == 4:
+            return mats
+        if h == 3 and w == 4:
+            last = np.tile(np.array([[0, 0, 0, 1]], dtype=mats.dtype), (T, 1, 1))
+            return np.concatenate([mats, last], axis=1)
+        raise ValueError(f"Unsupported pose shape {mats.shape}, expected (T,4,4) or (T,3,4)")
+
+    def _load_source_c2ws_from_npz(self, npz_path: str) -> tuple[np.ndarray, np.ndarray]:
+        """Load source camera c2w sequence and frame inds from an .npz file.
+        Returns: (c2w: (T,4,4) float32, inds: (T,) int64)
+        """
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"Source pose file not found: {npz_path}")
+        data = np.load(npz_path, allow_pickle=True)
+        if 'data' not in data or 'inds' not in data:
+            raise ValueError(f"Invalid pose file {npz_path}, expected keys 'data' and 'inds', got {data.files}")
+        mats = data['data'].astype(np.float32)
+        inds = data['inds']
+        mats = self._to_homogeneous(mats)  # (T,4,4)
+        return mats, inds
+
+    def _nearest_index(self, inds: np.ndarray, target: int) -> int:
+        """Find index i such that inds[i] is closest to target."""
+        j = (np.abs(inds - target)).argmin()
+        return int(j)
+
+    def _build_relative_embedding(self, cams: list) -> torch.Tensor:
+        relative_poses = []
+        for i in range(len(cams)):
+            relative_pose = self.get_relative_pose([cams[0], cams[i]])
+            relative_poses.append(torch.as_tensor(relative_pose)[:, :3, :][1])
+        pose_embedding = torch.stack(relative_poses, dim=0)
+        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
+        return pose_embedding
 
     def __getitem__(self, data_id):
         text = self.text[data_id]
@@ -128,65 +196,49 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         assert num_frames == 81
         data = {"text": text, "video": video, "path": path}
 
-        # load camera: derive target camera json path and condition cam id from video path
-        # Example path: /.../scene3294/videos/cam10.mp4
-        # -> cond_cam_type_id = 10
-        # -> tgt_camera_path = /.../scene3294/cameras/camera_extrinsics.json
-        videos_dir = os.path.dirname(path)
-        scene_dir = os.path.dirname(videos_dir)
-        tgt_camera_path = os.path.join(scene_dir, "cameras", "camera_extrinsics.json")
+        cam_idx = list(range(num_frames))[::4]
+
+        # Use parameterized camera extrinsics filename instead of hard-coding
+        tgt_camera_path = os.path.join(
+            self.args.dataset_path,
+            "cameras",
+            getattr(self.args, "camera_extrinsics_filename", "camera_extrinsics_ori.json")
+        )
         with open(tgt_camera_path, 'r') as file:
             cam_data = json.load(file)
 
-        cam_idx = list(range(num_frames))[::4]
+        videos_dir = os.path.dirname(path)
+        src_fname = os.path.basename(path)
+        src_stem, _ = os.path.splitext(src_fname)
+        src_npz_path = os.path.join(videos_dir, f"{src_stem}.npz")
+        src_c2ws, src_inds = self._load_source_c2ws_from_npz(src_npz_path)
 
-        # 1) Use the cam id parsed from file name as the condition video pose
-        cam_fname = os.path.basename(path)  # e.g., cam10.mp4
-        cam_stem = os.path.splitext(cam_fname)[0]  # cam10
-        cond_cam_type_id = int(cam_stem[3:]) if cam_stem.startswith("cam") and cam_stem[3:].isdigit() else 6
-        cond_traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cond_cam_type_id):02d}"]) for idx in cam_idx]
-        cond_traj = np.stack(cond_traj).transpose(0, 2, 1)
-        cond_c2ws = []
-        for c2w in cond_traj:
-            c2w = c2w[:, [1, 2, 0, 3]]
-            c2w[:3, 1] *= -1.
-            c2w[:3, 3] /= 100
-            cond_c2ws.append(c2w)
-        cond_cam_params = [Camera(cam_param) for cam_param in cond_c2ws]
-        ref_cam = cond_cam_params[0]
-        # 2) Compute condition poses relative to its own first frame
-        cond_relative_poses = []
-        for i in range(len(cond_cam_params)):
-            cond_relative_pose = self.get_relative_pose([ref_cam, cond_cam_params[i]])
-            cond_relative_poses.append(torch.as_tensor(cond_relative_pose)[:,:3,:][1])
-        cond_pose_embedding = torch.stack(cond_relative_poses, dim=0)  # 21x3x4
-        cond_pose_embedding = rearrange(cond_pose_embedding, 'b c d -> b (c d)')  # 21x12
+        src_c2ws_sampled = []
+        for t in cam_idx:
+            matches = np.where(src_inds == t)[0]
+            if len(matches) > 0:
+                j = int(matches[0])
+            else:
+                j = self._nearest_index(src_inds, t)
+            c2w = src_c2ws[j]
+            c2w = self._convert_c2w_convention(c2w)
+            src_c2ws_sampled.append(c2w)
+        src_cam_params = [Camera(c2w) for c2w in src_c2ws_sampled]
+        cond_embedding = self._build_relative_embedding(src_cam_params)
 
-        # 3) For each target camera, compute relative poses using condition's first frame as reference
         camera_list = []
-        for cam_type_id in range(1, 11):
-            traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type_id):02d}"]) for idx in cam_idx]
+        for cam_type in range(1, 11):
+            traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type):02d}"]) for idx in cam_idx]
             traj = np.stack(traj).transpose(0, 2, 1)
             c2ws = []
             for c2w in traj:
-                c2w = c2w[:, [1, 2, 0, 3]]
-                c2w[:3, 1] *= -1.
-                c2w[:3, 3] /= 100
+                c2w = self._convert_c2w_convention(c2w)
                 c2ws.append(c2w)
             tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
-
-            tgt_relative_poses = []
-            for i in range(len(tgt_cam_params)):
-                # Use condition's first frame as the reference instead of target's first frame
-                relative_pose = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
-                tgt_relative_poses.append(torch.as_tensor(relative_pose)[:,:3,:][1])
-            tgt_pose_embedding = torch.stack(tgt_relative_poses, dim=0)  # 21x3x4
-            tgt_pose_embedding = rearrange(tgt_pose_embedding, 'b c d -> b (c d)')  # 21x12
-
-            # 4) Concatenate condition pose and target pose along the feature dimension
-            combined_embedding = torch.cat([cond_pose_embedding, tgt_pose_embedding], dim=0)  # 42x12
-            camera_list.append(combined_embedding.to(torch.bfloat16))
-
+            tgt_embedding = self._build_relative_embedding(tgt_cam_params)
+            pose_embedding = torch.cat([tgt_embedding, cond_embedding], dim=0).to(torch.bfloat16)
+            camera_list.append(pose_embedding)
+        
         data['camera'] = camera_list
         return data
     
@@ -230,13 +282,30 @@ def parse_args():
         type=float,
         default=5.0,
     )
+    parser.add_argument(
+        "--ckpt_type",
+        type=str,
+        default="recammaster",
+        choices=["wan21", "recammaster"],
+        help="Type of checkpoint to load: 'wan21' for original Wan2.1 model, 'recammaster' for ReCamMaster fine-tuned model"
+    )
+    parser.add_argument(
+        "--enable_cam_layers",
+        action="store_true",
+        help="Enable camera encoder and projector layers injection (only for ReCamMaster)"
+    )
+    parser.add_argument(
+        "--camera_extrinsics_filename",
+        type=str,
+        default="camera_extrinsics_ori.json",
+        help="Filename of the target camera extrinsics JSON under {dataset_path}/cameras/"
+    )
     args = parser.parse_args()
     return args
 
 if __name__ == '__main__':
     args = parse_args()
 
-    # 1. Load Wan2.1 pre-trained models
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
         "models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
@@ -245,50 +314,89 @@ if __name__ == '__main__':
     ])
     pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device="cuda")
 
-    # 2. Initialize additional modules introduced in ReCamMaster
-    dim=pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-    for block in pipe.dit.blocks:
-        block.cam_encoder = nn.Linear(12, dim)
-        block.projector = nn.Linear(dim, dim)
-        block.cam_encoder.weight.data.zero_()
-        block.cam_encoder.bias.data.zero_()
-        block.projector.weight = nn.Parameter(torch.eye(dim))
-        block.projector.bias = nn.Parameter(torch.zeros(dim))
-
-    # 3. Load ReCamMaster checkpoint
-    state_dict = torch.load(args.ckpt_path, map_location="cpu")
-    # Check if any keys have a common prefix
-    if 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-
-    # Common prefixes to check for and remove
-    prefixes_to_remove = ['model.', 'module.', 'pipe.dit.']
-    has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
-
-    if has_prefix:
-        print("Prefix detected in checkpoint keys. Attempting to strip them.")
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            for p in prefixes_to_remove:
-                if k.startswith(p):
-                    k = k[len(p):]
-                    break
-            new_state_dict[k] = v
-        state_dict = new_state_dict
-        print("Prefixes stripped. Using the new state_dict.")
-
-    # 3.1 Load ReCamMaster checkpoint
-    pipe.dit.load_state_dict(state_dict, strict=True)
+    print(f"Loading checkpoint from: {args.ckpt_path}")
+    print(f"Checkpoint type: {args.ckpt_type}")
+    
+    if args.ckpt_type == "wan21":
+        # Support both safetensors and torch formats for Wan2.1 DiT checkpoints
+        state_dict = None
+        if str(args.ckpt_path).endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(args.ckpt_path)
+        else:
+            # torch-based checkpoint
+            raw = torch.load(args.ckpt_path, map_location="cpu")
+            # Unwrap common containers
+            if isinstance(raw, dict) and 'state_dict' in raw:
+                raw = raw['state_dict']
+            if isinstance(raw, dict) and 'module' in raw:
+                raw = raw['module']
+            # Strip common prefixes
+            prefixes = ['model.', 'module.', 'pipe.dit.', 'dit.']
+            state_dict = {}
+            for k, v in raw.items():
+                kk = k
+                for p in prefixes:
+                    if kk.startswith(p):
+                        kk = kk[len(p):]
+                        break
+                # Filter out any camera-layer weights accidentally present
+                if '.cam_encoder.' in kk or '.projector.' in kk:
+                    continue
+                state_dict[kk] = v
+        print("Loading Wan2.1 DiT weights...")
+        pipe.dit.load_state_dict(state_dict, strict=True)
+    else:
+        state_dict = torch.load(args.ckpt_path, map_location="cpu")
+        if 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        if "module" in state_dict:
+            state_dict = state_dict["module"]
+        prefixes_to_remove = ['model.', 'module.', 'pipe.dit.']
+        has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
+        if has_prefix:
+            print("Prefix detected in checkpoint keys. Attempting to strip them.")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                for p in prefixes_to_remove:
+                    if k.startswith(p):
+                        k = k[len(p):]
+                        break
+                new_state_dict[k] = v
+            state_dict = new_state_dict
+            print("Prefixes stripped. Using the new state_dict.")
+        contains_cam_layers = any('.cam_encoder.' in k or '.projector.' in k for k in state_dict.keys())
+        if contains_cam_layers:
+            print("Checkpoint contains camera layers; registering modules before loading...")
+            dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+            for block in pipe.dit.blocks:
+                if not hasattr(block, 'cam_encoder'):
+                    block.cam_encoder = nn.Linear(12, dim)
+                if not hasattr(block, 'projector'):
+                    block.projector = nn.Linear(dim, dim, bias=True)
+                block.enable_cam_layers = True
+        pipe.dit.load_state_dict(state_dict, strict=True)
+        if args.enable_cam_layers and not contains_cam_layers:
+            print("Enabling camera layers (not present in checkpoint); registering with identity/zero init...")
+            dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+            for block in pipe.dit.blocks:
+                block.cam_encoder = nn.Linear(12, dim)
+                block.projector = nn.Linear(dim, dim)
+                with torch.no_grad():
+                    block.cam_encoder.weight.zero_()
+                    block.cam_encoder.bias.zero_()
+                    block.projector.weight.copy_(torch.eye(dim))
+                    block.projector.bias.zero_()
+                block.enable_cam_layers = True
+    
     pipe.to("cuda")
     pipe.to(dtype=torch.bfloat16)
 
-    # Create timestamped output directory under ./result
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join("./result", timestamp)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # 4. Prepare test data (source video, target camera, target trajectory)
     dataset = TextVideoCameraDataset(
         args.dataset_path,
         os.path.join(args.dataset_path, "metadata.csv"),
@@ -301,19 +409,12 @@ if __name__ == '__main__':
         num_workers=args.dataloader_num_workers
     )
 
-    # 5. Inference
     for batch_idx, batch in enumerate(dataloader):
         target_text = batch["text"]
         source_video = batch["video"]
-        camera_list = batch["camera"]  # list of 10 pose embeddings (batched tensors)
-        # Derive naming components from dataset path
+        camera_list = batch["camera"]
         source_path = batch["path"][0]
-        videos_dir = os.path.dirname(source_path)
-        scene_dir = os.path.dirname(videos_dir)
-        scene_name = os.path.basename(scene_dir)  # e.g., scene3294
-        cam_fname = os.path.basename(source_path)  # e.g., cam10.mp4
-        cam_stem = os.path.splitext(cam_fname)[0]  # cam10
-        cond_cam_type_id = int(cam_stem[3:]) if cam_stem.startswith("cam") and cam_stem[3:].isdigit() else 6
+        cam_fname = os.path.basename(source_path)  # original video filename
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
@@ -329,5 +430,5 @@ if __name__ == '__main__':
                 num_inference_steps=50,
                 seed=0, tiled=True
             )
-            filename = f"{scene_name}_cam{cond_cam_type_id}_camtype{cam_type_id}.mp4"
+            filename = cam_fname
             save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)

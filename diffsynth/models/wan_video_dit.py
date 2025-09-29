@@ -1,4 +1,5 @@
 import torch
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -364,10 +365,15 @@ class DiTBlock(nn.Module):
         # Ensure Ks has the same dtype and device as input_x
         Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=input_x.device, dtype=input_x.dtype).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
         
-        if self.enable_cam_layers:
-            x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
-        else:
-            x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks)
+        try:
+            if self.enable_cam_layers:
+                x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
+            else:
+                x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                raise RuntimeError(f"[OOM][submodule=self_attn] {e}") from e
+            raise
 
 
         # cam_emb = self.cam_encoder(cam_emb)
@@ -380,7 +386,12 @@ class DiTBlock(nn.Module):
         
         
         
-        x = x + self.cross_attn(self.norm3(x), context)
+        try:
+            x = x + self.cross_attn(self.norm3(x), context)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                raise RuntimeError(f"[OOM][submodule=cross_attn] {e}") from e
+            raise
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp * self.ffn(input_x)
         return x
@@ -516,23 +527,36 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
-        for block in self.blocks:
-            if self.training and use_gradient_checkpointing:
-                if use_gradient_checkpointing_offload:
-                    with torch.autograd.graph.save_on_cpu():
+        # Iterate blocks with OOM reporting per DiT layer
+        for layer_index, block in enumerate(self.blocks):
+            try:
+                if self.training and use_gradient_checkpointing:
+                    if use_gradient_checkpointing_offload:
+                        with torch.autograd.graph.save_on_cpu():
+                            x = torch.utils.checkpoint.checkpoint(
+                                create_custom_forward(block),
+                                x, context, cam_emb, t_mod, freqs,
+                                use_reentrant=False,
+                            )
+                    else:
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
                             x, context, cam_emb, t_mod, freqs,
                             use_reentrant=False,
                         )
                 else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x, context, cam_emb, t_mod, freqs,
-                        use_reentrant=False,
-                    )
-            else:
-                x = block(x, context, cam_emb, t_mod, freqs)
+                    x = block(x, context, cam_emb, t_mod, freqs)
+            except RuntimeError as e:
+                # Augment CUDA OOM with layer index and rank information
+                msg = str(e)
+                if "out of memory" in msg.lower():
+                    try:
+                        import torch.distributed as dist
+                        rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("LOCAL_RANK", -1))
+                    except Exception:
+                        rank = int(os.environ.get("LOCAL_RANK", -1))
+                    raise RuntimeError(f"[OOM][rank{rank}] DiTBlock index {layer_index}: {msg}") from e
+                raise
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

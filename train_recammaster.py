@@ -18,6 +18,18 @@ from wandb_module import WandBVideoLogger, VideoDecoder
 from dataset import create_datasets
 
 
+def set_global_seed(seed):
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Set deterministic behavior for better reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 
 
 class LightningModelForTrain(pl.LightningModule):
@@ -36,10 +48,19 @@ class LightningModelForTrain(pl.LightningModule):
         wandb_video_quality_threshold=25.0,  # PSNR threshold for quality-based selection
         wandb_compress_videos=True,
         wandb_video_fps=4,  # Reduced FPS for WandB uploads
-        wandb_video_scale=0.5  # Scale factor for WandB videos (0.5 = half resolution)
+        wandb_video_scale=0.5,  # Scale factor for WandB videos (0.5 = half resolution)
+        global_seed=42,
+        enable_test_step=False,
+        test_samples=10,
+        test_inference_steps=5
     ):
         super().__init__()
         self.latent_path = latent_path
+        self.global_seed = global_seed
+        self.enable_test_step = enable_test_step
+        self.test_samples = test_samples
+        self.test_inference_steps = test_inference_steps
+        self.test_dataset = None  # Will be set later
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -50,7 +71,8 @@ class LightningModelForTrain(pl.LightningModule):
         model_manager.load_models(models_to_load)
         
         self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
-        self.pipe.scheduler.set_timesteps(1000, training=True)
+        self.train_timesteps = 1000
+        self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
 
         # Store parameters for later use
         self.ckpt_type = ckpt_type
@@ -74,11 +96,31 @@ class LightningModelForTrain(pl.LightningModule):
             print(f"Checkpoint type: {self.ckpt_type}")
             
             if self.ckpt_type == "wan21":
-                # Load Wan2.1 original model - use safetensors format
-                from safetensors.torch import load_file
-                state_dict = load_file(resume_ckpt_path)
-                print("Loading Wan2.1 original model...")
-                self.pipe.dit.load_state_dict(state_dict, strict=True)
+                # Check if it's a .ckpt file (PyTorch format) or .safetensors file
+                if resume_ckpt_path.endswith('.ckpt'):
+                    # Load PyTorch checkpoint from previous wan21 training
+                    print("Loading wan21 checkpoint from PyTorch format...")
+                    state_dict = torch.load(resume_ckpt_path, map_location="cpu")
+                    
+                    # Handle different checkpoint formats
+                    if "state_dict" in state_dict:
+                        # Lightning checkpoint format
+                        model_state_dict = state_dict["state_dict"]
+                        # Remove 'pipe.dit.' prefix if present
+                        dit_state_dict = {}
+                        for k, v in model_state_dict.items():
+                            if k.startswith("pipe.dit."):
+                                dit_state_dict[k[9:]] = v  # Remove 'pipe.dit.' prefix
+                        self.pipe.dit.load_state_dict(dit_state_dict, strict=False)
+                    else:
+                        # Direct state dict
+                        self.pipe.dit.load_state_dict(state_dict, strict=False)
+                else:
+                    # Load Wan2.1 original model - use safetensors format
+                    from safetensors.torch import load_file
+                    state_dict = load_file(resume_ckpt_path)
+                    print("Loading Wan2.1 original model from safetensors...")
+                    self.pipe.dit.load_state_dict(state_dict, strict=True)
             else:
                 # Load ReCamMaster fine-tuned model - use torch format
                 state_dict = torch.load(resume_ckpt_path, map_location="cpu")
@@ -161,8 +203,17 @@ class LightningModelForTrain(pl.LightningModule):
 
 
 
-    def decode_video_and_log(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch):
-        """Simplified video decoding using the VideoDecoder module"""
+    def decode_video(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch):
+        """Decode video and calculate PSNR without saving"""
+        # Use VideoDecoder to handle the complex decoding logic
+        psnr_value, combined_frames, metadata = self.video_decoder.decode_and_create_combined_video(
+            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch
+        )
+        
+        return psnr_value, combined_frames, metadata
+    
+    def save_video_with_naming(self, combined_frames, batch, video_type="val"):
+        """Save video with appropriate naming based on type"""
         # Extract metadata for file naming
         try:
             scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
@@ -174,19 +225,46 @@ class LightningModelForTrain(pl.LightningModule):
             condition_cam_type = "unknown"
             target_cam_type = "unknown"
         
-        # Create output path
+        # Create output path based on video type
         os.makedirs(self.latent_path, exist_ok=True)
-        combined_video_path = os.path.join(
-            self.latent_path, 
-            f"step{self.global_step}_SceneID{scene_id}_SourcePoseType{condition_cam_type}_TargetPoseType{target_cam_type}.mp4"
-        )
+        if video_type == "val":
+            video_path = os.path.join(
+                self.latent_path, 
+                f"step{self.global_step}_Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}.mp4"
+            )
+        elif video_type == "test":
+            video_path = os.path.join(
+                self.latent_path, 
+                f"test_epoch{self.current_epoch}_Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}.mp4"
+            )
+        else:
+            raise ValueError(f"Unknown video_type: {video_type}")
         
-        # Use VideoDecoder to handle the complex decoding logic
-        psnr_value, combined_frames, metadata = self.video_decoder.decode_and_create_combined_video(
-            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch, combined_video_path
-        )
+        # Compress frames for local storage (optimized for storage)
+        local_scale = 0.5   # 1/2 resolution
+        frame_skip = 2      # Skip every other frame (1/2 frames)
+        local_fps = 4       # Reduced FPS from 8 to 4
+        local_quality = 4   # Lower quality for smaller file size
         
-        return psnr_value, None, None, combined_video_path, combined_frames
+        compressed_combined_frames = []
+        for i, frame in enumerate(combined_frames):
+            # Skip frames for further compression
+            if i % frame_skip != 0:
+                continue
+                
+            # Resize frame using PIL for better quality
+            h, w = frame.shape[:2]
+            new_h, new_w = int(h * local_scale), int(w * local_scale)
+            frame_pil = Image.fromarray(frame)
+            frame_pil = frame_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            compressed_frame = np.array(frame_pil)
+            compressed_combined_frames.append(compressed_frame)
+        
+        # Save compressed video
+        imageio.mimsave(video_path, compressed_combined_frames, fps=local_fps, quality=local_quality)
+        print(f"Saved {video_type} video: {video_path}")
+        
+        return video_path
         
     def training_step(self, batch, batch_idx):
         # Data
@@ -204,9 +282,15 @@ class LightningModelForTrain(pl.LightningModule):
 
         # Loss
         self.pipe.device = self.device
-        noise = torch.randn_like(latents)
-        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
-        timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+        # Ensure training timesteps are set (validation/test may change it)
+        self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
+        # Use deterministic generators for reproducibility
+        gen_cuda = torch.Generator(device=self.device).manual_seed(self.global_seed + self.global_step)
+        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=gen_cuda)
+        gen_cpu = torch.Generator(device='cpu').manual_seed(self.global_seed + self.global_step)
+        tlen = len(self.pipe.scheduler.timesteps)
+        timestep_idx = torch.randint(0, tlen, (1,), generator=gen_cpu)
+        timestep = self.pipe.scheduler.timesteps[timestep_idx].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
         extra_input = self.pipe.prepare_extra_input(latents)
         origin_latents = copy.deepcopy(latents)
         noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
@@ -246,23 +330,53 @@ class LightningModelForTrain(pl.LightningModule):
         cam_emb = batch["camera"].to(self.device)
 
         self.pipe.device = self.device
-        noise = torch.randn_like(latents)
-        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
-        timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        extra_input = self.pipe.prepare_extra_input(latents)
-        origin_latents = copy.deepcopy(latents)
-        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
-        tgt_latent_len = noisy_latents.shape[2] // 2
-        noisy_latents[:, :, tgt_latent_len:, ...] = origin_latents[:, :, tgt_latent_len:, ...]
-
-        noise_pred = self.pipe.denoising_model()(noisy_latents, timestep=timestep, cam_emb=cam_emb, **prompt_emb, **extra_input, **image_emb,
-            use_gradient_checkpointing=self.use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload)
-
-        # Decode, compute PSNR, save videos locally
-        psnr_value, pred_frames, gt_frames, combined_path, combined_frames = self.decode_video_and_log(
-            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch
+        # Multi-step denoising in validation (like test_step)
+        tgt_latent_len = latents.shape[2] // 2
+        target_latents = latents[:, :, :tgt_latent_len, ...]
+        condition_latents = latents[:, :, tgt_latent_len:, ...]
+        
+        # Deterministic seed per step/batch
+        val_seed = self.global_seed + self.global_step + batch_idx
+        noise = self.pipe.generate_noise(
+            target_latents.shape,
+            seed=val_seed,
+            device=self.device,
+            dtype=torch.float32
+        ).to(dtype=self.pipe.torch_dtype, device=self.device)
+        
+        # Use multi-step scheduler
+        self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
+        latents_gen = noise
+        for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
+            timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
+            latents_input = torch.cat([latents_gen, condition_latents], dim=2)
+            extra_input = self.pipe.prepare_extra_input(latents_input)
+            noise_pred = self.pipe.denoising_model()(
+                latents_input,
+                timestep=timestep,
+                cam_emb=cam_emb,
+                **prompt_emb,
+                **extra_input,
+                **image_emb,
+                use_gradient_checkpointing=self.use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+            )
+            latents_gen = self.pipe.scheduler.step(
+                noise_pred[:, :, :tgt_latent_len, ...],
+                self.pipe.scheduler.timesteps[progress_id],
+                latents_input[:, :, :tgt_latent_len, ...]
+            )
+        
+        # Decode video and calculate PSNR (reuse decode logic)
+        dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
+        noisy_latents = torch.cat([latents_gen, condition_latents], dim=2)
+        origin_latents = torch.cat([target_latents, condition_latents], dim=2)
+        psnr_value, combined_frames, metadata = self.decode_video(
+            latents_gen, noisy_latents, tgt_latent_len, origin_latents, dummy_timestep, batch
         )
+        
+        # Save video with validation naming
+        combined_path = self.save_video_with_naming(combined_frames, batch, video_type="val")
 
         # Accumulate for epoch-average
         if not hasattr(self, "_val_psnr_sum"):
@@ -295,7 +409,125 @@ class LightningModelForTrain(pl.LightningModule):
         # Print info for all ranks about saved videos
         print(f"Rank {self.global_rank}: Saved validation videos for batch {batch_idx} at step {self.global_step}")
 
+        # Restore training timesteps after validation to avoid affecting training_step
+        self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
+
         return {"psnr": psnr_value}
+
+    @torch.no_grad()
+    def test_step(self, batch, batch_idx):
+        """Test step using inference mode (multi-step denoising from pure noise)"""
+        if not self.enable_test_step:
+            return {}
+            
+        # Only test on rank 0 to avoid duplicate work
+        if self.global_rank != 0:
+            return {}
+            
+        latents = batch["latents"].to(self.device)
+        prompt_emb = batch["prompt_emb"]
+        prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
+        image_emb = batch["image_emb"]
+        if "clip_feature" in image_emb:
+            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
+        if "y" in image_emb:
+            image_emb["y"] = image_emb["y"][0].to(self.device)
+        cam_emb = batch["camera"].to(self.device)
+
+        self.pipe.device = self.device
+        
+        # Get target and condition latents
+        tgt_latent_len = latents.shape[2] // 2
+        target_latents = latents[:, :, :tgt_latent_len, ...]
+        condition_latents = latents[:, :, tgt_latent_len:, ...]
+        
+        # Reuse pipeline's noise generation and scheduler setup
+        test_seed = self.global_seed + self.current_epoch + batch_idx
+        noise_shape = target_latents.shape
+        
+        # Use pipeline's generate_noise method (reuse from call())
+        noise = self.pipe.generate_noise(
+            noise_shape, 
+            seed=test_seed, 
+            device=self.device, 
+            dtype=torch.float32
+        ).to(dtype=self.pipe.torch_dtype, device=self.device)
+        
+        # Use pipeline's scheduler setup (reuse from call())
+        self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
+        
+        # Multi-step denoising loop (reuse from call())
+        latents = noise
+        
+        for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
+            timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
+            
+            # Prepare input latents (target + condition) - same as call()
+            latents_input = torch.cat([latents, condition_latents], dim=2)
+            
+            # Predict noise using the same method as call()
+            extra_input = self.pipe.prepare_extra_input(latents_input)
+            noise_pred = self.pipe.denoising_model()(
+                latents_input, 
+                timestep=timestep, 
+                cam_emb=cam_emb, 
+                **prompt_emb, 
+                **extra_input, 
+                **image_emb,
+                use_gradient_checkpointing=self.use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+            )
+            
+            # Scheduler step (same as call())
+            latents = self.pipe.scheduler.step(
+                noise_pred[:,:,:tgt_latent_len,...], 
+                self.pipe.scheduler.timesteps[progress_id], 
+                latents_input[:,:,:tgt_latent_len,...]
+            )
+        
+        # Reuse decode logic for consistency with validation_step
+        # Prepare inputs for decode_video_only
+        dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
+        
+        # Create noisy_latents format: [target_latents, condition_latents] 
+        noisy_latents = torch.cat([latents, condition_latents], dim=2)
+        
+        # Create origin_latents format: [target_latents, condition_latents]
+        origin_latents = torch.cat([target_latents, condition_latents], dim=2)
+        
+        # Decode video and calculate PSNR (same as validation_step)
+        test_psnr, combined_frames, metadata = self.decode_video(
+            latents, noisy_latents, tgt_latent_len, origin_latents, dummy_timestep, batch
+        )
+        
+        # Save video with test naming (only first 3 samples)
+        if batch_idx < 3:
+            try:
+                self.save_video_with_naming(combined_frames, batch, video_type="test")
+            except Exception as e:
+                print(f"Failed to save test video: {e}")
+        
+        # Log test PSNR
+        self.log("test_psnr", test_psnr, on_epoch=True, prog_bar=True, logger=True)
+        
+        return {"test_psnr": test_psnr}
+
+    def test_dataloader(self):
+        """Return test dataloader for automatic test_step execution after each epoch"""
+        if not self.enable_test_step or self.test_dataset is None:
+            return None
+        
+        # Create a subset of test dataset for testing
+        test_indices = list(range(min(self.test_samples, len(self.test_dataset))))
+        test_subset = torch.utils.data.Subset(self.test_dataset, test_indices)
+        
+        return torch.utils.data.DataLoader(
+            test_subset,
+            shuffle=False,
+            batch_size=1,
+            num_workers=4,  # Use reasonable number of workers
+            persistent_workers=True
+        )
 
     def on_validation_epoch_start(self):
         # Reset accumulators
@@ -500,7 +732,7 @@ def parse_args():
     parser.add_argument(
         "--val_size",
         type=int,
-        default=48,
+        default=24,
         help="Number of samples to use for validation (taken from the beginning of metadata).",
     )
     parser.add_argument(
@@ -528,7 +760,7 @@ def parse_args():
     parser.add_argument(
         "--wandb_video_strategy",
         type=str,
-        default="selective",
+        default="all",
         choices=["none", "selective", "quality_based", "all"],
         help="Strategy for uploading validation videos to WandB. 'none': no upload, 'selective': first few + every Nth, 'quality_based': based on PSNR thresholds, 'all': upload all videos"
     )
@@ -581,10 +813,40 @@ def parse_args():
         help="Number of cameras per scene for ValidationDataset"
     )
     parser.add_argument(
-        "--val_seed",
+        "--global_seed",
         type=int,
         default=42,
-        help="Random seed for ValidationDataset scene selection"
+        help="Global random seed for all random operations (training, validation, data loading, etc.)"
+    )
+    parser.add_argument(
+        "--enable_test_step",
+        action="store_true",
+        default=False,
+        help="Enable test step with inference mode (multi-step denoising) at the end of each epoch"
+    )
+    parser.add_argument(
+        "--test_samples",
+        type=int,
+        default=10,
+        help="Number of random samples to test in test_step (default: 10)"
+    )
+    parser.add_argument(
+        "--test_inference_steps",
+        type=int,
+        default=5,
+        help="Number of inference steps for test_step (default: 5)"
+    )
+    parser.add_argument(
+        "--val_check_interval",
+        type=int,
+        default=50,
+        help="Number of training steps between validation runs (default: 50)"
+    )
+    parser.add_argument(
+        "--val_check_interval_batches",
+        type=int,
+        default=None,
+        help="Number of batches between validation runs (overrides val_check_interval if set)"
     )
     args = parser.parse_args()
     return args
@@ -594,6 +856,10 @@ def parse_args():
     
     
 def train(args):
+    # Set global seed for reproducibility
+    set_global_seed(args.global_seed)
+    print(f"Global seed set to: {args.global_seed}")
+    
     if args.debug:
         print("Debug mode is enabled.") 
         import debugpy
@@ -610,21 +876,32 @@ def train(args):
         use_validation_dataset=args.use_validation_dataset,
         num_val_scenes=args.num_val_scenes,
         cameras_per_scene=args.cameras_per_scene,
-        seed=args.val_seed
+        seed=args.global_seed
     )
 
+    def worker_init_fn(worker_id):
+        """Initialize worker with deterministic seed"""
+        worker_seed = args.global_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+    
     dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=args.batch_size,
-        num_workers=args.dataloader_num_workers
+        num_workers=args.dataloader_num_workers,
+        worker_init_fn=worker_init_fn,
+        generator=torch.Generator().manual_seed(args.global_seed)
     )
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         shuffle=False,
         batch_size=1,
-        num_workers=args.dataloader_num_workers
+        num_workers=args.dataloader_num_workers,
+        worker_init_fn=worker_init_fn
     )
+    
 
     ## TODO: lantent_path = './latents/{date-time}/   if don't exist, then mkdir
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
@@ -648,7 +925,15 @@ def train(args):
         wandb_compress_videos=getattr(args, 'wandb_compress_videos', True),
         wandb_video_fps=getattr(args, 'wandb_video_fps', 4),
         wandb_video_scale=getattr(args, 'wandb_video_scale', 0.5),
+        global_seed=args.global_seed,
+        enable_test_step=args.enable_test_step,
+        test_samples=args.test_samples,
+        test_inference_steps=args.test_inference_steps,
     )
+    
+    # Set test dataset for automatic test_step execution
+    if args.enable_test_step:
+        model.test_dataset = val_dataset
     
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
@@ -675,7 +960,7 @@ def train(args):
         strategy=args.training_strategy,
         default_root_dir=run_dir,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        val_check_interval=300,
+        val_check_interval=args.val_check_interval_batches if args.val_check_interval_batches is not None else args.val_check_interval,  # Use batch-based or step-based validation frequency
         limit_val_batches=len(val_dataset),
         num_sanity_val_steps=0,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
@@ -688,6 +973,14 @@ def train(args):
     )
     # Run an initial validation at step 0 for debugging/baseline
     trainer.validate(model, val_dataloader)
+    
+    # Run an initial test at step 0 if test_step is enabled
+    # if test_dataloader is not None:
+    #     trainer.test(model, test_dataloader)
+    
+    # Lightning will automatically call test_step after each epoch if test_dataloader() returns a DataLoader
+    
+    # Fit the model
     trainer.fit(model, dataloader, val_dataloader)
 
 

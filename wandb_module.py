@@ -264,7 +264,7 @@ class VideoDecoder:
         origin_latents, 
         timestep, 
         batch,
-        output_path
+        output_path=None
     ):
         """
         Decode video and create combined visualization
@@ -276,7 +276,7 @@ class VideoDecoder:
             origin_latents: Original latent representations
             timestep: Current timestep
             batch: Batch data containing metadata
-            output_path: Path to save the combined video
+            output_path: Path to save the combined video (optional)
             
         Returns:
             Tuple of (psnr_value, combined_frames, metadata)
@@ -347,29 +347,6 @@ class VideoDecoder:
             'condition_cam_type': condition_cam_type,
             'target_cam_type': target_cam_type
         }
-        
-        # 7. COMPRESS FRAMES FOR LOCAL STORAGE (optimized for storage)
-        local_scale = 0.5   # 1/2 resolution
-        frame_skip = 2      # Skip every other frame (1/2 frames)
-        local_fps = 4       # Reduced FPS from 8 to 4
-        local_quality = 4   # Lower quality for smaller file size
-        
-        compressed_combined_frames = []
-        for i, frame in enumerate(combined_frames):
-            # Skip frames for further compression
-            if i % frame_skip != 0:
-                continue
-                
-            # Resize frame using PIL for better quality
-            h, w = frame.shape[:2]
-            new_h, new_w = int(h * local_scale), int(w * local_scale)
-            frame_pil = Image.fromarray(frame)
-            frame_pil = frame_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            compressed_frame = np.array(frame_pil)
-            compressed_combined_frames.append(compressed_frame)
-        
-        # 8. SAVE LOCAL VIDEO (heavily compressed for storage)
-        imageio.mimsave(output_path, compressed_combined_frames, fps=local_fps, quality=local_quality)
         
         return psnr_value.detach().float().cpu().item(), combined_frames, metadata
 
