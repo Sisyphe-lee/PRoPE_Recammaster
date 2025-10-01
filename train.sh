@@ -24,7 +24,11 @@ else
     ENABLE_CAM_LAYERS="--enable_cam_layers"
 fi
 
+<<<<<<< HEAD
 CUDA_VISIBLE_DEVICES="7" python train_recammaster.py  \
+=======
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" python train_recammaster.py  \
+>>>>>>> 1519934085cb6a8dcacb8ac62ccb465e0f5a37ce
  --task train  \
  --dataset_path /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10  \
  --output_path "$OUTPUT_DIR"   \
@@ -36,7 +40,11 @@ CUDA_VISIBLE_DEVICES="7" python train_recammaster.py  \
  --accumulate_grad_batches  4  \
  --use_gradient_checkpointing  \
  --dataloader_num_workers 2 \
+<<<<<<< HEAD
  --batch_size 1 \
+=======
+ --batch_size 2 \
+>>>>>>> 1519934085cb6a8dcacb8ac62ccb465e0f5a37ce
  --num_val_scenes 2 \
  --global_seed 42 \
  --enable_test_step \
@@ -47,8 +55,13 @@ CUDA_VISIBLE_DEVICES="7" python train_recammaster.py  \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
  --metadata_path "./metadata_subset.csv" \
+<<<<<<< HEAD
  --wandb_name "Exp07b" \
  --val_check_interval_batches 1000 \
+=======
+ --wandb_name "Exp07c" \
+ --val_check_interval_batches 100 \
+>>>>>>> 1519934085cb6a8dcacb8ac62ccb465e0f5a37ce
  --training_strategy deepspeed_stage_2 \
  --debug \
 

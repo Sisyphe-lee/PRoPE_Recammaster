@@ -11,14 +11,14 @@ OUTPUT_DIR="./results"
 WAN21_CHECKPOINT_PATH="./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
 # For ReCamMaster fine-tuned model:
 RECAMMASTER_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-16-231550_Exp04d/checkpoints/validation_step150.ckpt"
-WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-27-130130_Exp07b/checkpoints/step966.ckpt"
+WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-27-130130_Exp07b/checkpoints/step1149.ckpt"
 # Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
 CHECKPOINT_TYPE="wan21"  # Change to "wan21" if you want to use Wan2.1 model
 
 # Set checkpoint path based on type
 if [ "$CHECKPOINT_TYPE" = "wan21" ]; then
     CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
-    ENABLE_CAM_LAYERS="--enable_cam_layers"
+    ENABLE_CAM_LAYERS=""
 else
     CHECKPOINT_PATH="$RECAMMASTER_CHECKPOINT_PATH"
     ENABLE_CAM_LAYERS=""
