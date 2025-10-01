@@ -732,7 +732,7 @@ def parse_args():
     parser.add_argument(
         "--val_size",
         type=int,
-        default=24,
+        default=42, 
         help="Number of samples to use for validation (taken from the beginning of metadata).",
     )
     parser.add_argument(
@@ -816,7 +816,37 @@ def parse_args():
         "--global_seed",
         type=int,
         default=42,
-        help="Random seed for ValidationDataset scene selection"
+        help="Global random seed for all random operations (training, validation, data loading, etc.)"
+    )
+    parser.add_argument(
+        "--enable_test_step",
+        action="store_true",
+        default=False,
+        help="Enable test step with inference mode (multi-step denoising) at the end of each epoch"
+    )
+    parser.add_argument(
+        "--test_samples",
+        type=int,
+        default=10,
+        help="Number of random samples to test in test_step (default: 10)"
+    )
+    parser.add_argument(
+        "--test_inference_steps",
+        type=int,
+        default=5,
+        help="Number of inference steps for test_step (default: 5)"
+    )
+    parser.add_argument(
+        "--val_check_interval",
+        type=int,
+        default=50,
+        help="Number of training steps between validation runs (default: 50)"
+    )
+    parser.add_argument(
+        "--val_check_interval_batches",
+        type=int,
+        default=None,
+        help="Number of batches between validation runs (overrides val_check_interval if set)"
     )
     args = parser.parse_args()
     return args
@@ -873,7 +903,7 @@ def train(args):
     )
     
 
-    ## TODO: lantent_path = './latents/{date-time}/   if don't exist, then mkdir
+
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
     folder_name = f"{time_str}_{args.wandb_name}"
     latent_path = os.path.join("./wandb", folder_name, "video_debug")
@@ -942,7 +972,7 @@ def train(args):
         log_every_n_steps=1,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    trainer.validate(model, val_dataloader)
+    # trainer.validate(model, val_dataloader)
     
     # Run an initial test at step 0 if test_step is enabled
     # if test_dataloader is not None:

@@ -97,8 +97,9 @@ class TensorDataset(torch.utils.data.Dataset):
                 tgt_camera_path = os.path.join(base_path, "cameras", "camera_extrinsics.json")              
                 with open(tgt_camera_path, 'r') as file:
                     cam_data = json.load(file)
+                # Build c2w trajectories for cond and tgt with axis/scale normalization
                 multiview_c2ws = []
-                cam_idx = list(range(81))[::4] 
+                cam_idx = list(range(81))[::4]
                 for view_idx in [cond_idx, tgt_idx]:
                     traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{view_idx:02d}"]) for idx in cam_idx]
                     traj = np.stack(traj).transpose(0, 2, 1)
@@ -109,37 +110,35 @@ class TensorDataset(torch.utils.data.Dataset):
                         c2w[:3, 3] /= 100
                         c2ws.append(c2w)
                     multiview_c2ws.append(c2ws)
+                # Make Camera objects for relative pose utility
                 cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
                 tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
-                
-                # --- Start: Calculate relative camera poses ---
-                # The reference pose is the first frame of the conditional camera trajectory.
+                # Reference is cond[0] in world coordinates
                 ref_cam = cond_cam_params[0]
-
-                # Calculate relative poses for the conditional trajectory
-                relative_cond_poses = []
-                for i in range(len(cond_cam_params)):
-                    # get_relative_pose expects a list of [reference_camera, target_camera]
-                    # It returns an array where the second element is the relative pose of the target.
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, cond_cam_params[i]])
-                    relative_cond_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-
-                # Calculate relative poses for the target trajectory
-                relative_tgt_poses = []
-                for i in range(len(tgt_cam_params)):
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
-                    relative_tgt_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-
-                # Stack, rearrange, and concatenate to form the final pose embedding
-                cond_embedding = torch.stack(relative_cond_poses, dim=0)
-                tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
-                cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
-                tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
-                pose_embedding = torch.cat([tgt_embedding, cond_embedding], dim=0)
-                # --- End: Calculate relative camera poses ---
-                
-                
-                data['camera'] = pose_embedding.to(torch.bfloat16)
+                # Compute relative poses cam_ref<-cam_i via get_relative_pose then invert to cam_i<-ref
+                def invert_SE3_np(T):
+                    T = T.astype(np.float64)
+                    R = T[:3, :3]
+                    t = T[:3, 3]
+                    Rinv = R.T
+                    tinv = -Rinv @ t
+                    out = np.eye(4, dtype=np.float64)
+                    out[:3, :3] = Rinv
+                    out[:3, 3] = tinv
+                    return out.astype(np.float32)
+                def rel_to_ref_inv(cam_params):
+                    rel_list = []
+                    for i in range(len(cam_params)):
+                        relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])  # shape (2,4,4)
+                        cam_ref_from_cami = relative_pose_matrix[1]
+                        cami_from_ref = invert_SE3_np(cam_ref_from_cami)
+                        rel_list.append(cami_from_ref)
+                    return np.stack(rel_list, axis=0)
+                cond_w2c_rel = rel_to_ref_inv(cond_cam_params)
+                tgt_w2c_rel = rel_to_ref_inv(tgt_cam_params)
+                # Concatenate tgt first then cond to align with latents
+                all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
+                data['camera'] = torch.from_numpy(all_w2c).to(torch.bfloat16)
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
@@ -289,9 +288,9 @@ class ValidationDataset(torch.utils.data.Dataset):
             with open(tgt_camera_path, 'r') as file:
                 cam_data = json.load(file)
             
+            # Build c2w trajectories with axis/scale normalization (cond first, then tgt)
             multiview_c2ws = []
             cam_idx = list(range(81))[::4]
-            
             for view_idx in [cond_cam_idx, tgt_cam_idx]:
                 traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{view_idx:02d}"]) for idx in cam_idx]
                 traj = np.stack(traj).transpose(0, 2, 1)
@@ -302,33 +301,35 @@ class ValidationDataset(torch.utils.data.Dataset):
                     c2w[:3, 3] /= 100
                     c2ws.append(c2w)
                 multiview_c2ws.append(c2ws)
-            
+            # Reference is cond[0]
             cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
             tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
-            
-            # Calculate relative camera poses
             ref_cam = cond_cam_params[0]
-            
-            # Calculate relative poses for the conditional trajectory
-            relative_cond_poses = []
-            for i in range(len(cond_cam_params)):
-                relative_pose_matrix = self.get_relative_pose([ref_cam, cond_cam_params[i]])
-                relative_cond_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-            
-            # Calculate relative poses for the target trajectory
-            relative_tgt_poses = []
-            for i in range(len(tgt_cam_params)):
-                relative_pose_matrix = self.get_relative_pose([ref_cam, tgt_cam_params[i]])
-                relative_tgt_poses.append(torch.as_tensor(relative_pose_matrix)[1, :3, :])
-            
-            # Stack, rearrange, and concatenate to form the final pose embedding
-            cond_embedding = torch.stack(relative_cond_poses, dim=0)
-            tgt_embedding = torch.stack(relative_tgt_poses, dim=0)
-            cond_embedding = rearrange(cond_embedding, 'b c d -> b (c d)')
-            tgt_embedding = rearrange(tgt_embedding, 'b c d -> b (c d)')
-            pose_embedding = torch.cat([tgt_embedding, cond_embedding], dim=0)
-            
-            data['camera'] = pose_embedding.to(torch.bfloat16)
+            # Stable SE(3) inverse
+            def invert_SE3_np(T):
+                T = T.astype(np.float64)
+                R = T[:3, :3]
+                t = T[:3, 3]
+                Rinv = R.T
+                tinv = -Rinv @ t
+                out = np.eye(4, dtype=np.float64)
+                out[:3, :3] = Rinv
+                out[:3, 3] = tinv
+                return out.astype(np.float32)
+            # Compute cam_i <- ref via get_relative_pose then inverse
+            def rel_to_ref_inv(cam_params):
+                rel_list = []
+                for i in range(len(cam_params)):
+                    relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])
+                    cam_ref_from_cami = relative_pose_matrix[1]
+                    cami_from_ref = invert_SE3_np(cam_ref_from_cami)
+                    rel_list.append(cami_from_ref)
+                return np.stack(rel_list, axis=0)
+            cond_w2c_rel = rel_to_ref_inv(cond_cam_params)
+            tgt_w2c_rel = rel_to_ref_inv(tgt_cam_params)
+            # Concatenate tgt first then cond to align with latents order
+            all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
+            data['camera'] = torch.from_numpy(all_w2c).to(torch.bfloat16)
             
             return data
             
@@ -402,8 +403,8 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
         # Use simple split based on metadata order
         val_size = min(val_size, len(all_paths))
         val_paths = all_paths[:val_size]
-        train_paths = all_paths[val_size:]
-        
+        # train_paths = all_paths[val_size:]
+        train_paths = all_paths
         print(f"Dataset split -> train: {len(train_paths)}  val: {len(val_paths)}  (val_size={val_size})")
         
         train_dataset = TensorDataset(

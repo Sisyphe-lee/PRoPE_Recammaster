@@ -24,7 +24,7 @@ else
     ENABLE_CAM_LAYERS="--enable_cam_layers"
 fi
 
-CUDA_VISIBLE_DEVICES="2,3,4,5,6,7" python train_recammaster.py  \
+CUDA_VISIBLE_DEVICES="7" python train_recammaster.py  \
  --task train  \
  --dataset_path /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10  \
  --output_path "$OUTPUT_DIR"   \
@@ -32,22 +32,23 @@ CUDA_VISIBLE_DEVICES="2,3,4,5,6,7" python train_recammaster.py  \
  --vae_path "$MODEL_BASE_PATH/Wan2.1_VAE.pth"   \
  --steps_per_epoch 8000   \
  --max_epochs 100   \
- --learning_rate 1e-4   \
- --accumulate_grad_batches  2  \
+ --learning_rate 1e-5   \
+ --accumulate_grad_batches  4  \
  --use_gradient_checkpointing  \
- --dataloader_num_workers 4 \
+ --dataloader_num_workers 2 \
  --batch_size 1 \
  --num_val_scenes 2 \
  --global_seed 42 \
  --enable_test_step \
  --test_samples 10 \
- --test_inference_steps 10 \
+ --test_inference_steps 20 \
+ --val_size 10 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
  --metadata_path "./metadata_subset.csv" \
  --wandb_name "Exp07b" \
- --val_check_interval_batches 200 \
+ --val_check_interval_batches 1000 \
  --training_strategy deepspeed_stage_2 \
-#  --debug \
+ --debug \
 
