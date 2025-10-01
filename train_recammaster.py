@@ -732,7 +732,7 @@ def parse_args():
     parser.add_argument(
         "--val_size",
         type=int,
-        default=24,
+        default=42, 
         help="Number of samples to use for validation (taken from the beginning of metadata).",
     )
     parser.add_argument(
@@ -903,7 +903,7 @@ def train(args):
     )
     
 
-    ## TODO: lantent_path = './latents/{date-time}/   if don't exist, then mkdir
+
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
     folder_name = f"{time_str}_{args.wandb_name}"
     latent_path = os.path.join("./wandb", folder_name, "video_debug")
@@ -972,7 +972,7 @@ def train(args):
         log_every_n_steps=1,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    trainer.validate(model, val_dataloader)
+    # trainer.validate(model, val_dataloader)
     
     # Run an initial test at step 0 if test_step is enabled
     # if test_dataloader is not None:

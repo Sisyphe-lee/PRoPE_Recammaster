@@ -352,18 +352,39 @@ class DiTBlock(nn.Module):
         # x.shape   torch.Size([1, 65520, 1536]) 
         # encode camera
 
-        B, N, _ = cam_emb.shape
-        reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
-        bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
-        bottom_row = bottom_row.unsqueeze(0).expand(N, -1, -1)
-        bottom_row = bottom_row.unsqueeze(0).expand(B, -1, -1, -1)
-        cam_emb = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
-        # cam_emb = cam_emb.unsqueeze(0)
-
-        N = cam_emb.shape[1]
+        # cam_emb can be either (B, N, 12) as flattened 3x4, or (B, N, 4, 4) absolute w2c matrices.
+        if cam_emb.dim() == 3 and cam_emb.shape[-1] == 12:
+            B, N, _ = cam_emb.shape
+            reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
+            bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
+            bottom_row = bottom_row.view(1,1,1,4).expand(B, N, 1, 4)
+            viewmats = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
+        elif cam_emb.dim() == 4 and cam_emb.shape[-2:] == (4, 4):
+            B, N = cam_emb.shape[:2]
+            viewmats = cam_emb
+        else:
+            raise ValueError(f"Unexpected cam_emb shape: {cam_emb.shape}. Expected (B,N,12) or (B,N,4,4).")
+        
+        N = viewmats.shape[1]
         
         # Ensure Ks has the same dtype and device as input_x
-        Ks = torch.tensor([[818.18,0,540],[0,818.18,540],[0,0,1]], device=input_x.device, dtype=input_x.dtype).unsqueeze(0).repeat(N,1,1).unsqueeze(0)
+        # Compute camera intrinsics (in pixels) from focal length and resolution.
+        # Assumptions: 35mm sensor (36mm x 24mm), focal length f = 18mm, aperture does not affect pinhole intrinsics.
+        image_width = 832.0
+        image_height = 480.0
+        # Provided sensor size (square): 23.76mm x 23.76mm
+        sensor_width_mm = 23.76
+        sensor_height_mm = 23.76
+        f_mm = 18.0
+        # fx ≈ f * (W_px / sensor_width_mm), fy ≈ f * (H_px / sensor_height_mm)
+        fx = f_mm * (image_width / sensor_width_mm)   # ~ 630.0 px
+        fy = f_mm * (image_height / sensor_height_mm) # ~ 363.6 px
+        cx = image_width / 2.0                        # 416.0 px
+        cy = image_height / 2.0                       # 240.0 px
+        K = torch.tensor([[fx, 0.0, cx],
+                          [0.0, fy, cy],
+                          [0.0, 0.0, 1.0]], device=input_x.device, dtype=input_x.dtype)
+        Ks = K.view(1, 1, 3, 3).expand(B, N, 3, 3).contiguous()
         
         try:
             if self.enable_cam_layers:
