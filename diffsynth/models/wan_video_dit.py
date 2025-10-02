@@ -3,7 +3,7 @@ import os
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from prope import _prepare_apply_fns
+
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
@@ -24,6 +24,12 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
+
+# TODO: move to src
+try:
+    from src.prope import _prepare_apply_fns
+except ModuleNotFoundError:
+    raise ModuleNotFoundError("prope module not found, please install it with `pip install prope`")
     
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
@@ -124,6 +130,7 @@ def rope_apply_(x, freqs, num_heads):
     return x_out.to(x.dtype)
 
 def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_highfreq_ratio: float = 0.0):
+    # TODO donot calc mask online
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     # Ensure freqs has the same dtype as x for complex operations
     freqs = freqs.to( device=x.device)
@@ -134,19 +141,20 @@ def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_
         # Build per-head complex-frequency coefficients so we can mask specific heads
         # freqs shape: (seqlen, 1, Lc)
         seqlen, _, Lc = freqs.shape
-        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction))
+        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction)) 
         # Assume 3D split order [t, h, w] across complex bins
         tLc = Lc - 2 * (Lc // 3)
         t_start = 0
         t_end = t_start + tLc
         t_lo = max(1, int(tLc * t_highfreq_ratio + 1e-6))
+        t_lo = max(0, (t_lo // 2) * 2)
         # Lowest frequencies are at the end of the t segment (from back to front)
         t_lo_start = max(t_start, t_end - t_lo)
         t_lo_end = t_end
         # Create head-aware freqs tensor aligned as (1, seqlen, num_heads, Lc) to avoid s x s broadcast
         freqs_heads = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc).clone()
         # Mask rotation for selected heads on t-lowfreq complex bins by setting multiplier to 1+0j
-        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device)
+        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device) # band 12-22 -> channel 22-44
         freqs_heads[:, :, :heads_to_mask, t_lo_start:t_lo_end] = one_c
         # Broadcast to x_out shape (b, s, n, Lc)
         freqs_effective = freqs_heads
@@ -210,6 +218,7 @@ class SelfAttention(nn.Module):
 
 
 class  PRoPE_SelfAttention(nn.Module):
+    """PRoPE SelfAttention"""
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -252,6 +261,7 @@ class  PRoPE_SelfAttention(nn.Module):
             head_dim=self.head_dim,
             viewmats=viewmats,
             Ks=Ks,
+            #TODO: hardcode
             patches_x=52,
             patches_y=30,
             image_width=832,
@@ -265,7 +275,7 @@ class  PRoPE_SelfAttention(nn.Module):
         q = apply_fn_q(q)
         k = apply_fn_kv(k)
         # v = apply_fn_kv(v)
-        
+
         # Apply attention (inputs are already in multi-head format)
         x = self.attn(q, k, v)
         
@@ -325,8 +335,11 @@ class DiTBlock(nn.Module):
         self.ffn_dim = ffn_dim
         self.enable_cam_layers = enable_cam_layers
 
+
         self.self_attn = PRoPE_SelfAttention(dim, num_heads, eps)
+        #Vanilla ReCamMaster is not supported anymore
         # self.self_attn = SelfAttention(dim, num_heads, eps)
+
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -370,6 +383,7 @@ class DiTBlock(nn.Module):
         # Ensure Ks has the same dtype and device as input_x
         # Compute camera intrinsics (in pixels) from focal length and resolution.
         # Assumptions: 35mm sensor (36mm x 24mm), focal length f = 18mm, aperture does not affect pinhole intrinsics.
+        # TODO: remove hardcoded 
         image_width = 832.0
         image_height = 480.0
         # Provided sensor size (square): 23.76mm x 23.76mm

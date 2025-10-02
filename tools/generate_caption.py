@@ -139,9 +139,6 @@ def generate_internlm_captions(
             if video_abs_path in processed_videos:
                 tqdm.write(f"Skipping already processed video: {video_abs_path}")
                 continue
-            ## TODO: 修改下面的脚本成处理.mp4而不是图片的list, filename是一个video的path
-            # Load and process all images with CLIP
-            ## TODO: image_features
             '''
             video = load(video_path)
             ...

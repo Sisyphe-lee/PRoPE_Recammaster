@@ -314,6 +314,9 @@ def _prepare_apply_fns(
         head_indices = torch.arange(max(1, int(num_heads * head_fraction)), device=device)
 
     def _apply_proj_subset(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Apply projection matrix to a subset of heads and the low-frequency tail of the t-channel block.
+        """
         # feats: (batch, num_heads, seqlen, head_dim)
         if t_lo_len == 0 or head_indices is None:
             return feats
@@ -334,7 +337,8 @@ def _prepare_apply_fns(
     apply_fn_kv = partial(_apply_proj_subset, matrix=P_inv)
     apply_fn_o = partial(_apply_proj_subset, matrix=P)
     return apply_fn_q, apply_fn_kv, apply_fn_o
-
+   # relative projection matrix RP = torch.einsum('amn,bnk->abmk', P_T[0], P_inv[0].transpose(2,1)).shape
+   # RP[i,j] = RT 
 
 def _apply_tiled_projmat(
     feats: torch.Tensor,  # (batch, num_heads, seqlen, feat_dim)
@@ -349,10 +353,26 @@ def _apply_tiled_projmat(
     D = matrix.shape[-1]
     assert matrix.shape == (batch, cameras, D, D)
     assert feat_dim % D == 0
+    # Equivalent readable form (for reference only):
+    # Shapes:
+    #   matrix: (batch, cameras, D, D)
+    #   feats:  (batch, num_heads, seqlen, feat_dim)
+    #   where seqlen = cameras * patches, feat_dim = (feat_dim // D) * D
+    # Reshape feats -> (batch, num_heads, cameras, patches, feat_dim // D, D)
+    # For each (batch, cameras), apply matrix (D x D) to the last dim D of feats.
+    # Pseudocode:
+    #   x = feats.reshape(batch, num_heads, cameras, patches, feat_dim // D, D)
+    #   # move dims to (batch, cameras, num_heads, patches, feat_dim // D, D)
+    #   x = x.permute(0, 2, 1, 3, 4, 5)
+    #   # matmul along last dim: (D, D) @ (D) -> (D)
+    #   x = torch.matmul(matrix[:, :, None, None, None, : , :], x)
+    #   # move back and reshape to original
+    #   x = x.permute(0, 2, 1, 3, 4, 5).reshape_as(feats)
+    # einsum below compactly does the same operation.
     return torch.einsum(
         "bcij,bncpkj->bncpki",
         matrix,
-        feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
+        feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)), #  feats @ matrix !!!!
     ).reshape(feats.shape)
 
 

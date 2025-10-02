@@ -4,9 +4,15 @@
     // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
-            "name": "Python: Current File",
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: Train ReCamMaster",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/train_recammaster.py",
@@ -35,20 +41,5 @@
             ]
         }
     ]
-    // "configurations": [
-    //     {
-    //         "name": "Python: Current File",
-    //         "type": "python",
-    //         "request": "launch",
-    //         "program": "${workspaceFolder}/generate_caption.py",
-    //         // "args": ["--cam_type", "1"],
-    //         "console": "integratedTerminal",
-    //         "python": "/home/cyli/anaconda3/envs/caption_gen/bin/python",
-    //         "env": {
-    //                 "http_proxy": "",
-    //                 "https_proxy": "",
-    //                 "all_proxy": ""
-    //             }
-    //     }
-    // ]
+
 }

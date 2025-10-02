@@ -109,7 +109,6 @@ def generate_internlm_captions(
         # get sequence, category from batch
         filenames = [f for f in sorted(os.listdir(os.path.join(basedir, img_folder_name))) if (f.endswith('mp4'))]
         for filename in tqdm(filenames, desc="Generate Captions in One Scene"):
-            ## TODO: 修改下面的脚本成处理.mp4而不是图片的list, filename是一个video的path
             # Load and process all images with CLIP
             video_path = os.path.join(basedir, img_folder_name, filename)
             ## TODO: image_features

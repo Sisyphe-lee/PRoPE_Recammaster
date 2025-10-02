@@ -117,6 +117,9 @@ class TensorDataset(torch.utils.data.Dataset):
                 ref_cam = cond_cam_params[0]
                 # Compute relative poses cam_ref<-cam_i via get_relative_pose then invert to cam_i<-ref
                 def invert_SE3_np(T):
+                    """
+                    Invert a 4x4 SE(3) matrix.
+                    """
                     T = T.astype(np.float64)
                     R = T[:3, :3]
                     t = T[:3, 3]
@@ -127,6 +130,9 @@ class TensorDataset(torch.utils.data.Dataset):
                     out[:3, 3] = tinv
                     return out.astype(np.float32)
                 def rel_to_ref_inv(cam_params):
+                    """
+                    Compute relative poses cam_ref<-cam_i via get_relative_pose then invert to cam_i<-ref, (set cam_ref = cond[0])
+                    """
                     rel_list = []
                     for i in range(len(cam_params)):
                         relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])  # shape (2,4,4)
@@ -134,8 +140,14 @@ class TensorDataset(torch.utils.data.Dataset):
                         cami_from_ref = invert_SE3_np(cam_ref_from_cami)
                         rel_list.append(cami_from_ref)
                     return np.stack(rel_list, axis=0)
-                cond_w2c_rel = rel_to_ref_inv(cond_cam_params)
-                tgt_w2c_rel = rel_to_ref_inv(tgt_cam_params)
+
+                if False:
+                    # transform to relative to cond[0] as origin -> for debug
+                    cond_w2c_rel = rel_to_ref_inv(cond_cam_params)
+                    tgt_w2c_rel = rel_to_ref_inv(tgt_cam_params)
+                else:
+                    # Use default world to camera transformation
+                    tgt_w2c_rel, cond_w2c_rel = [cam.w2c_mat for cam in tgt_cam_params], [cam.w2c_mat for cam in cond_cam_params]
                 # Concatenate tgt first then cond to align with latents
                 all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
                 data['camera'] = torch.from_numpy(all_w2c).to(torch.bfloat16)

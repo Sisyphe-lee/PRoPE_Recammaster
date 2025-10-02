@@ -1,3 +1,6 @@
+"""
+Train ReCamMaster With PRoPE Attention
+"""
 import copy
 import os
 import torch, os, imageio, argparse
@@ -14,8 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import shutil
 from datetime import datetime
-from wandb_module import WandBVideoLogger, VideoDecoder
-from dataset import create_datasets
+
+from src.wandb_module import WandBVideoLogger, VideoDecoder
+from src.dataset import create_datasets
 
 
 def set_global_seed(seed):
@@ -77,7 +81,6 @@ class LightningModelForTrain(pl.LightningModule):
         # Store parameters for later use
         self.ckpt_type = ckpt_type
         self.enable_cam_layers = enable_cam_layers
-        ## TODO:
         # Only inject camera layers if enabled (for ReCamMaster training)
         if self.enable_cam_layers:
             dim=self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
