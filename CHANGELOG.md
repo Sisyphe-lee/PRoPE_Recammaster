@@ -1,5 +1,25 @@
 # Change Log
 
+## v0.2.0 @lcy - 2025-10-06
+
+### 新增
+- 训练脚本 `scripts/train.sh` 增加 `--t-highfreq-ratio`、`--frame-downsample-to`、`--wan21-resume-checkpoint` 等参数开关，便于动态控制时间频率与断点恢复策略
+- 训练主循环 `src/train_recammaster.py` 引入 `ConciseTimingCallback`，自动记录训练/验证时长并在启动阶段执行一次基线验证
+- 新增工具脚本 `clean_empty_experiments.py`，用于清理未产出视频的 wandb 子实验
+
+### 变更
+- `diffsynth/models/wan_video_dit.py` 与 `DiTBlock` 支持向下游透传 `t_highfreq_ratio` 等关键字参数，适配新的时序高频筛选逻辑
+- `scripts/train.sh` 与 `src/train_recammaster.py` 默认超参更新：提升 dataloader worker 数、调整验证频率至每 200 step、缩短测试步数并启用梯度裁剪
+
+### 修复
+- `src/dataset.py` 重新整理相机相对位姿：统一参考视角后归一化平移分量并反求 w2c，修复 viewmats 乱飘问题
+
+### 构建与工具链
+- `.vscode/settings.json` 默认关闭 ChatGPT 扩展启动弹窗，避免干扰
+
+### 其他
+- `exp_by_day/` 目录新增日常实验脚本记录，方便复现训练命令
+
 ## Init @yyb 2025-10-02
 
 ### 新功能
