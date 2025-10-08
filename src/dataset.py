@@ -9,7 +9,6 @@ import numpy as np
 import random
 import json
 import pandas as pd
-from einops import rearrange
 
 
 class Camera(object):
