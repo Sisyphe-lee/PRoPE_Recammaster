@@ -1021,7 +1021,7 @@ def train(args):
             os.makedirs(run_dir, exist_ok=True)
         wandb_logger = WandbLogger(
             ## project=args.wandb_project+wandb_name
-            project=f"{args.wandb_project}_{wandb_name[:5]}",
+            project=f"{args.wandb_project}_{args.wandb_name[:5]}",
             name=wandb_name,
             id=wandb_name,
             config=vars(args),

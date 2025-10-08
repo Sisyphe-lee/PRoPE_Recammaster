@@ -1,5 +1,17 @@
 # Change Log
 
+## v0.2.1 @lcy - 2025-10-08
+
+### 新增
+- 新增日常实验脚本 `exp_by_day/10.08/exp07h:5frame_downsample.sh`，记录包含 5 帧降采样、归一化与梯度裁剪的恢复训练命令。
+
+### 变更
+- 调整训练脚本默认配置：每轮步数提升至 10k、关闭梯度累积、dataloader worker 提升至 36、batch size提升为10、验证集采样扩充至 36 并缩短验证间隔等，以匹配最新算力配置 `scripts/train.sh`。
+- 更新实验脚本 `exp_by_day/10.06/exp07g:resume_debug.sh` 以传递新的运行标志，保持与主训练脚本一致的参数集。
+
+### 修复
+- 修正 WandB 项目名称的前缀来源，确保 CLI 指定的 `wandb_name` 能正确映射到项目 slug `src/train_recammaster.py`。
+
 ## v0.2.0 @lcy - 2025-10-06
 
 ### 新增

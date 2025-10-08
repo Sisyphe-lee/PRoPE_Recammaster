@@ -202,25 +202,25 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --output_path "$OUTPUT_DIR"   \
  --dit_path "$MODEL_BASE_PATH/diffusion_pytorch_model.safetensors"   \
  --vae_path "$MODEL_BASE_PATH/Wan2.1_VAE.pth"   \
- --steps_per_epoch 8000   \
+ --steps_per_epoch 10000   \
  --max_epochs 100   \
  --learning_rate 1e-5   \
- --accumulate_grad_batches  4  \
+ --accumulate_grad_batches  1  \
  --use_gradient_checkpointing  \
- --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 12; fi) \
- --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 2; fi) \
+ --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 36; fi) \
+ --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 10; fi) \
  --num_val_scenes 2 \
  --global_seed "$GLOBAL_SEED" \
  --enable_test_step \
  --test_samples 10 \
  --test_inference_steps 10 \
- --val_size 6 \
+ --val_size 36 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
  --metadata_path "$METADATA_PATH" \
  --wandb_name "$WANDB_NAME" \
- --val_check_interval_batches 200 \
+ --val_check_interval_batches 50 \
  --training_strategy deepspeed_stage_2 \
  --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
