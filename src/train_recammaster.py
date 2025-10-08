@@ -17,6 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import shutil
 from datetime import datetime
+import time
+import csv
+
 
 from src.wandb_module import WandBVideoLogger, VideoDecoder
 from src.dataset import create_datasets
@@ -56,8 +59,10 @@ class LightningModelForTrain(pl.LightningModule):
         global_seed=42,
         enable_test_step=False,
         test_samples=10,
-        test_inference_steps=5
-    ):
+        test_inference_steps=5,
+        t_highfreq_ratio=0.0,
+        frame_downsample_to=0,
+    ): 
         super().__init__()
         self.latent_path = latent_path
         self.global_seed = global_seed
@@ -65,6 +70,8 @@ class LightningModelForTrain(pl.LightningModule):
         self.test_samples = test_samples
         self.test_inference_steps = test_inference_steps
         self.test_dataset = None  # Will be set later
+        self.t_highfreq_ratio = t_highfreq_ratio
+        self.frame_downsample_to = frame_downsample_to
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -283,6 +290,22 @@ class LightningModelForTrain(pl.LightningModule):
 
         cam_emb = batch["camera"].to(self.device)
 
+        # Optional external frame downsampling (two-halves: take base then base+per_half)
+        if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0:
+            F_total = latents.shape[2]
+            halves = 2
+            per_half = F_total // halves
+            base = torch.linspace(0, per_half - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            index_full = torch.cat([base, base + per_half], dim=0)
+            # apply to latents (B, C, F, H, W)
+            latents = latents.index_select(2, index_full)
+            # sync cam_emb if its N matches F_total or per_half
+            if cam_emb is not None and cam_emb.dim() >= 2:
+                if cam_emb.shape[1] == F_total:
+                    cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
+                elif cam_emb.shape[1] == per_half:
+                    cam_emb = cam_emb.index_select(1, base.to(cam_emb.device))
+
         # Loss
         self.pipe.device = self.device
         # Ensure training timesteps are set (validation/test may change it)
@@ -301,16 +324,26 @@ class LightningModelForTrain(pl.LightningModule):
         noisy_latents[:, :, tgt_latent_len:, ...] = origin_latents[:, :, tgt_latent_len:, ...]
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
         
-        # Compute loss
+        # Compute loss with model-internal downsampling; match targets by selecting same indices
         noise_pred = self.pipe.denoising_model()(
             noisy_latents, timestep=timestep, cam_emb=cam_emb, **prompt_emb, **extra_input, **image_emb,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+            t_highfreq_ratio=self.t_highfreq_ratio,
+            frame_downsample_to=self.frame_downsample_to,
         )
 
-        # Remove ad-hoc decode/eval from training loop; validation loop will handle evaluation
-
-        loss = torch.nn.functional.mse_loss(noise_pred[:, :, :tgt_latent_len, ...].float(), training_target[:, :, :tgt_latent_len, ...].float())
+        # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
+        if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0 and self.frame_downsample_to < tgt_latent_len:
+            base_indices = torch.linspace(0, tgt_latent_len - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            tgt_sel = training_target[:, :, base_indices, ...]
+            pred_sel = noise_pred[:, :, :base_indices.numel(), ...]
+            loss = torch.nn.functional.mse_loss(pred_sel.float(), tgt_sel.float())
+        else:
+            loss = torch.nn.functional.mse_loss(
+                noise_pred[:, :, :tgt_latent_len, ...].float(),
+                training_target[:, :, :tgt_latent_len, ...].float()
+            )
         loss = loss * self.pipe.scheduler.training_weight(timestep)
 
         # Record log
@@ -333,12 +366,33 @@ class LightningModelForTrain(pl.LightningModule):
         cam_emb = batch["camera"].to(self.device)
 
         self.pipe.device = self.device
+
+        
         # Multi-step denoising in validation (like test_step)
         tgt_latent_len = latents.shape[2] // 2
         target_latents = latents[:, :, :tgt_latent_len, ...]
         condition_latents = latents[:, :, tgt_latent_len:, ...]
         
-        # Deterministic seed per step/batch
+        # External frame downsampling at start (two-halves scheme). Apply to latents and cam_emb.
+        frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
+        base_indices = None
+        if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
+            per_half = tgt_latent_len
+            base_indices = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            # Apply to target/condition
+            target_latents = target_latents.index_select(2, base_indices)
+            condition_latents = condition_latents.index_select(2, base_indices)
+            # Apply to cam_emb
+            if cam_emb is not None and cam_emb.dim() >= 2:
+                if cam_emb.shape[1] == per_half * 2:
+                    idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
+                    cam_emb = cam_emb.index_select(1, idx_full.to(cam_emb.device))
+                elif cam_emb.shape[1] == per_half:
+                    cam_emb = cam_emb.index_select(1, base_indices.to(cam_emb.device))
+            # Update target half length
+            tgt_latent_len = base_indices.numel()
+        
+        # Deterministic seed per step/batch (use downsampled target shape)
         val_seed = self.global_seed + self.global_step + batch_idx
         noise = self.pipe.generate_noise(
             target_latents.shape,
@@ -346,7 +400,7 @@ class LightningModelForTrain(pl.LightningModule):
             device=self.device,
             dtype=torch.float32
         ).to(dtype=self.pipe.torch_dtype, device=self.device)
-        
+
         # Use multi-step scheduler
         self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
         latents_gen = noise
@@ -362,16 +416,21 @@ class LightningModelForTrain(pl.LightningModule):
                 **extra_input,
                 **image_emb,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+                t_highfreq_ratio=self.t_highfreq_ratio,
+                frame_downsample_to=self.frame_downsample_to,
             )
+            # With external downsampling, model outputs already match target temporal length
+            pred_tgt_full = noise_pred[:, :, :tgt_latent_len, ...]
             latents_gen = self.pipe.scheduler.step(
-                noise_pred[:, :, :tgt_latent_len, ...],
+                pred_tgt_full,
                 self.pipe.scheduler.timesteps[progress_id],
                 latents_input[:, :, :tgt_latent_len, ...]
             )
         
         # Decode video and calculate PSNR (reuse decode logic)
         dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
+        
         noisy_latents = torch.cat([latents_gen, condition_latents], dim=2)
         origin_latents = torch.cat([target_latents, condition_latents], dim=2)
         psnr_value, combined_frames, metadata = self.decode_video(
@@ -478,7 +537,8 @@ class LightningModelForTrain(pl.LightningModule):
                 **extra_input, 
                 **image_emb,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+                frame_downsample_to=self.frame_downsample_to,
             )
             
             # Scheduler step (same as call())
@@ -667,7 +727,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=12,
         help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
     )
     parser.add_argument(
@@ -851,6 +911,19 @@ def parse_args():
         default=None,
         help="Number of batches between validation runs (overrides val_check_interval if set)"
     )
+    parser.add_argument(
+        "--t_highfreq_ratio",
+        type=float,
+        default=0.0,
+        help="Temporal low-frequency masking ratio for self-attention (passed via **kwargs to blocks)"
+    )
+    parser.add_argument(
+        "--frame_downsample_to",
+        type=int,
+        default=0,
+        help="Per-half frames to sample (two-halves scheme). Use 0 to disable downsampling (default: 0)"
+    )
+
     args = parser.parse_args()
     return args
 
@@ -932,6 +1005,8 @@ def train(args):
         enable_test_step=args.enable_test_step,
         test_samples=args.test_samples,
         test_inference_steps=args.test_inference_steps,
+        t_highfreq_ratio=getattr(args, 't_highfreq_ratio', 0.0),
+        frame_downsample_to=getattr(args, 'frame_downsample_to', 5),
     )
     
     # Set test dataset for automatic test_step execution
@@ -945,7 +1020,8 @@ def train(args):
         if os.environ.get("LOCAL_RANK", "0") == "0":
             os.makedirs(run_dir, exist_ok=True)
         wandb_logger = WandbLogger(
-            project=args.wandb_project,
+            ## project=args.wandb_project+wandb_name
+            project=f"{args.wandb_project}_{wandb_name[:5]}",
             name=wandb_name,
             id=wandb_name,
             config=vars(args),
@@ -955,6 +1031,109 @@ def train(args):
     else:
         logger = None
         run_dir = args.output_path
+    # Concise timing callback to record validate/train totals and per-step averages on rank 0 only
+    class ConciseTimingCallback(pl.Callback):
+        def __init__(self, out_dir, train_log_every_n_batches=20):
+            self.out_dir = out_dir
+            self.train_log_every_n_batches = max(1, int(train_log_every_n_batches))
+            os.makedirs(self.out_dir, exist_ok=True)
+            self.csv_path = os.path.join(self.out_dir, "timings.csv")
+            if os.environ.get("LOCAL_RANK", "0") == "0" and not os.path.exists(self.csv_path):
+                with open(self.csv_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["phase", "global_step", "epoch", "count", "total_ms", "avg_ms"])  # concise schema
+            # validation timers/accumulators
+            self._val_t0 = None
+            self._val_step_t0 = None
+            self._val_step_durations = []
+            # training timers/accumulators (per-epoch)
+            self._train_epoch_t0 = None
+            self._train_step_t0 = None
+            self._train_step_durations = []
+        def _is_rank0(self, trainer):
+            return getattr(trainer, "global_rank", 0) == 0
+        # ========== Training (per epoch totals + avg step) ==========
+        def on_train_epoch_start(self, trainer, pl_module):
+            self._train_epoch_t0 = time.perf_counter()
+            self._train_step_durations = []
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            self._train_step_t0 = time.perf_counter()
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            if self._train_step_t0 is not None:
+                dt = (time.perf_counter() - self._train_step_t0) * 1000.0
+                self._train_step_durations.append(dt)
+                self._train_step_t0 = None
+            # running output every N batches on rank0
+            if self._is_rank0(trainer) and (len(self._train_step_durations) % self.train_log_every_n_batches == 0):
+                count = len(self._train_step_durations)
+                avg_ms = (sum(self._train_step_durations) / count) if count > 0 else 0.0
+                with open(self.csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["train_step_avg_running", trainer.global_step, trainer.current_epoch, count, "", f"{avg_ms:.3f}"])
+                if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+                    try:
+                        trainer.logger.experiment.log({
+                            "timing/train_step_avg_ms_running": avg_ms,
+                            "trainer/global_step": trainer.global_step,
+                            "trainer/epoch": trainer.current_epoch,
+                        })
+                    except Exception:
+                        pass
+        def on_train_epoch_end(self, trainer, pl_module):
+            if not self._is_rank0(trainer):
+                return
+            total_ms = None
+            if self._train_epoch_t0 is not None:
+                total_ms = (time.perf_counter() - self._train_epoch_t0) * 1000.0
+            count = len(self._train_step_durations)
+            avg_ms = (sum(self._train_step_durations) / count) if count > 0 else 0.0
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["train_epoch_total", trainer.global_step, trainer.current_epoch, count, f"{total_ms:.3f}", f"{avg_ms:.3f}"])
+            if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+                try:
+                    trainer.logger.experiment.log({
+                        "timing/train_epoch_total_ms": total_ms,
+                        "timing/train_step_avg_ms": avg_ms,
+                        "trainer/global_step": trainer.global_step,
+                        "trainer/epoch": trainer.current_epoch,
+                    })
+                except Exception:
+                    pass
+        # ========== Validation (total + avg step) ==========
+        def on_validation_start(self, trainer, pl_module):
+            self._val_t0 = time.perf_counter()
+            self._val_step_durations = []
+        def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
+            self._val_step_t0 = time.perf_counter()
+        def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+            if self._val_step_t0 is not None:
+                dt = (time.perf_counter() - self._val_step_t0) * 1000.0
+                self._val_step_durations.append(dt)
+                self._val_step_t0 = None
+        def on_validation_end(self, trainer, pl_module):
+            if not self._is_rank0(trainer):
+                return
+            total_ms = None
+            if self._val_t0 is not None:
+                total_ms = (time.perf_counter() - self._val_t0) * 1000.0
+            count = len(self._val_step_durations)
+            avg_ms = (sum(self._val_step_durations) / count) if count > 0 else 0.0
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["validate_total", trainer.global_step, trainer.current_epoch, count, f"{total_ms:.3f}", f"{avg_ms:.3f}"])
+            if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+                try:
+                    trainer.logger.experiment.log({
+                        "timing/validate_total_ms": total_ms,
+                        "timing/validation_step_avg_ms": avg_ms,
+                        "trainer/global_step": trainer.global_step,
+                        "trainer/epoch": trainer.current_epoch,
+                    })
+                except Exception:
+                    pass
+    concise_timing_cb = ConciseTimingCallback(out_dir=os.path.join(run_dir, "profiler"))
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
@@ -966,16 +1145,20 @@ def train(args):
         val_check_interval=args.val_check_interval_batches if args.val_check_interval_batches is not None else args.val_check_interval,  # Use batch-based or step-based validation frequency
         limit_val_batches=len(val_dataset),
         num_sanity_val_steps=0,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
-            save_top_k=-1,
-            dirpath=os.path.join(run_dir, "checkpoints"),
-            filename="{epoch}-{step}"
-        )],
+        callbacks=[
+            pl.pytorch.callbacks.ModelCheckpoint(
+                save_top_k=-1,
+                dirpath=os.path.join(run_dir, "checkpoints"),
+                filename="{epoch}-{step}"
+            ),
+            concise_timing_cb,
+        ],
         logger=logger,
         log_every_n_steps=1,
+        gradient_clip_val=0.05,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    # trainer.validate(model, val_dataloader)
+    trainer.validate(model, val_dataloader)
     
     # Run an initial test at step 0 if test_step is enabled
     # if test_dataloader is not None:

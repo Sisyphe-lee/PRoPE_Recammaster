@@ -352,7 +352,7 @@ class DiTBlock(nn.Module):
         # Camera layers are registered externally in training script
         # This class only controls whether to use projector or not
 
-    def forward(self, x, context, cam_emb, t_mod, freqs):
+    def forward(self, x, context, cam_emb, t_mod, freqs, **_kwargs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
@@ -400,11 +400,14 @@ class DiTBlock(nn.Module):
                           [0.0, 0.0, 1.0]], device=input_x.device, dtype=input_x.dtype)
         Ks = K.view(1, 1, 3, 3).expand(B, N, 3, 3).contiguous()
         
+        # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
+        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
+
         try:
             if self.enable_cam_layers:
-                x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks))
+                x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks, t_highfreq_ratio=t_highfreq_ratio))
             else:
-                x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks)
+                x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks, t_highfreq_ratio=t_highfreq_ratio)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 raise RuntimeError(f"[OOM][submodule=self_attn] {e}") from e
@@ -544,22 +547,21 @@ class WanModel(torch.nn.Module):
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
         
+        # Patchify (all downsampling handled outside the model)
         x, (f, h, w) = self.patchify(x)
-        
-        # 获取 self.freqs[0][:f] 并修改倒数五个通道
-        # freq_0 = self.freqs[0][:f].clone()  # 形状: [f, 22]
-        # 将倒数五个通道设置为 1.0000+0.0000e+00j
-        # freq_0[:, -5:] = torch.complex(torch.ones_like(freq_0[:, -5:].real), torch.zeros_like(freq_0[:, -5:].imag))
-        
+
+        # Build RoPE freqs with contiguous temporal indices (0..f-1)
+        selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
+        f_freqs = self.freqs[0].index_select(0, selected_t_idx)
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-        
+
         def create_custom_forward(module):
             def custom_forward(*inputs):
-                return module(*inputs)
+                return module(*inputs, **kwargs)
             return custom_forward
 
         # Iterate blocks with OOM reporting per DiT layer
@@ -580,7 +582,7 @@ class WanModel(torch.nn.Module):
                             use_reentrant=False,
                         )
                 else:
-                    x = block(x, context, cam_emb, t_mod, freqs)
+                    x = block(x, context, cam_emb, t_mod, freqs, **kwargs)
             except RuntimeError as e:
                 # Augment CUDA OOM with layer index and rank information
                 msg = str(e)

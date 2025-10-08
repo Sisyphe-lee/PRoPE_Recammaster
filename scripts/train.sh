@@ -9,13 +9,16 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  -c, --cuda-devices CUDA_DEVICES    CUDA visible devices (default: 0,1,2,3,4,5,6,7)"
-    echo "  -d, --debug                        Enable debug mode (default: enabled)"
+    echo "  -d, --debug                        Enable debug mode (default: disabled)"
     echo "  -o, --output-dir OUTPUT_DIR        Output directory (default: ./models/train)"
     echo "  -r, --recammaster-checkpoint PATH  ReCamMaster checkpoint path (default: /data1/lcy/projects/ReCamMaster/models/ReCamMaster/checkpoints/step20000.ckpt)"
+    echo "  -R, --wan21-resume-checkpoint PATH Wan2.1 resume checkpoint path (optional; used only when provided and ckpt_type=wan21)"
     echo "  -w, --wandb-name WANDB_NAME        Wandb experiment name (default: Exp07c)"
     echo "  -s, --dataset-path DATASET_PATH    Dataset path (default: /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10)"
     echo "  -m, --metadata-path METADATA_PATH  Metadata file path (default: ./metadata_subset.csv)"
     echo "  -g, --global-seed SEED             Global seed (default: 42)"
+    echo "  -t, --t-highfreq-ratio RATIO      Temporal low-frequency masking ratio for self-attn (default: 0.0)"
+    echo "  -F, --frame-downsample-to N       Per-half frames to sample (two-halves). Default: 0 (disabled); e.g., 5 means each half picks 5 frames"
     echo "  -h, --help                         Show this help message"
     exit 1
 }
@@ -23,15 +26,17 @@ usage() {
 export RUN_TIMESTAMP=$(date +'%m-%d-%H%M%S')
 
 # Default values
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-DEBUG_FLAG="--debug"
+CUDA_VISIBLE_DEVICES="2,3,4,5,6,7"
+DEBUG_FLAG=""
 OUTPUT_DIR="$(pwd)/models/train"
-METADATA_PATH="$(pwd)/metadata/metadata_subset.csv"
+METADATA_PATH="$(pwd)/metadata/metadata.csv"
 RECAMMASTER_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/ReCamMaster/checkpoints/step20000.ckpt"
 WANDB_NAME="Exp07c"
 DATASET_PATH="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10"
-
+WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-19-191944_Exp04d/checkpoints/step1344.ckpt"
 GLOBAL_SEED="42"
+T_HIGHFREQ_RATIO="0.5"
+FRAME_DOWNSAMPLE_TO="0"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -69,6 +74,14 @@ while [[ $# -gt 0 ]]; do
             RECAMMASTER_CHECKPOINT_PATH="$2"
             shift 2
             ;;
+        -R|--wan21-resume-checkpoint)
+            WAN21_RESUME_CHECKPOINT_PATH="$2"
+            shift 2
+            ;;
+        --wan21-resume-checkpoint=*)
+            WAN21_RESUME_CHECKPOINT_PATH="${1#*=}"
+            shift
+            ;;
         -w|--wandb-name)
             WANDB_NAME="$2"
             shift 2
@@ -84,6 +97,30 @@ while [[ $# -gt 0 ]]; do
         -g|--global-seed)
             GLOBAL_SEED="$2"
             shift 2
+            ;;
+        -t|--t-highfreq-ratio)
+            T_HIGHFREQ_RATIO="$2"
+            shift 2
+            ;;
+        -t=*)
+            T_HIGHFREQ_RATIO="${1#*=}"
+            shift
+            ;;
+        --t-highfreq-ratio=*)
+            T_HIGHFREQ_RATIO="${1#*=}"
+            shift
+            ;;
+        -F|--frame-downsample-to)
+            FRAME_DOWNSAMPLE_TO="$2"
+            shift 2
+            ;;
+        -F=*)
+            FRAME_DOWNSAMPLE_TO="${1#*=}"
+            shift
+            ;;
+        --frame-downsample-to=*)
+            FRAME_DOWNSAMPLE_TO="${1#*=}"
+            shift
             ;;
         -h|--help)
             usage
@@ -101,7 +138,7 @@ MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
 # If you want to train from scratch, you can remove the --resume_ckpt_path line.
 # For Wan2.1 original model:
 WAN21_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
-WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-19-191944_Exp04d/checkpoints/step1344.ckpt"
+
 # RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/train/wandb/ReCamMaster/08-21-151648_exp02b/checkpoints/step1079.ckpt"
 
 # Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
@@ -109,7 +146,12 @@ CHECKPOINT_TYPE="wan21"  # Change to "recammaster" if you want to use ReCamMaste
 
 # Set checkpoint path based on type
 if [ "$CHECKPOINT_TYPE" = "wan21" ]; then
-    RESUME_CHECKPOINT_PATH="$WAN21_CHECKPOINT_PATH"
+    # Prefer WAN21_RESUME_CHECKPOINT_PATH if provided; otherwise fall back to base WAN21 checkpoint
+    if [ -n "$WAN21_RESUME_CHECKPOINT_PATH" ]; then
+        RESUME_CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
+    else
+        RESUME_CHECKPOINT_PATH="$WAN21_CHECKPOINT_PATH"
+    fi
     ENABLE_CAM_LAYERS=""
 else
     RESUME_CHECKPOINT_PATH="$RECAMMASTER_CHECKPOINT_PATH"
@@ -147,7 +189,9 @@ cat <<CONFIG_EOF
   "wandb_name": "$WANDB_NAME",
   "dataset_path": "$DATASET_PATH",
   "metadata_path": "$METADATA_PATH",
-  "global_seed": $GLOBAL_SEED
+  "global_seed": $GLOBAL_SEED,
+  "t_highfreq_ratio": $T_HIGHFREQ_RATIO,
+  "frame_downsample_to": $FRAME_DOWNSAMPLE_TO
 }
 CONFIG_EOF
 
@@ -163,20 +207,22 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --learning_rate 1e-5   \
  --accumulate_grad_batches  4  \
  --use_gradient_checkpointing  \
- --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 4; fi) \
+ --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 12; fi) \
  --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 2; fi) \
  --num_val_scenes 2 \
  --global_seed "$GLOBAL_SEED" \
  --enable_test_step \
  --test_samples 10 \
- --test_inference_steps 20 \
- --val_size 10 \
+ --test_inference_steps 10 \
+ --val_size 6 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
  --metadata_path "$METADATA_PATH" \
  --wandb_name "$WANDB_NAME" \
- --val_check_interval_batches 100 \
+ --val_check_interval_batches 200 \
  --training_strategy deepspeed_stage_2 \
+ --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
+ --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
  $DEBUG_FLAG \
 
