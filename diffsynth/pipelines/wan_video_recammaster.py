@@ -190,6 +190,40 @@ class WanVideoReCamMasterPipeline(BasePipeline):
         frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
 
+    def _compute_downsample_indices(self, length: int, frame_downsample_to: int) -> Optional[torch.Tensor]:
+        """Return evenly-spaced indices for downsampling along temporal axis."""
+        if not isinstance(frame_downsample_to, int) or frame_downsample_to <= 0 or frame_downsample_to >= length:
+            return None
+        return torch.linspace(
+            0,
+            length - 1,
+            steps=frame_downsample_to,
+            device=self.device,
+            dtype=torch.float32
+        ).round().long()
+
+    def _downsample_cam_emb(self, cam_emb: Optional[torch.Tensor], indices: torch.Tensor, per_half: int) -> Optional[torch.Tensor]:
+        """Apply temporal downsampling to camera embeddings."""
+        if cam_emb is None:
+            return None
+        seq_dim = None
+        shape = cam_emb.shape
+
+        # Determine which dimension encodes temporal sequence length.
+        for dim_idx, dim_size in enumerate(shape):
+            if dim_size == per_half or dim_size == per_half * 2:
+                seq_dim = dim_idx
+                break
+        if seq_dim is None:
+            return cam_emb
+
+        idx_full = indices
+        if shape[seq_dim] == per_half * 2:
+            idx_full = torch.cat([indices, indices + per_half], dim=0)
+        idx_full = idx_full.to(device=cam_emb.device)
+        cam_emb = cam_emb.index_select(seq_dim, idx_full)
+        return cam_emb
+
 
     @torch.no_grad()
     def __call__(
@@ -212,6 +246,7 @@ class WanVideoReCamMasterPipeline(BasePipeline):
         tiled=True,
         tile_size=(30, 52),
         tile_stride=(15, 26),
+        frame_downsample_to=0,
         tea_cache_l1_thresh=None,
         tea_cache_model_id="",
         progress_bar_cmd=tqdm,
@@ -248,6 +283,16 @@ class WanVideoReCamMasterPipeline(BasePipeline):
 
         # Process target camera (recammaster)
         cam_emb = target_camera.to(dtype=self.torch_dtype, device=self.device)
+
+        # Optional temporal downsampling (apply evenly to target, condition, and cam_emb)
+        target_latent_len = latents.shape[2]
+        down_idx = self._compute_downsample_indices(target_latent_len, frame_downsample_to)
+        if down_idx is not None:
+            latents = latents.index_select(2, down_idx)
+            source_latents = source_latents.index_select(2, down_idx)
+            if cam_emb is not None:
+                cam_emb = self._downsample_cam_emb(cam_emb, down_idx, target_latent_len)
+            target_latent_len = latents.shape[2]
 
         # Encode prompts
         self.load_models_to_device(["text_encoder"])

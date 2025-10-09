@@ -1,8 +1,12 @@
 import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 import torch
 import torch.nn as nn
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData
-import torch, os, imageio, argparse
+import os, imageio, argparse
 from datetime import datetime
 from torchvision.transforms import v2
 from einops import rearrange
@@ -177,14 +181,66 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         j = (np.abs(inds - target)).argmin()
         return int(j)
 
-    def _build_relative_embedding(self, cams: list) -> torch.Tensor:
-        relative_poses = []
-        for i in range(len(cams)):
-            relative_pose = self.get_relative_pose([cams[0], cams[i]])
-            relative_poses.append(torch.as_tensor(relative_pose)[:, :3, :][1])
-        pose_embedding = torch.stack(relative_poses, dim=0)
-        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-        return pose_embedding
+    def _invert_se3(self, matrix: np.ndarray) -> np.ndarray:
+        """Invert a 4x4 SE(3) matrix in a numerically stable way."""
+        matrix = matrix.astype(np.float64)
+        rotation = matrix[:3, :3]
+        translation = matrix[:3, 3]
+        rotation_inv = rotation.T
+        translation_inv = -rotation_inv @ translation
+        result = np.eye(4, dtype=np.float64)
+        result[:3, :3] = rotation_inv
+        result[:3, 3] = translation_inv
+        return result.astype(np.float32)
+
+    def _compute_relative_c2w(self, ref_cam: Camera, cams: list[Camera]) -> np.ndarray:
+        """Compute cam_i<-ref (c2w) for each camera in cams."""
+        rel_c2w_list = []
+        for cam in cams:
+            relative_pose = self.get_relative_pose([ref_cam, cam])
+            cam_ref_from_cam = relative_pose[1]
+            cam_from_ref = self._invert_se3(cam_ref_from_cam)
+            rel_c2w_list.append(cam_from_ref)
+        return np.stack(rel_c2w_list, axis=0)
+
+    def _normalize_pairwise_distance(self, rel_c2w: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+        """
+        Normalize a trajectory so that the maximum pairwise translation distance
+        between any two cameras is <= 1.
+        """
+        translations = rel_c2w[:, :3, 3]
+        if translations.shape[0] <= 1:
+            return rel_c2w
+        diffs = translations[None, :, :] - translations[:, None, :]
+        dists = np.linalg.norm(diffs, axis=-1)
+        max_dist = float(np.max(dists))
+        if not np.isfinite(max_dist) or max_dist < eps:
+            return rel_c2w
+        scaled = rel_c2w.copy()
+        scaled[:, :3, 3] /= max_dist
+        return scaled
+
+    def _normalize_joint_translation(self, cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-8) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Jointly normalize condition and target trajectories so that the maximum
+        translation norm across both trajectories is <= 1.
+        """
+        combined = np.concatenate([tgt_rel_c2w, cond_rel_c2w], axis=0)
+        translations = combined[:, :3, 3]
+        norms = np.linalg.norm(translations, axis=1)
+        max_norm = float(np.max(norms)) if norms.size > 0 else 0.0
+        if not np.isfinite(max_norm) or max_norm < eps:
+            return cond_rel_c2w.copy(), tgt_rel_c2w.copy()
+        scale = max_norm
+        cond_scaled = cond_rel_c2w.copy()
+        tgt_scaled = tgt_rel_c2w.copy()
+        cond_scaled[:, :3, 3] /= scale
+        tgt_scaled[:, :3, 3] /= scale
+        return cond_scaled, tgt_scaled
+
+    def _c2w_to_w2c(self, rel_c2w: np.ndarray) -> np.ndarray:
+        """Invert a trajectory of c2w matrices to w2c."""
+        return np.stack([self._invert_se3(T) for T in rel_c2w], axis=0)
 
     def __getitem__(self, data_id):
         text = self.text[data_id]
@@ -224,7 +280,9 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             c2w = self._convert_c2w_convention(c2w)
             src_c2ws_sampled.append(c2w)
         src_cam_params = [Camera(c2w) for c2w in src_c2ws_sampled]
-        cond_embedding = self._build_relative_embedding(src_cam_params)
+        cond_ref_cam = src_cam_params[0]
+        cond_rel_c2w = self._compute_relative_c2w(cond_ref_cam, src_cam_params)
+        cond_rel_c2w = self._normalize_pairwise_distance(cond_rel_c2w)
 
         camera_list = []
         for cam_type in range(1, 11):
@@ -235,8 +293,13 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
                 c2w = self._convert_c2w_convention(c2w)
                 c2ws.append(c2w)
             tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
-            tgt_embedding = self._build_relative_embedding(tgt_cam_params)
-            pose_embedding = torch.cat([tgt_embedding, cond_embedding], dim=0).to(torch.bfloat16)
+            tgt_rel_c2w = self._compute_relative_c2w(cond_ref_cam, tgt_cam_params)
+            tgt_rel_c2w = self._normalize_pairwise_distance(tgt_rel_c2w)
+            cond_joint, tgt_joint = self._normalize_joint_translation(cond_rel_c2w, tgt_rel_c2w)
+            cond_rel_w2c = self._c2w_to_w2c(cond_joint)
+            tgt_rel_w2c = self._c2w_to_w2c(tgt_joint)
+            all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0).astype(np.float32)
+            pose_embedding = torch.from_numpy(all_w2c).to(torch.bfloat16)
             camera_list.append(pose_embedding)
         
         data['camera'] = camera_list
@@ -281,6 +344,12 @@ def parse_args():
         "--cfg_scale",
         type=float,
         default=5.0,
+    )
+    parser.add_argument(
+        "--frame_downsample_to",
+        type=int,
+        default=5,
+        help="Temporal latent downsample count (0 表示不降采样)"
     )
     parser.add_argument(
         "--ckpt_type",
@@ -427,6 +496,7 @@ if __name__ == '__main__':
                 source_video=source_video,
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
+                frame_downsample_to=args.frame_downsample_to,
                 num_inference_steps=50,
                 seed=0, tiled=True
             )

@@ -1,5 +1,18 @@
 # Change Log
 
+## v0.2.2 @lcy - 2025-10-09
+
+### 新增
+- 推理脚本 `src/inference_recammaster.py` 与 `scripts/inference.sh` 支持 `--frame_downsample_to`，可按需从 21 latent 均匀抽帧降到任意数量，并默认配置为 5。
+- `WanVideoReCamMasterPipeline` 增加统一的 latent / camera 下采样工具方法，推理调用可复用。
+
+### 变更
+- 推理数据集相机处理与训练对齐：cond/tgt 轨迹分别归一化再联合归一化，并输出 bf16 w2c 视角序列。
+- 推理脚本开头注入项目根目录，使直接运行 `src/inference_recammaster.py` 时总能加载当前仓库版本的 `diffsynth` 模块。
+
+### 修复
+- 修正 `scripts/inference.sh` 直接运行路径与环境变量，避免旧的 `python inference_recammaster.py` 调用失败。
+
 ## v0.2.1 @lcy - 2025-10-08
 
 ### 新增
