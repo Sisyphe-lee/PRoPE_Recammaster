@@ -1,5 +1,22 @@
 # Change Log
 
+## v0.2.3 @lcy - 2025-10-11
+
+### 新增
+- 数据集加载 `src/dataset.py` 按 metadata 中的子目录解析，自动推算并返回相机内参矩阵；训练与验证批次现可直接获取 `intrinsics`。
+
+### 变更
+- 推理/训练主干 `diffsynth/models/wan_video_dit.py`、`diffsynth/pipelines/wan_video_recammaster.py` 与 `src/train_recammaster.py` 全链路传播 `cam_intrinsics`，缺省时回退至 Wan2.1 默认内参。
+- 训练脚本 `scripts/train.sh` 默认使用全量数据（`metadata_all.csv` + `/train` 根目录）、新增 `--batch-size` 参数，并仅在明确传入 `--wan21-resume-checkpoint` 时加载断点。
+- 数据集加载 `src/dataset.py` 目前训练集和验证集没有重合。
+- VAE 特征提取 `src/vae_feature.py` 支持 `--metadata_path`，可复用共享 metadata；`TextVideoDataset` 与训练版数据集都会接受绝对或相对路径。
+
+### 构建与工具链
+- 新版 `scripts/extract_vae.sh` 支持参数化数据集/metadata 输入，用于批量补齐 `.tensors.pth`。
+
+### 其他
+- 清理 README 过期的 todo 片段，保持顶层描述精简。
+
 ## v0.2.2 @lcy - 2025-10-09
 
 ### 新增

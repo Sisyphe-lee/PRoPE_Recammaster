@@ -289,6 +289,9 @@ class LightningModelForTrain(pl.LightningModule):
             image_emb["y"] = image_emb["y"][0].to(self.device)
 
         cam_emb = batch["camera"].to(self.device)
+        cam_intrinsics = batch.get("intrinsics")
+        if cam_intrinsics is not None:
+            cam_intrinsics = cam_intrinsics.to(self.device)
 
         # Optional external frame downsampling (two-halves: take base then base+per_half)
         if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0:
@@ -305,6 +308,11 @@ class LightningModelForTrain(pl.LightningModule):
                     cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
                 elif cam_emb.shape[1] == per_half:
                     cam_emb = cam_emb.index_select(1, base.to(cam_emb.device))
+            if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
+                if cam_intrinsics.shape[1] == F_total:
+                    cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
+                elif cam_intrinsics.shape[1] == per_half:
+                    cam_intrinsics = cam_intrinsics.index_select(1, base.to(cam_intrinsics.device))
 
         # Loss
         self.pipe.device = self.device
@@ -331,6 +339,7 @@ class LightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
             t_highfreq_ratio=self.t_highfreq_ratio,
             frame_downsample_to=self.frame_downsample_to,
+            cam_intrinsics=cam_intrinsics,
         )
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
@@ -364,6 +373,9 @@ class LightningModelForTrain(pl.LightningModule):
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
         cam_emb = batch["camera"].to(self.device)
+        cam_intrinsics = batch.get("intrinsics")
+        if cam_intrinsics is not None:
+            cam_intrinsics = cam_intrinsics.to(self.device)
 
         self.pipe.device = self.device
 
@@ -389,6 +401,12 @@ class LightningModelForTrain(pl.LightningModule):
                     cam_emb = cam_emb.index_select(1, idx_full.to(cam_emb.device))
                 elif cam_emb.shape[1] == per_half:
                     cam_emb = cam_emb.index_select(1, base_indices.to(cam_emb.device))
+            if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
+                if cam_intrinsics.shape[1] == per_half * 2:
+                    idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
+                    cam_intrinsics = cam_intrinsics.index_select(1, idx_full.to(cam_intrinsics.device))
+                elif cam_intrinsics.shape[1] == per_half:
+                    cam_intrinsics = cam_intrinsics.index_select(1, base_indices.to(cam_intrinsics.device))
             # Update target half length
             tgt_latent_len = base_indices.numel()
         
@@ -412,6 +430,7 @@ class LightningModelForTrain(pl.LightningModule):
                 latents_input,
                 timestep=timestep,
                 cam_emb=cam_emb,
+                cam_intrinsics=cam_intrinsics,
                 **prompt_emb,
                 **extra_input,
                 **image_emb,
@@ -495,6 +514,9 @@ class LightningModelForTrain(pl.LightningModule):
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
         cam_emb = batch["camera"].to(self.device)
+        cam_intrinsics = batch.get("intrinsics")
+        if cam_intrinsics is not None:
+            cam_intrinsics = cam_intrinsics.to(self.device)
 
         self.pipe.device = self.device
         
@@ -530,11 +552,12 @@ class LightningModelForTrain(pl.LightningModule):
             # Predict noise using the same method as call()
             extra_input = self.pipe.prepare_extra_input(latents_input)
             noise_pred = self.pipe.denoising_model()(
-                latents_input, 
-                timestep=timestep, 
-                cam_emb=cam_emb, 
-                **prompt_emb, 
-                **extra_input, 
+                latents_input,
+                timestep=timestep,
+                cam_emb=cam_emb,
+                cam_intrinsics=cam_intrinsics,
+                **prompt_emb,
+                **extra_input,
                 **image_emb,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
@@ -952,7 +975,9 @@ def train(args):
         use_validation_dataset=args.use_validation_dataset,
         num_val_scenes=args.num_val_scenes,
         cameras_per_scene=args.cameras_per_scene,
-        seed=args.global_seed
+        seed=args.global_seed,
+        dataset_root=args.dataset_path,
+        image_size=(args.width, args.height),
     )
 
     def worker_init_fn(worker_id):

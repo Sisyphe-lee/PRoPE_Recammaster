@@ -6,19 +6,3 @@
 + 模型的Dit block在这里diffsynth/models/wan_video_dit.py，也是我对模型进行修改的地方。
 + 这是训练脚本train_recammaster.py和启动脚本train.sh
 
-conda activate recammaster
-./scripts/train.sh 
-
-
-conda activate recammaster && ./scripts/train.sh -d -c=7 -g=42 # training debug (nn)
-
-
-# todo
-
-- todo tree
-- uv 
-- readme
-- changelog
-- systemprompt
-- commit template
-- (optional) ruff and pytest

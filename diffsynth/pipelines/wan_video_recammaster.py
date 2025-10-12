@@ -404,6 +404,7 @@ def model_fn_wan_video(
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     tea_cache: TeaCache = None,
+    cam_intrinsics: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
@@ -435,7 +436,7 @@ def model_fn_wan_video(
     else:
         # blocks
         for block in dit.blocks:
-            x = block(x, context, cam_emb, t_mod, freqs)
+            x = block(x, context, cam_emb, t_mod, freqs, cam_intrinsics=cam_intrinsics, **kwargs)
         if tea_cache is not None:
             tea_cache.store(x)
 
