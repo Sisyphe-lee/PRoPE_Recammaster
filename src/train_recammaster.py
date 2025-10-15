@@ -62,6 +62,7 @@ class LightningModelForTrain(pl.LightningModule):
         test_inference_steps=5,
         t_highfreq_ratio=0.0,
         frame_downsample_to=0,
+        use_real_temporal_indices=False,
     ): 
         super().__init__()
         self.latent_path = latent_path
@@ -72,6 +73,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.test_dataset = None  # Will be set later
         self.t_highfreq_ratio = t_highfreq_ratio
         self.frame_downsample_to = frame_downsample_to
+        self.use_real_temporal_indices = use_real_temporal_indices
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -294,6 +296,7 @@ class LightningModelForTrain(pl.LightningModule):
             cam_intrinsics = cam_intrinsics.to(self.device)
 
         # Optional external frame downsampling (two-halves: take base then base+per_half)
+        temporal_indices = None
         if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0:
             F_total = latents.shape[2]
             halves = 2
@@ -313,6 +316,14 @@ class LightningModelForTrain(pl.LightningModule):
                     cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
                 elif cam_intrinsics.shape[1] == per_half:
                     cam_intrinsics = cam_intrinsics.index_select(1, base.to(cam_intrinsics.device))
+            
+            # 记录真实的时序索引
+            temporal_indices = index_full
+        
+        # 如果启用了真实时序索引但没有降采样，使用连续索引
+        if self.use_real_temporal_indices and temporal_indices is None:
+            F_total = latents.shape[2]
+            temporal_indices = torch.arange(F_total, device=self.device, dtype=torch.long)
 
         # Loss
         self.pipe.device = self.device
@@ -340,6 +351,7 @@ class LightningModelForTrain(pl.LightningModule):
             t_highfreq_ratio=self.t_highfreq_ratio,
             frame_downsample_to=self.frame_downsample_to,
             cam_intrinsics=cam_intrinsics,
+            temporal_indices=temporal_indices,
         )
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
@@ -387,6 +399,7 @@ class LightningModelForTrain(pl.LightningModule):
         
         # External frame downsampling at start (two-halves scheme). Apply to latents and cam_emb.
         frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
+        temporal_indices = None
         base_indices = None
         if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
             per_half = tgt_latent_len
@@ -409,6 +422,9 @@ class LightningModelForTrain(pl.LightningModule):
                     cam_intrinsics = cam_intrinsics.index_select(1, base_indices.to(cam_intrinsics.device))
             # Update target half length
             tgt_latent_len = base_indices.numel()
+            
+            # 记录真实的时序索引 (两半拼接)
+            temporal_indices = torch.cat([base_indices, base_indices + per_half], dim=0)
         
         # Deterministic seed per step/batch (use downsampled target shape)
         val_seed = self.global_seed + self.global_step + batch_idx
@@ -431,6 +447,7 @@ class LightningModelForTrain(pl.LightningModule):
                 timestep=timestep,
                 cam_emb=cam_emb,
                 cam_intrinsics=cam_intrinsics,
+                temporal_indices=temporal_indices,
                 **prompt_emb,
                 **extra_input,
                 **image_emb,
@@ -495,108 +512,137 @@ class LightningModelForTrain(pl.LightningModule):
 
         return {"psnr": psnr_value}
 
-    @torch.no_grad()
-    def test_step(self, batch, batch_idx):
-        """Test step using inference mode (multi-step denoising from pure noise)"""
-        if not self.enable_test_step:
-            return {}
+    # @torch.no_grad()
+    # def test_step(self, batch, batch_idx):
+    #     """Test step using inference mode (multi-step denoising from pure noise)"""
+    #     if not self.enable_test_step:
+    #         return {}
             
-        # Only test on rank 0 to avoid duplicate work
-        if self.global_rank != 0:
-            return {}
+    #     # Only test on rank 0 to avoid duplicate work
+    #     if self.global_rank != 0:
+    #         return {}
             
-        latents = batch["latents"].to(self.device)
-        prompt_emb = batch["prompt_emb"]
-        prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
-        image_emb = batch["image_emb"]
-        if "clip_feature" in image_emb:
-            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
-        if "y" in image_emb:
-            image_emb["y"] = image_emb["y"][0].to(self.device)
-        cam_emb = batch["camera"].to(self.device)
-        cam_intrinsics = batch.get("intrinsics")
-        if cam_intrinsics is not None:
-            cam_intrinsics = cam_intrinsics.to(self.device)
+    #     latents = batch["latents"].to(self.device)
+    #     prompt_emb = batch["prompt_emb"]
+    #     prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
+    #     image_emb = batch["image_emb"]
+    #     if "clip_feature" in image_emb:
+    #         image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
+    #     if "y" in image_emb:
+    #         image_emb["y"] = image_emb["y"][0].to(self.device)
+    #     cam_emb = batch["camera"].to(self.device)
+    #     cam_intrinsics = batch.get("intrinsics")
+    #     if cam_intrinsics is not None:
+    #         cam_intrinsics = cam_intrinsics.to(self.device)
 
-        self.pipe.device = self.device
+    #     self.pipe.device = self.device
         
-        # Get target and condition latents
-        tgt_latent_len = latents.shape[2] // 2
-        target_latents = latents[:, :, :tgt_latent_len, ...]
-        condition_latents = latents[:, :, tgt_latent_len:, ...]
+    #     # Get target and condition latents
+    #     tgt_latent_len = latents.shape[2] // 2
+    #     target_latents = latents[:, :, :tgt_latent_len, ...]
+    #     condition_latents = latents[:, :, tgt_latent_len:, ...]
         
-        # Reuse pipeline's noise generation and scheduler setup
-        test_seed = self.global_seed + self.current_epoch + batch_idx
-        noise_shape = target_latents.shape
-        
-        # Use pipeline's generate_noise method (reuse from call())
-        noise = self.pipe.generate_noise(
-            noise_shape, 
-            seed=test_seed, 
-            device=self.device, 
-            dtype=torch.float32
-        ).to(dtype=self.pipe.torch_dtype, device=self.device)
-        
-        # Use pipeline's scheduler setup (reuse from call())
-        self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
-        
-        # Multi-step denoising loop (reuse from call())
-        latents = noise
-        
-        for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
-            timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
+    #     # Handle temporal downsampling (same as validation_step)
+    #     temporal_indices = None
+    #     frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
+    #     if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
+    #         per_half = tgt_latent_len
+    #         base_indices = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+    #         # Apply to target/condition
+    #         target_latents = target_latents.index_select(2, base_indices)
+    #         condition_latents = condition_latents.index_select(2, base_indices)
+    #         # Apply to cam_emb
+    #         if cam_emb is not None and cam_emb.dim() >= 2:
+    #             if cam_emb.shape[1] == per_half * 2:
+    #                 idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
+    #                 cam_emb = cam_emb.index_select(1, idx_full.to(cam_emb.device))
+    #             elif cam_emb.shape[1] == per_half:
+    #                 cam_emb = cam_emb.index_select(1, base_indices.to(cam_emb.device))
+    #         if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
+    #             if cam_intrinsics.shape[1] == per_half * 2:
+    #                 idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
+    #                 cam_intrinsics = cam_intrinsics.index_select(1, idx_full.to(cam_intrinsics.device))
+    #             elif cam_intrinsics.shape[1] == per_half:
+    #                 cam_intrinsics = cam_intrinsics.index_select(1, base_indices.to(cam_intrinsics.device))
+    #         # Update target half length
+    #         tgt_latent_len = base_indices.numel()
             
-            # Prepare input latents (target + condition) - same as call()
-            latents_input = torch.cat([latents, condition_latents], dim=2)
+    #         # 记录真实的时序索引 (两半拼接)
+    #         temporal_indices = torch.cat([base_indices, base_indices + per_half], dim=0)
+        
+    #     # Reuse pipeline's noise generation and scheduler setup
+    #     test_seed = self.global_seed + self.current_epoch + batch_idx
+    #     noise_shape = target_latents.shape
+        
+    #     # Use pipeline's generate_noise method (reuse from call())
+    #     noise = self.pipe.generate_noise(
+    #         noise_shape, 
+    #         seed=test_seed, 
+    #         device=self.device, 
+    #         dtype=torch.float32
+    #     ).to(dtype=self.pipe.torch_dtype, device=self.device)
+        
+    #     # Use pipeline's scheduler setup (reuse from call())
+    #     self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
+        
+    #     # Multi-step denoising loop (reuse from call())
+    #     latents = noise
+        
+    #     for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
+    #         timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
             
-            # Predict noise using the same method as call()
-            extra_input = self.pipe.prepare_extra_input(latents_input)
-            noise_pred = self.pipe.denoising_model()(
-                latents_input,
-                timestep=timestep,
-                cam_emb=cam_emb,
-                cam_intrinsics=cam_intrinsics,
-                **prompt_emb,
-                **extra_input,
-                **image_emb,
-                use_gradient_checkpointing=self.use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
-                frame_downsample_to=self.frame_downsample_to,
-            )
+    #         # Prepare input latents (target + condition) - same as call()
+    #         latents_input = torch.cat([latents, condition_latents], dim=2)
             
-            # Scheduler step (same as call())
-            latents = self.pipe.scheduler.step(
-                noise_pred[:,:,:tgt_latent_len,...], 
-                self.pipe.scheduler.timesteps[progress_id], 
-                latents_input[:,:,:tgt_latent_len,...]
-            )
+    #         # Predict noise using the same method as call()
+    #         extra_input = self.pipe.prepare_extra_input(latents_input)
+    #         noise_pred = self.pipe.denoising_model()(
+    #             latents_input,
+    #             timestep=timestep,
+    #             cam_emb=cam_emb,
+    #             cam_intrinsics=cam_intrinsics,
+    #             **prompt_emb,
+    #             **extra_input,
+    #             **image_emb,
+    #             use_gradient_checkpointing=self.use_gradient_checkpointing,
+    #             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+    #             frame_downsample_to=self.frame_downsample_to,
+    #             temporal_indices=temporal_indices,
+    #         )
+            
+    #         # Scheduler step (same as call())
+    #         latents = self.pipe.scheduler.step(
+    #             noise_pred[:,:,:tgt_latent_len,...], 
+    #             self.pipe.scheduler.timesteps[progress_id], 
+    #             latents_input[:,:,:tgt_latent_len,...]
+    #         )
         
-        # Reuse decode logic for consistency with validation_step
-        # Prepare inputs for decode_video_only
-        dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
+    #     # Reuse decode logic for consistency with validation_step
+    #     # Prepare inputs for decode_video_only
+    #     dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
         
-        # Create noisy_latents format: [target_latents, condition_latents] 
-        noisy_latents = torch.cat([latents, condition_latents], dim=2)
+    #     # Create noisy_latents format: [target_latents, condition_latents] 
+    #     noisy_latents = torch.cat([latents, condition_latents], dim=2)
         
-        # Create origin_latents format: [target_latents, condition_latents]
-        origin_latents = torch.cat([target_latents, condition_latents], dim=2)
+    #     # Create origin_latents format: [target_latents, condition_latents]
+    #     origin_latents = torch.cat([target_latents, condition_latents], dim=2)
         
-        # Decode video and calculate PSNR (same as validation_step)
-        test_psnr, combined_frames, metadata = self.decode_video(
-            latents, noisy_latents, tgt_latent_len, origin_latents, dummy_timestep, batch
-        )
+    #     # Decode video and calculate PSNR (same as validation_step)
+    #     test_psnr, combined_frames, metadata = self.decode_video(
+    #         latents, noisy_latents, tgt_latent_len, origin_latents, dummy_timestep, batch
+    #     )
         
-        # Save video with test naming (only first 3 samples)
-        if batch_idx < 3:
-            try:
-                self.save_video_with_naming(combined_frames, batch, video_type="test")
-            except Exception as e:
-                print(f"Failed to save test video: {e}")
+    #     # Save video with test naming (only first 3 samples)
+    #     if batch_idx < 3:
+    #         try:
+    #             self.save_video_with_naming(combined_frames, batch, video_type="test")
+    #         except Exception as e:
+    #             print(f"Failed to save test video: {e}")
         
-        # Log test PSNR
-        self.log("test_psnr", test_psnr, on_epoch=True, prog_bar=True, logger=True)
+    #     # Log test PSNR
+    #     self.log("test_psnr", test_psnr, on_epoch=True, prog_bar=True, logger=True)
         
-        return {"test_psnr": test_psnr}
+    #     return {"test_psnr": test_psnr}
 
     def test_dataloader(self):
         """Return test dataloader for automatic test_step execution after each epoch"""
@@ -946,6 +992,12 @@ def parse_args():
         default=0,
         help="Per-half frames to sample (two-halves scheme). Use 0 to disable downsampling (default: 0)"
     )
+    parser.add_argument(
+        "--use_real_temporal_indices",
+        action="store_true",
+        default=False,
+        help="Use real temporal indices for RoPE instead of continuous indices (default: False)"
+    )
 
     args = parser.parse_args()
     return args
@@ -1032,6 +1084,7 @@ def train(args):
         test_inference_steps=args.test_inference_steps,
         t_highfreq_ratio=getattr(args, 't_highfreq_ratio', 0.0),
         frame_downsample_to=getattr(args, 'frame_downsample_to', 5),
+        use_real_temporal_indices=getattr(args, 'use_real_temporal_indices', False),
     )
     
     # Set test dataset for automatic test_step execution

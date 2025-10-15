@@ -403,7 +403,7 @@ class DiTBlock(nn.Module):
         # Camera layers are registered externally in training script
         # This class only controls whether to use projector or not
 
-    def forward(self, x, context, cam_emb, t_mod, freqs, **_kwargs):
+    def forward(self, x, context, cam_emb, t_mod, freqs, temporal_indices=None, **_kwargs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
@@ -570,6 +570,7 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                temporal_indices: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -585,8 +586,14 @@ class WanModel(torch.nn.Module):
         # Patchify (all downsampling handled outside the model)
         x, (f, h, w) = self.patchify(x)
 
-        # Build RoPE freqs with contiguous temporal indices (0..f-1)
-        selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
+        # Build RoPE freqs with real temporal indices
+        if temporal_indices is not None:
+            # 使用真实的时序索引，确保在正确的设备上
+            selected_t_idx = temporal_indices.to(device=self.freqs[0].device, dtype=torch.long)
+        else:
+            # 回退到连续索引 (向后兼容)
+            selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
+        
         f_freqs = self.freqs[0].index_select(0, selected_t_idx)
         freqs = torch.cat([
             f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),

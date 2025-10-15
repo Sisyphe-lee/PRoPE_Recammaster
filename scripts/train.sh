@@ -20,6 +20,8 @@ usage() {
     echo "  -t, --t-highfreq-ratio RATIO      Temporal low-frequency masking ratio for self-attn (default: 0.0)"
     echo "  -b, --batch-size BATCH_SIZE        Training batch size (default: 1)"
     echo "  -F, --frame-downsample-to N       Per-half frames to sample (two-halves). Default: 0 (disabled); e.g., 5 means each half picks 5 frames"
+    echo "  -T, --use-real-temporal-indices   Use real temporal indices for RoPE instead of continuous indices (default: false)"
+    echo "                                    When enabled, RoPE uses actual frame positions instead of [0,1,2,3...]"
     echo "  -h, --help                         Show this help message"
     exit 1
 }
@@ -40,6 +42,7 @@ T_HIGHFREQ_RATIO="0.5"
 FRAME_DOWNSAMPLE_TO="0"
 BATCH_SIZE="1"
 DATALOADER_DEFAULT=36
+USE_REAL_TEMPORAL_INDICES="false"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -137,6 +140,14 @@ while [[ $# -gt 0 ]]; do
             BATCH_SIZE="${1#*=}"
             shift
             ;;
+        -T|--use-real-temporal-indices)
+            USE_REAL_TEMPORAL_INDICES="true"
+            shift
+            ;;
+        --use-real-temporal-indices=*)
+            USE_REAL_TEMPORAL_INDICES="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -217,6 +228,7 @@ cat <<CONFIG_EOF
   "t_highfreq_ratio": $T_HIGHFREQ_RATIO,
   "batch_size": $BATCH_SIZE,
   "frame_downsample_to": $FRAME_DOWNSAMPLE_TO,
+  "use_real_temporal_indices": $USE_REAL_TEMPORAL_INDICES,
   "effective_dataloader_workers": $EFFECTIVE_DATALOADER_WORKERS
 }
 CONFIG_EOF
@@ -240,7 +252,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --enable_test_step \
  --test_samples 10 \
  --test_inference_steps 10 \
- --val_size 36 \
+ --val_size 2 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
@@ -250,4 +262,5 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --training_strategy deepspeed_stage_2 \
  --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
+ $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
  $DEBUG_FLAG \

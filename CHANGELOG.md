@@ -1,5 +1,25 @@
 # Change Log
 
+## v0.2.5 @lcy - 2025-10-15
+
+### 新增
+- 训练脚本 `scripts/train.sh` 新增开关 `-T/--use-real-temporal-indices`，可独立于 `-F/--frame-downsample-to` 控制 RoPE 使用真实时间索引或连续索引。
+
+### 变更
+- 模型与管线支持显式传入真实时间索引用于 RoPE：
+  - `diffsynth/models/wan_video_dit.py` 的 `WanModel.forward` 与 `DiTBlock.forward` 接受 `temporal_indices`，并在构建时间维 RoPE 频率时优先使用真实索引；自动处理 device 一致性。
+  - 推理 `diffsynth/pipelines/wan_video_recammaster.py` 计算并传递 `temporal_indices`，与降采样后的帧对齐。
+- 训练主循环 `src/train_recammaster.py`：
+  - 当启用两半降采样（two-halves）时构造真实索引 `[base, base+per_half]` 并透传；
+  - 当未降采样但启用 `--use_real_temporal_indices` 时，使用完整连续区间索引；
+  - 验证流程同步透传 `temporal_indices`，确保 RoPE 与时序对齐。
+
+### 实验
+- 新增实验脚本 `exp_by_day/10.15/exp07k:5frame_new_t_rope.sh`，演示 `-F 5 -T` 的组合（5 帧两半降采样 + 真实时间索引）。
+
+### 修复
+- 修复 RoPE 构建中索引 device 不一致导致的运行错误：在模型与管线中将 `temporal_indices` 强制移动至 RoPE 频率张量所在设备。
+
 ## v0.2.4 @lcy - 2025-10-14
 
 ### 变更
