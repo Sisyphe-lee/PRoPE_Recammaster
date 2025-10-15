@@ -13,9 +13,12 @@
   - 当启用两半降采样（two-halves）时构造真实索引 `[base, base+per_half]` 并透传；
   - 当未降采样但启用 `--use_real_temporal_indices` 时，使用完整连续区间索引；
   - 验证流程同步透传 `temporal_indices`，确保 RoPE 与时序对齐。
+- 验证逻辑对齐训练逻辑：`validation_step` 改为先在整段时序上做两半降采样，再切分 target/condition，简化并与 `training_step` 保持一致；同时将相机嵌入与内参的索引同步为全序列形态（去除按半序列的分支）。
+- 训练脚本 `scripts/train.sh` 将 `--val_size` 恢复为 36（由 2 调整回 36），以匹配常规验证规模。
 
 ### 实验
 - 新增实验脚本 `exp_by_day/10.15/exp07k:5frame_new_t_rope.sh`，演示 `-F 5 -T` 的组合（5 帧两半降采样 + 真实时间索引）。
+- 更新 `exp_by_day/10.14/exp07j:full_KS_without_downsample_resume_5_f.sh` 的恢复训练命令与设备分配，指向最新断点与 GPU 配置。
 
 ### 修复
 - 修复 RoPE 构建中索引 device 不一致导致的运行错误：在模型与管线中将 `temporal_indices` 强制移动至 RoPE 频率张量所在设备。

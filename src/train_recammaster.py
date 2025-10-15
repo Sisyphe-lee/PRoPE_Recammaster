@@ -305,17 +305,11 @@ class LightningModelForTrain(pl.LightningModule):
             index_full = torch.cat([base, base + per_half], dim=0)
             # apply to latents (B, C, F, H, W)
             latents = latents.index_select(2, index_full)
-            # sync cam_emb if its N matches F_total or per_half
+            # sync cam_emb and cam_intrinsics assuming full-sequence (F_total)
             if cam_emb is not None and cam_emb.dim() >= 2:
-                if cam_emb.shape[1] == F_total:
-                    cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
-                elif cam_emb.shape[1] == per_half:
-                    cam_emb = cam_emb.index_select(1, base.to(cam_emb.device))
+                cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
             if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
-                if cam_intrinsics.shape[1] == F_total:
-                    cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
-                elif cam_intrinsics.shape[1] == per_half:
-                    cam_intrinsics = cam_intrinsics.index_select(1, base.to(cam_intrinsics.device))
+                cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
             
             # 记录真实的时序索引
             temporal_indices = index_full
@@ -392,39 +386,28 @@ class LightningModelForTrain(pl.LightningModule):
         self.pipe.device = self.device
 
         
-        # Multi-step denoising in validation (like test_step)
+        # External frame downsampling (align with training_step): operate on full sequence, then split
+        frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
+        temporal_indices = None
+        F_total = latents.shape[2]
+        per_half = F_total // 2
+        if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
+            base = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            index_full = torch.cat([base, base + per_half], dim=0)
+            # Apply to latents (B, C, F, H, W)
+            latents = latents.index_select(2, index_full)
+            # Sync cam_emb and cam_intrinsics assuming full-sequence (F_total)
+            if cam_emb is not None and cam_emb.dim() >= 2:
+                cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
+            if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
+                cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
+            # Record real indices
+            temporal_indices = index_full
+        
+        # Split after optional downsampling
         tgt_latent_len = latents.shape[2] // 2
         target_latents = latents[:, :, :tgt_latent_len, ...]
         condition_latents = latents[:, :, tgt_latent_len:, ...]
-        
-        # External frame downsampling at start (two-halves scheme). Apply to latents and cam_emb.
-        frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
-        temporal_indices = None
-        base_indices = None
-        if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
-            per_half = tgt_latent_len
-            base_indices = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
-            # Apply to target/condition
-            target_latents = target_latents.index_select(2, base_indices)
-            condition_latents = condition_latents.index_select(2, base_indices)
-            # Apply to cam_emb
-            if cam_emb is not None and cam_emb.dim() >= 2:
-                if cam_emb.shape[1] == per_half * 2:
-                    idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
-                    cam_emb = cam_emb.index_select(1, idx_full.to(cam_emb.device))
-                elif cam_emb.shape[1] == per_half:
-                    cam_emb = cam_emb.index_select(1, base_indices.to(cam_emb.device))
-            if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
-                if cam_intrinsics.shape[1] == per_half * 2:
-                    idx_full = torch.cat([base_indices, base_indices + per_half], dim=0)
-                    cam_intrinsics = cam_intrinsics.index_select(1, idx_full.to(cam_intrinsics.device))
-                elif cam_intrinsics.shape[1] == per_half:
-                    cam_intrinsics = cam_intrinsics.index_select(1, base_indices.to(cam_intrinsics.device))
-            # Update target half length
-            tgt_latent_len = base_indices.numel()
-            
-            # 记录真实的时序索引 (两半拼接)
-            temporal_indices = torch.cat([base_indices, base_indices + per_half], dim=0)
         
         # Deterministic seed per step/batch (use downsampled target shape)
         val_seed = self.global_seed + self.global_step + batch_idx

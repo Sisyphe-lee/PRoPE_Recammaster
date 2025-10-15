@@ -252,7 +252,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --enable_test_step \
  --test_samples 10 \
  --test_inference_steps 10 \
- --val_size 2 \
+ --val_size 36 \
  --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
  --ckpt_type "$CHECKPOINT_TYPE" \
  $ENABLE_CAM_LAYERS \
