@@ -1,5 +1,14 @@
 # Change Log
 
+## v0.2.4 @lcy - 2025-10-14
+
+### 变更
+- 推理脚本 `scripts/inference.sh` 更新checkpoint路径至Exp07i实验，并禁用帧降采样（`--frame_downsample_to 0`）以支持全帧推理
+- 移除推理脚本中过期的ReCamMaster checkpoint路径配置
+
+### 实验记录
+- 新增实验脚本 `exp_by_day/10.14/exp07j:full_KS_without_downsample_resume_5_f.sh`，记录基于Exp07j的断点恢复训练命令
+
 ## v0.2.3 @lcy - 2025-10-11
 
 ### 新增
