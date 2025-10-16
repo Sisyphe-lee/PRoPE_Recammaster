@@ -205,10 +205,10 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --steps_per_epoch 10000   \
  --max_epochs 100   \
  --learning_rate 1e-5   \
- --accumulate_grad_batches  1  \
+ --accumulate_grad_batches  4  \
  --use_gradient_checkpointing  \
  --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 36; fi) \
- --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 10; fi) \
+ --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 1; fi) \
  --num_val_scenes 2 \
  --global_seed "$GLOBAL_SEED" \
  --enable_test_step \
