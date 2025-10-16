@@ -30,7 +30,58 @@ try:
     from src.prope import _prepare_apply_fns
 except ModuleNotFoundError:
     raise ModuleNotFoundError("prope module not found, please install it with `pip install prope`")
-    
+
+DEFAULT_IMAGE_WIDTH = 832.0
+DEFAULT_IMAGE_HEIGHT = 480.0
+DEFAULT_SENSOR_WIDTH_MM = 23.76
+DEFAULT_SENSOR_HEIGHT_MM = 23.76
+DEFAULT_FOCAL_MM = 18.0
+
+
+def _default_intrinsics_matrix(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    fx = DEFAULT_FOCAL_MM * (DEFAULT_IMAGE_WIDTH / DEFAULT_SENSOR_WIDTH_MM)
+    fy = DEFAULT_FOCAL_MM * (DEFAULT_IMAGE_HEIGHT / DEFAULT_SENSOR_HEIGHT_MM)
+    cx = DEFAULT_IMAGE_WIDTH / 2.0
+    cy = DEFAULT_IMAGE_HEIGHT / 2.0
+    base = torch.tensor(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+    )
+    return base.to(dtype=dtype, device=device)
+
+
+def _normalize_cam_intrinsics(
+    cam_intrinsics: Optional[torch.Tensor],
+    batch: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Ensure camera intrinsics tensor is (B, seq_len, 3, 3) on the correct device/dtype.
+    """
+    if cam_intrinsics is None:
+        base = _default_intrinsics_matrix(dtype, device)
+        return base.view(1, 1, 3, 3).expand(batch, seq_len, 3, 3).contiguous()
+
+    if cam_intrinsics.dim() == 3:
+        cam_intrinsics = cam_intrinsics.unsqueeze(0)
+    if cam_intrinsics.dim() != 4:
+        raise ValueError(f"Unexpected cam_intrinsics shape: {cam_intrinsics.shape}. Expected (B,N,3,3) or (N,3,3).")
+
+    if cam_intrinsics.shape[0] == 1 and batch > 1:
+        cam_intrinsics = cam_intrinsics.expand(batch, -1, -1, -1)
+    if cam_intrinsics.shape[1] != seq_len:
+        if cam_intrinsics.shape[1] == seq_len * 2:
+            raise ValueError(
+                f"cam_intrinsics has twice the expected sequence length ({cam_intrinsics.shape[1]} vs {seq_len}). "
+                "Please downsample or reorder intrinsics to match cam embeddings."
+            )
+        raise ValueError(
+            f"cam_intrinsics sequence dimension mismatch: expected {seq_len}, got {cam_intrinsics.shape[1]}"
+        )
+    return cam_intrinsics.to(dtype=dtype, device=device).contiguous()
+
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     # Check if inputs are already in multi-head format by checking tensor dimensions
@@ -352,7 +403,7 @@ class DiTBlock(nn.Module):
         # Camera layers are registered externally in training script
         # This class only controls whether to use projector or not
 
-    def forward(self, x, context, cam_emb, t_mod, freqs, **_kwargs):
+    def forward(self, x, context, cam_emb, t_mod, freqs, temporal_indices=None, **_kwargs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
@@ -381,24 +432,8 @@ class DiTBlock(nn.Module):
         N = viewmats.shape[1]
         
         # Ensure Ks has the same dtype and device as input_x
-        # Compute camera intrinsics (in pixels) from focal length and resolution.
-        # Assumptions: 35mm sensor (36mm x 24mm), focal length f = 18mm, aperture does not affect pinhole intrinsics.
-        # TODO: remove hardcoded 
-        image_width = 832.0
-        image_height = 480.0
-        # Provided sensor size (square): 23.76mm x 23.76mm
-        sensor_width_mm = 23.76
-        sensor_height_mm = 23.76
-        f_mm = 18.0
-        # fx ≈ f * (W_px / sensor_width_mm), fy ≈ f * (H_px / sensor_height_mm)
-        fx = f_mm * (image_width / sensor_width_mm)   # ~ 630.0 px
-        fy = f_mm * (image_height / sensor_height_mm) # ~ 363.6 px
-        cx = image_width / 2.0                        # 416.0 px
-        cy = image_height / 2.0                       # 240.0 px
-        K = torch.tensor([[fx, 0.0, cx],
-                          [0.0, fy, cy],
-                          [0.0, 0.0, 1.0]], device=input_x.device, dtype=input_x.dtype)
-        Ks = K.view(1, 1, 3, 3).expand(B, N, 3, 3).contiguous()
+        cam_intrinsics = _kwargs.get("cam_intrinsics", None)
+        Ks = _normalize_cam_intrinsics(cam_intrinsics, B, N, input_x.dtype, input_x.device)
         
         # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
         t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
@@ -535,6 +570,7 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                temporal_indices: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -550,8 +586,14 @@ class WanModel(torch.nn.Module):
         # Patchify (all downsampling handled outside the model)
         x, (f, h, w) = self.patchify(x)
 
-        # Build RoPE freqs with contiguous temporal indices (0..f-1)
-        selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
+        # Build RoPE freqs with real temporal indices
+        if temporal_indices is not None:
+            # 使用真实的时序索引，确保在正确的设备上
+            selected_t_idx = temporal_indices.to(device=self.freqs[0].device, dtype=torch.long)
+        else:
+            # 回退到连续索引 (向后兼容)
+            selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
+        
         f_freqs = self.freqs[0].index_select(0, selected_t_idx)
         freqs = torch.cat([
             f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),

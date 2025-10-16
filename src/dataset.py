@@ -9,6 +9,78 @@ import numpy as np
 import random
 import json
 import pandas as pd
+from typing import Optional, Tuple, Dict
+
+
+DEFAULT_IMAGE_WIDTH = 832.0
+DEFAULT_IMAGE_HEIGHT = 480.0
+DEFAULT_SENSOR_WIDTH_MM = 23.76
+DEFAULT_SENSOR_HEIGHT_MM = 23.76
+DEFAULT_FOCAL_MM = 18.0
+
+DATASET_ID_PATTERN = re.compile(r"/train/([^/]+)/")
+FOCAL_PATTERN = re.compile(r"f(?P<focal>\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def infer_dataset_id(path: str) -> str:
+    """
+    Infer dataset identifier (e.g., f18_aperture10) from a tensor/video path.
+    """
+    match = DATASET_ID_PATTERN.search(path)
+    if match:
+        return match.group(1)
+    parts = re.split(r"[\\/]", path)
+    for part in parts:
+        if part.startswith("f") and "aperture" in part:
+            return part
+    return "unknown"
+
+
+def _safe_float(value: Optional[str], default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compute_intrinsics_for_dataset(
+    dataset_id: str,
+    image_width: float = DEFAULT_IMAGE_WIDTH,
+    image_height: float = DEFAULT_IMAGE_HEIGHT,
+    sensor_width_mm: float = DEFAULT_SENSOR_WIDTH_MM,
+    sensor_height_mm: float = DEFAULT_SENSOR_HEIGHT_MM,
+    default_focal_mm: float = DEFAULT_FOCAL_MM,
+) -> np.ndarray:
+    """
+    Build a 3x3 camera intrinsic matrix for a dataset identifier derived from folder name.
+    """
+    focal_match = FOCAL_PATTERN.search(dataset_id)
+    focal_mm = _safe_float(focal_match.group("focal") if focal_match else None, default_focal_mm)
+    fx = focal_mm * (image_width / sensor_width_mm)
+    fy = focal_mm * (image_height / sensor_height_mm)
+    cx = image_width / 2.0
+    cy = image_height / 2.0
+    return np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+
+def resolve_tensor_path(video_path: str, dataset_root: Optional[str] = None) -> str:
+    """
+    Resolve absolute tensor path from a video path and optional dataset root.
+    """
+    candidate = video_path
+    if not os.path.isabs(candidate):
+        if dataset_root is not None:
+            candidate = os.path.join(dataset_root, candidate.lstrip("/"))
+        candidate = os.path.abspath(candidate)
+    tensor_path = candidate + ".tensors.pth"
+    if os.path.exists(tensor_path):
+        return tensor_path
+    return ""
 
 
 class Camera(object):
@@ -19,16 +91,28 @@ class Camera(object):
 
 
 class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, steps_per_epoch, paths=None, fixed_length=None, seed=42):
-        self.path = paths
+    def __init__(
+        self,
+        steps_per_epoch,
+        paths=None,
+        fixed_length=None,
+        seed=42,
+        dataset_root: Optional[str] = None,
+        image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
+        sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
+    ):
+        self.path = paths or []
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
         self.steps_per_epoch = steps_per_epoch
         self.seed = seed
-        # Set random seed for this dataset
         random.seed(seed)
         np.random.seed(seed)
         self.fixed_length = fixed_length
+        self.dataset_root = dataset_root
+        self.image_size = image_size
+        self.sensor_size_mm = sensor_size_mm
+        self._intrinsics_cache: Dict[str, torch.Tensor] = {}
 
     def parse_matrix(self, matrix_str):
         rows = matrix_str.strip().split('] [')
@@ -51,6 +135,21 @@ class TensorDataset(torch.utils.data.Dataset):
         ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
         ret_poses = np.array(ret_poses, dtype=np.float32)
         return ret_poses
+
+    def _get_intrinsics_tensor(self, data_path: str, repeat: int) -> torch.Tensor:
+        dataset_id = infer_dataset_id(data_path)
+        if dataset_id not in self._intrinsics_cache:
+            intrinsics_np = compute_intrinsics_for_dataset(
+                dataset_id,
+                image_width=self.image_size[0],
+                image_height=self.image_size[1],
+                sensor_width_mm=self.sensor_size_mm[0],
+                sensor_height_mm=self.sensor_size_mm[1],
+            )
+            self._intrinsics_cache[dataset_id] = torch.from_numpy(intrinsics_np)
+        Ks = self._intrinsics_cache[dataset_id]
+        expanded = Ks.unsqueeze(0).repeat(repeat, 1, 1)
+        return expanded.to(torch.bfloat16)
 
     def __getitem__(self, index):
         # Return: 
@@ -165,7 +264,9 @@ class TensorDataset(torch.utils.data.Dataset):
 
                 # Concatenate tgt first then cond to align with latents
                 all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0)
-                data['camera'] = torch.from_numpy(all_w2c).to(torch.bfloat16)
+                camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
+                data['camera'] = camera_tensor
+                data['intrinsics'] = self._get_intrinsics_tensor(path_tgt, repeat=camera_tensor.shape[0])
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
@@ -185,7 +286,15 @@ class ValidationDataset(torch.utils.data.Dataset):
     Validation dataset that randomly selects 3 scenes and creates all possible 
     cond-target camera combinations (10x10 = 100 per scene, 300 total)
     """
-    def __init__(self, all_paths, num_val_scenes=3, cameras_per_scene=10, seed=42):
+    def __init__(
+        self,
+        all_paths,
+        num_val_scenes=3,
+        cameras_per_scene=10,
+        seed=42,
+        image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
+        sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
+    ):
         """
         Args:
             all_paths: List of all tensor file paths
@@ -195,6 +304,9 @@ class ValidationDataset(torch.utils.data.Dataset):
         """
         self.cameras_per_scene = cameras_per_scene
         self.num_val_scenes = num_val_scenes
+        self.image_size = image_size
+        self.sensor_size_mm = sensor_size_mm
+        self._intrinsics_cache: Dict[str, torch.Tensor] = {}
         
         # Set random seed for reproducible validation set
         random.seed(seed)
@@ -276,6 +388,21 @@ class ValidationDataset(torch.utils.data.Dataset):
         ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
         ret_poses = np.array(ret_poses, dtype=np.float32)
         return ret_poses
+
+    def _get_intrinsics_tensor(self, data_path: str, repeat: int) -> torch.Tensor:
+        dataset_id = infer_dataset_id(data_path)
+        if dataset_id not in self._intrinsics_cache:
+            intrinsics_np = compute_intrinsics_for_dataset(
+                dataset_id,
+                image_width=self.image_size[0],
+                image_height=self.image_size[1],
+                sensor_width_mm=self.sensor_size_mm[0],
+                sensor_height_mm=self.sensor_size_mm[1],
+            )
+            self._intrinsics_cache[dataset_id] = torch.from_numpy(intrinsics_np)
+        Ks = self._intrinsics_cache[dataset_id]
+        expanded = Ks.unsqueeze(0).repeat(repeat, 1, 1)
+        return expanded.to(torch.bfloat16)
 
     def __getitem__(self, index):
         """Get a validation sample"""
@@ -375,7 +502,9 @@ class ValidationDataset(torch.utils.data.Dataset):
 
             # Concatenate tgt first then cond to align with latents order
             all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
-            data['camera'] = torch.from_numpy(all_w2c).to(torch.bfloat16)
+            camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
+            data['camera'] = camera_tensor
+            data['intrinsics'] = self._get_intrinsics_tensor(tgt_path, repeat=camera_tensor.shape[0])
             
             return data
             
@@ -389,7 +518,18 @@ class ValidationDataset(torch.utils.data.Dataset):
         return len(self.val_combinations)
 
 
-def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dataset=True, num_val_scenes=3, cameras_per_scene=10, seed=42):
+def create_datasets(
+    metadata_path,
+    val_size,
+    steps_per_epoch,
+    use_validation_dataset=True,
+    num_val_scenes=3,
+    cameras_per_scene=10,
+    seed=42,
+    dataset_root: Optional[str] = None,
+    image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
+    sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
+):
     """
     Create training and validation datasets
     
@@ -409,14 +549,21 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
     metadata = pd.read_csv(metadata_path)
     if "video_absolute_path" not in metadata.columns:
         raise ValueError(f"Required column 'video_absolute_path' not found in {metadata_path}")
+    if "dataset" not in metadata.columns:
+        metadata["dataset"] = metadata["video_absolute_path"].apply(infer_dataset_id)
     
     all_paths = []
+    missing = []
     for p in metadata["video_absolute_path"]:
-        tp = p + ".tensors.pth"
-        if os.path.exists(tp):
+        tp = resolve_tensor_path(p, dataset_root=dataset_root)
+        if tp and os.path.exists(tp):
             all_paths.append(tp)
         else:
-            print(f"Warning: missing tensor file: {tp}")
+            if len(missing) < 20:
+                print(f"Warning: missing tensor file: {tp or p}")
+            missing.append(tp or p)
+    if missing:
+        print(f"Warning: {len(missing)} tensor files listed in metadata were not found on disk.")
     
     print(f"Total available tensor files: {len(all_paths)}")
     
@@ -428,7 +575,9 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
             all_paths=all_paths,
             num_val_scenes=num_val_scenes,
             cameras_per_scene=cameras_per_scene,
-            seed=seed
+            seed=seed,
+            image_size=image_size,
+            sensor_size_mm=sensor_size_mm,
         )
         
         # Get training paths from remaining scenes
@@ -441,6 +590,9 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
             paths=train_paths,
             fixed_length=None,
             seed=seed,
+            dataset_root=dataset_root,
+            image_size=image_size,
+            sensor_size_mm=sensor_size_mm,
         )
         
         return train_dataset, val_dataset
@@ -450,7 +602,7 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
         val_size = min(val_size, len(all_paths))
         val_paths = all_paths[:val_size]
         # train_paths = all_paths[val_size:]
-        train_paths = all_paths
+        train_paths = all_paths[val_size:]
         print(f"Dataset split -> train: {len(train_paths)}  val: {len(val_paths)}  (val_size={val_size})")
         
         train_dataset = TensorDataset(
@@ -458,12 +610,18 @@ def create_datasets(metadata_path, val_size, steps_per_epoch, use_validation_dat
             paths=train_paths,
             fixed_length=None,
             seed=seed,
+            dataset_root=dataset_root,
+            image_size=image_size,
+            sensor_size_mm=sensor_size_mm,
         )
         val_dataset = TensorDataset(
             steps_per_epoch=val_size,
             paths=val_paths,
             fixed_length=val_size,
             seed=seed + 10000,  # Different seed for validation dataset
+            dataset_root=dataset_root,
+            image_size=image_size,
+            sensor_size_mm=sensor_size_mm,
         )
         
         return train_dataset, val_dataset

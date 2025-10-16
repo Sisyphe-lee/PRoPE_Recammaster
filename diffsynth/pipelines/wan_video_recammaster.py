@@ -286,6 +286,7 @@ class WanVideoReCamMasterPipeline(BasePipeline):
 
         # Optional temporal downsampling (apply evenly to target, condition, and cam_emb)
         target_latent_len = latents.shape[2]
+        temporal_indices = None
         down_idx = self._compute_downsample_indices(target_latent_len, frame_downsample_to)
         if down_idx is not None:
             latents = latents.index_select(2, down_idx)
@@ -293,6 +294,7 @@ class WanVideoReCamMasterPipeline(BasePipeline):
             if cam_emb is not None:
                 cam_emb = self._downsample_cam_emb(cam_emb, down_idx, target_latent_len)
             target_latent_len = latents.shape[2]
+            temporal_indices = down_idx
 
         # Encode prompts
         self.load_models_to_device(["text_encoder"])
@@ -322,9 +324,9 @@ class WanVideoReCamMasterPipeline(BasePipeline):
 
             latents_input = torch.cat([latents, source_latents], dim=2)
             # Inference
-            noise_pred_posi = model_fn_wan_video(self.dit, latents_input, timestep=timestep, cam_emb=cam_emb, **prompt_emb_posi, **image_emb, **extra_input, **tea_cache_posi)
+            noise_pred_posi = model_fn_wan_video(self.dit, latents_input, timestep=timestep, cam_emb=cam_emb, temporal_indices=temporal_indices, **prompt_emb_posi, **image_emb, **extra_input, **tea_cache_posi)
             if cfg_scale != 1.0:
-                noise_pred_nega = model_fn_wan_video(self.dit, latents_input, timestep=timestep, cam_emb=cam_emb, **prompt_emb_nega, **image_emb, **extra_input, **tea_cache_nega)
+                noise_pred_nega = model_fn_wan_video(self.dit, latents_input, timestep=timestep, cam_emb=cam_emb, temporal_indices=temporal_indices, **prompt_emb_nega, **image_emb, **extra_input, **tea_cache_nega)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
@@ -404,6 +406,8 @@ def model_fn_wan_video(
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     tea_cache: TeaCache = None,
+    cam_intrinsics: Optional[torch.Tensor] = None,
+    temporal_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
@@ -417,8 +421,17 @@ def model_fn_wan_video(
     
     x, (f, h, w) = dit.patchify(x)
     
+    # Build RoPE freqs with real temporal indices
+    if temporal_indices is not None:
+        # 使用真实的时序索引，确保在正确的设备上
+        selected_t_idx = temporal_indices.to(device=dit.freqs[0].device, dtype=torch.long)
+    else:
+        # 回退到连续索引 (向后兼容)
+        selected_t_idx = torch.arange(f, device=dit.freqs[0].device, dtype=torch.long)
+    
+    f_freqs = dit.freqs[0].index_select(0, selected_t_idx)
     freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
@@ -435,7 +448,7 @@ def model_fn_wan_video(
     else:
         # blocks
         for block in dit.blocks:
-            x = block(x, context, cam_emb, t_mod, freqs)
+            x = block(x, context, cam_emb, t_mod, freqs, temporal_indices=temporal_indices, cam_intrinsics=cam_intrinsics, **kwargs)
         if tea_cache is not None:
             tea_cache.store(x)
 

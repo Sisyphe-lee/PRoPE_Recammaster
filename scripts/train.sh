@@ -14,11 +14,14 @@ usage() {
     echo "  -r, --recammaster-checkpoint PATH  ReCamMaster checkpoint path (default: /data1/lcy/projects/ReCamMaster/models/ReCamMaster/checkpoints/step20000.ckpt)"
     echo "  -R, --wan21-resume-checkpoint PATH Wan2.1 resume checkpoint path (optional; used only when provided and ckpt_type=wan21)"
     echo "  -w, --wandb-name WANDB_NAME        Wandb experiment name (default: Exp07c)"
-    echo "  -s, --dataset-path DATASET_PATH    Dataset path (default: /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10)"
-    echo "  -m, --metadata-path METADATA_PATH  Metadata file path (default: ./metadata_subset.csv)"
+    echo "  -s, --dataset-path DATASET_PATH    Dataset path (default: /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train)"
+    echo "  -m, --metadata-path METADATA_PATH  Metadata file path (default: ./metadata/metadata_all.csv)"
     echo "  -g, --global-seed SEED             Global seed (default: 42)"
     echo "  -t, --t-highfreq-ratio RATIO      Temporal low-frequency masking ratio for self-attn (default: 0.0)"
+    echo "  -b, --batch-size BATCH_SIZE        Training batch size (default: 1)"
     echo "  -F, --frame-downsample-to N       Per-half frames to sample (two-halves). Default: 0 (disabled); e.g., 5 means each half picks 5 frames"
+    echo "  -T, --use-real-temporal-indices   Use real temporal indices for RoPE instead of continuous indices (default: false)"
+    echo "                                    When enabled, RoPE uses actual frame positions instead of [0,1,2,3...]"
     echo "  -h, --help                         Show this help message"
     exit 1
 }
@@ -29,14 +32,17 @@ export RUN_TIMESTAMP=$(date +'%m-%d-%H%M%S')
 CUDA_VISIBLE_DEVICES="2,3,4,5,6,7"
 DEBUG_FLAG=""
 OUTPUT_DIR="$(pwd)/models/train"
-METADATA_PATH="$(pwd)/metadata/metadata.csv"
+METADATA_PATH="$(pwd)/metadata/metadata_all.csv"
 RECAMMASTER_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/ReCamMaster/checkpoints/step20000.ckpt"
 WANDB_NAME="Exp07c"
-DATASET_PATH="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10"
-WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-19-191944_Exp04d/checkpoints/step1344.ckpt"
+DATASET_PATH="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train"
+WAN21_RESUME_CHECKPOINT_PATH=""
 GLOBAL_SEED="42"
 T_HIGHFREQ_RATIO="0.5"
 FRAME_DOWNSAMPLE_TO="0"
+BATCH_SIZE="1"
+DATALOADER_DEFAULT=36
+USE_REAL_TEMPORAL_INDICES="false"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -122,6 +128,26 @@ while [[ $# -gt 0 ]]; do
             FRAME_DOWNSAMPLE_TO="${1#*=}"
             shift
             ;;
+        -b|--batch-size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
+        -b=*)
+            BATCH_SIZE="${1#*=}"
+            shift
+            ;;
+        --batch-size=*)
+            BATCH_SIZE="${1#*=}"
+            shift
+            ;;
+        -T|--use-real-temporal-indices)
+            USE_REAL_TEMPORAL_INDICES="true"
+            shift
+            ;;
+        --use-real-temporal-indices=*)
+            USE_REAL_TEMPORAL_INDICES="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -166,6 +192,7 @@ fi
 
 # Build log file and redirect all outputs
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR/logs"
 BASENAME_DATASET=$(basename "$DATASET_PATH")
 SANITIZED_WANDB_NAME=$(echo "$WANDB_NAME" | tr -cs 'A-Za-z0-9._-' '-')
 SANITIZED_DATASET=$(echo "$BASENAME_DATASET" | tr -cs 'A-Za-z0-9._-' '-')
@@ -177,6 +204,14 @@ echo "Logging to $LOG_FILE"
 # Enable xtrace only in debug mode (after tee so traces also go to log)
 if [ "$DEBUG_BOOL" = true ]; then
     set -x
+fi
+
+if [ "$DEBUG_BOOL" = true ]; then
+    EFFECTIVE_BATCH_SIZE=1
+    EFFECTIVE_DATALOADER_WORKERS=0
+else
+    EFFECTIVE_BATCH_SIZE="$BATCH_SIZE"
+    EFFECTIVE_DATALOADER_WORKERS="$DATALOADER_DEFAULT"
 fi
 
 echo "Configuration:"
@@ -191,7 +226,10 @@ cat <<CONFIG_EOF
   "metadata_path": "$METADATA_PATH",
   "global_seed": $GLOBAL_SEED,
   "t_highfreq_ratio": $T_HIGHFREQ_RATIO,
-  "frame_downsample_to": $FRAME_DOWNSAMPLE_TO
+  "batch_size": $BATCH_SIZE,
+  "frame_downsample_to": $FRAME_DOWNSAMPLE_TO,
+  "use_real_temporal_indices": $USE_REAL_TEMPORAL_INDICES,
+  "effective_dataloader_workers": $EFFECTIVE_DATALOADER_WORKERS
 }
 CONFIG_EOF
 
@@ -205,10 +243,10 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --steps_per_epoch 10000   \
  --max_epochs 100   \
  --learning_rate 1e-5   \
- --accumulate_grad_batches  4  \
+ --accumulate_grad_batches  2  \
  --use_gradient_checkpointing  \
- --dataloader_num_workers $(if [ "$DEBUG_BOOL" = true ]; then echo 0; else echo 36; fi) \
- --batch_size $(if [ "$DEBUG_BOOL" = true ]; then echo 1; else echo 1; fi) \
+ --dataloader_num_workers "$EFFECTIVE_DATALOADER_WORKERS" \
+ --batch_size "$EFFECTIVE_BATCH_SIZE" \
  --num_val_scenes 2 \
  --global_seed "$GLOBAL_SEED" \
  --enable_test_step \
@@ -220,9 +258,9 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  $ENABLE_CAM_LAYERS \
  --metadata_path "$METADATA_PATH" \
  --wandb_name "$WANDB_NAME" \
- --val_check_interval_batches 50 \
+ --val_check_interval_batches 200 \
  --training_strategy deepspeed_stage_2 \
  --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
+ $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
  $DEBUG_FLAG \
-

@@ -1,5 +1,54 @@
 # Change Log
 
+## v0.2.5 @lcy - 2025-10-15
+
+### 新增
+- 训练脚本 `scripts/train.sh` 新增开关 `-T/--use-real-temporal-indices`，可独立于 `-F/--frame-downsample-to` 控制 RoPE 使用真实时间索引或连续索引。
+
+### 变更
+- 模型与管线支持显式传入真实时间索引用于 RoPE：
+  - `diffsynth/models/wan_video_dit.py` 的 `WanModel.forward` 与 `DiTBlock.forward` 接受 `temporal_indices`，并在构建时间维 RoPE 频率时优先使用真实索引；自动处理 device 一致性。
+  - 推理 `diffsynth/pipelines/wan_video_recammaster.py` 计算并传递 `temporal_indices`，与降采样后的帧对齐。
+- 训练主循环 `src/train_recammaster.py`：
+  - 当启用两半降采样（two-halves）时构造真实索引 `[base, base+per_half]` 并透传；
+  - 当未降采样但启用 `--use_real_temporal_indices` 时，使用完整连续区间索引；
+  - 验证流程同步透传 `temporal_indices`，确保 RoPE 与时序对齐。
+- 验证逻辑对齐训练逻辑：`validation_step` 改为先在整段时序上做两半降采样，再切分 target/condition，简化并与 `training_step` 保持一致；同时将相机嵌入与内参的索引同步为全序列形态（去除按半序列的分支）。
+- 训练脚本 `scripts/train.sh` 将 `--val_size` 恢复为 36（由 2 调整回 36），以匹配常规验证规模。
+
+### 实验
+- 新增实验脚本 `exp_by_day/10.15/exp07k:5frame_new_t_rope.sh`，演示 `-F 5 -T` 的组合（5 帧两半降采样 + 真实时间索引）。
+- 更新 `exp_by_day/10.14/exp07j:full_KS_without_downsample_resume_5_f.sh` 的恢复训练命令与设备分配，指向最新断点与 GPU 配置。
+
+### 修复
+- 修复 RoPE 构建中索引 device 不一致导致的运行错误：在模型与管线中将 `temporal_indices` 强制移动至 RoPE 频率张量所在设备。
+
+## v0.2.4 @lcy - 2025-10-14
+
+### 变更
+- 推理脚本 `scripts/inference.sh` 更新checkpoint路径至Exp07i实验，并禁用帧降采样（`--frame_downsample_to 0`）以支持全帧推理
+- 移除推理脚本中过期的ReCamMaster checkpoint路径配置
+
+### 实验记录
+- 新增实验脚本 `exp_by_day/10.14/exp07j:full_KS_without_downsample_resume_5_f.sh`，记录基于Exp07j的断点恢复训练命令
+
+## v0.2.3 @lcy - 2025-10-11
+
+### 新增
+- 数据集加载 `src/dataset.py` 按 metadata 中的子目录解析，自动推算并返回相机内参矩阵；训练与验证批次现可直接获取 `intrinsics`。
+
+### 变更
+- 推理/训练主干 `diffsynth/models/wan_video_dit.py`、`diffsynth/pipelines/wan_video_recammaster.py` 与 `src/train_recammaster.py` 全链路传播 `cam_intrinsics`，缺省时回退至 Wan2.1 默认内参。
+- 训练脚本 `scripts/train.sh` 默认使用全量数据（`metadata_all.csv` + `/train` 根目录）、新增 `--batch-size` 参数，并仅在明确传入 `--wan21-resume-checkpoint` 时加载断点。
+- 数据集加载 `src/dataset.py` 目前训练集和验证集没有重合。
+- VAE 特征提取 `src/vae_feature.py` 支持 `--metadata_path`，可复用共享 metadata；`TextVideoDataset` 与训练版数据集都会接受绝对或相对路径。
+
+### 构建与工具链
+- 新版 `scripts/extract_vae.sh` 支持参数化数据集/metadata 输入，用于批量补齐 `.tensors.pth`。
+
+### 其他
+- 清理 README 过期的 todo 片段，保持顶层描述精简。
+
 ## v0.2.2 @lcy - 2025-10-09
 
 ### 新增

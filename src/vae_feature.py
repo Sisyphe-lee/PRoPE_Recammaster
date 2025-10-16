@@ -19,8 +19,12 @@ import shutil
 
 class TextVideoDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
-        metadata = pd.read_csv('./metadata.csv')
-        self.path = [os.path.join( file_name) for file_name in metadata["video_absolute_path"]]
+        metadata = pd.read_csv(metadata_path)
+        raw_paths = metadata["video_absolute_path"].tolist()
+        self.path = [
+            p if os.path.isabs(p) else os.path.join(base_path, p)
+            for p in raw_paths
+        ]
         self.text = metadata["caption"].to_list()
         
         self.max_num_frames = max_num_frames
@@ -171,10 +175,15 @@ class Camera(object):
 
 class TensorDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, steps_per_epoch):
-        metadata = pd.read_csv('./metadata.csv')
-        self.path = [os.path.join(file_name) for file_name in metadata["video_absolute_path"]]
-        print(len(self.path), "videos in metadata.")
-        self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
+        metadata = pd.read_csv(metadata_path)
+        raw_paths = metadata["video_absolute_path"].tolist()
+        video_paths = [
+            p if os.path.isabs(p) else os.path.join(base_path, p)
+            for p in raw_paths
+        ]
+        print(len(video_paths), "videos in metadata.")
+        tensor_paths = [f"{p}.tensors.pth" for p in video_paths if os.path.exists(f"{p}.tensors.pth")]
+        self.path = tensor_paths
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
         self.steps_per_epoch = steps_per_epoch
@@ -546,6 +555,13 @@ def parse_args():
         "--metadata_file_name",
         type=str,
         default="metadata.csv",
+        help="Metadata filename relative to dataset_path (ignored when --metadata_path is provided).",
+    )
+    parser.add_argument(
+        "--metadata_path",
+        type=str,
+        default=None,
+        help="Optional absolute metadata CSV path. Overrides --metadata_file_name when set.",
     )
     parser.add_argument(
         "--resume_ckpt_path",
@@ -557,9 +573,12 @@ def parse_args():
 
 
 def data_process(args):
+    metadata_path = args.metadata_path
+    if metadata_path is None:
+        metadata_path = os.path.join(args.dataset_path, args.metadata_file_name)
     dataset = TextVideoDataset(
         args.dataset_path,
-        os.path.join(args.dataset_path, args.metadata_file_name),
+        metadata_path,
         max_num_frames=args.num_frames,
         frame_interval=1,
         num_frames=args.num_frames,
@@ -590,9 +609,12 @@ def data_process(args):
     
     
 def train(args):
+    metadata_path = args.metadata_path
+    if metadata_path is None:
+        metadata_path = os.path.join(args.dataset_path, args.metadata_file_name)
     dataset = TensorDataset(
         args.dataset_path,
-        os.path.join(args.dataset_path, "metadata.csv"),
+        metadata_path,
         steps_per_epoch=args.steps_per_epoch,
     )
     dataloader = torch.utils.data.DataLoader(

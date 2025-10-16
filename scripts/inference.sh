@@ -12,8 +12,8 @@ FRAME_DOWNSAMPLE_TO="${FRAME_DOWNSAMPLE_TO:-5}"
 # For Wan2.1 original model:
 WAN21_CHECKPOINT_PATH="./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
 # For ReCamMaster fine-tuned model:
-RECAMMASTER_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/09-16-231550_Exp04d/checkpoints/validation_step150.ckpt"
-WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/10-08-111048_Exp07g/checkpoints/step2388.ckpt"
+
+WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/10-11-154819_Exp07i/checkpoints/step1451.ckpt"
 # Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
 CHECKPOINT_TYPE="wan21"  # Change to "wan21" if you want to use Wan2.1 model
 
@@ -34,6 +34,6 @@ PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
     $ENABLE_CAM_LAYERS \
     --output_dir "$OUTPUT_DIR" \
     --cfg_scale 5.0 \
-    --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
+    --frame_downsample_to 0 \
     --dataloader_num_workers 1 \
     --camera_extrinsics_filename "camera_extrinsics_ori.json"
