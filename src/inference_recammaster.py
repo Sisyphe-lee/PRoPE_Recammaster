@@ -215,9 +215,12 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         dists = np.linalg.norm(diffs, axis=-1)
         max_dist = float(np.max(dists))
         if not np.isfinite(max_dist) or max_dist < eps:
+            # print("max_dist is not finite or less than eps, return original rel_c2w")
             return rel_c2w
         scaled = rel_c2w.copy()
         scaled[:, :3, 3] /= max_dist
+        # print("max_dist is finite and greater than eps, return scaled rel_c2w")
+        print(f"max_dist: {max_dist}")
         return scaled
 
     def _normalize_joint_translation(self, cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-8) -> tuple[np.ndarray, np.ndarray]:
@@ -282,7 +285,7 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         src_cam_params = [Camera(c2w) for c2w in src_c2ws_sampled]
         cond_ref_cam = src_cam_params[0]
         cond_rel_c2w = self._compute_relative_c2w(cond_ref_cam, src_cam_params)
-        cond_rel_c2w = self._normalize_pairwise_distance(cond_rel_c2w)
+        # cond_rel_c2w = self._normalize_pairwise_distance(cond_rel_c2w)
 
         camera_list = []
         for cam_type in range(1, 11):
@@ -294,8 +297,13 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
                 c2ws.append(c2w)
             tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
             tgt_rel_c2w = self._compute_relative_c2w(cond_ref_cam, tgt_cam_params)
-            tgt_rel_c2w = self._normalize_pairwise_distance(tgt_rel_c2w)
+            # tgt_rel_c2w = self._normalize_pairwise_distance(tgt_rel_c2w)
+
+            ## TODO: 放大tgt的translation 5倍
+            # tgt_rel_c2w[:, :3, 3] *= 20.0    
+
             cond_joint, tgt_joint = self._normalize_joint_translation(cond_rel_c2w, tgt_rel_c2w)
+            # tgt_joint[:, :3, 3] *= 5.0
             cond_rel_w2c = self._c2w_to_w2c(cond_joint)
             tgt_rel_w2c = self._c2w_to_w2c(tgt_joint)
             all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0).astype(np.float32)
@@ -486,10 +494,12 @@ if __name__ == '__main__':
         cam_fname = os.path.basename(source_path)  # original video filename
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
+            ## if id < 5, continue
+            if cam_type_id < 5:
+                continue
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
-                os.makedirs(cam_output_dir)
-
+                os.makedirs(cam_output_dir) 
             video = pipe(
                 prompt=target_text,
                 negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",

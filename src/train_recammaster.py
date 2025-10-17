@@ -4,6 +4,7 @@ Train ReCamMaster With PRoPE Attention
 import copy
 import os
 import torch, os, imageio, argparse
+import sys
 from torchvision.transforms import v2
 import lightning as pl
 import pandas as pd
@@ -16,7 +17,8 @@ import json
 import torch.nn as nn
 import torch.nn.functional as F
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
+import torch.distributed as dist
 import time
 import csv
 
@@ -627,22 +629,22 @@ class LightningModelForTrain(pl.LightningModule):
         
     #     return {"test_psnr": test_psnr}
 
-    def test_dataloader(self):
-        """Return test dataloader for automatic test_step execution after each epoch"""
-        if not self.enable_test_step or self.test_dataset is None:
-            return None
+    # def test_dataloader(self):
+    #     """Return test dataloader for automatic test_step execution after each epoch"""
+    #     if not self.enable_test_step or self.test_dataset is None:
+    #         return None
         
-        # Create a subset of test dataset for testing
-        test_indices = list(range(min(self.test_samples, len(self.test_dataset))))
-        test_subset = torch.utils.data.Subset(self.test_dataset, test_indices)
+    #     # Create a subset of test dataset for testing
+    #     test_indices = list(range(min(self.test_samples, len(self.test_dataset))))
+    #     test_subset = torch.utils.data.Subset(self.test_dataset, test_indices)
         
-        return torch.utils.data.DataLoader(
-            test_subset,
-            shuffle=False,
-            batch_size=1,
-            num_workers=4,  # Use reasonable number of workers
-            persistent_workers=True
-        )
+    #     return torch.utils.data.DataLoader(
+    #         test_subset,
+    #         shuffle=False,
+    #         batch_size=1,
+    #         num_workers=4,  # Use reasonable number of workers
+    #         persistent_workers=True
+    #     )
 
     def on_validation_epoch_start(self):
         # Reset accumulators
@@ -982,6 +984,13 @@ def parse_args():
         help="Use real temporal indices for RoPE instead of continuous indices (default: False)"
     )
 
+    parser.add_argument(
+        "--distributed_timeout_seconds",
+        type=int,
+        default=1800,
+        help="Timeout in seconds for torch.distributed.init_process_group (default: 1800)"
+    )
+
     args = parser.parse_args()
     return args
 
@@ -1195,6 +1204,9 @@ def train(args):
                     pass
     concise_timing_cb = ConciseTimingCallback(out_dir=os.path.join(run_dir, "profiler"))
 
+    # Ensure distributed init uses a generous timeout to avoid premature aborts on long steps
+    os.environ["TORCH_DIST_INIT_TIMEOUT"] = str(getattr(args, "distributed_timeout_seconds", 1800))
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
@@ -1219,7 +1231,7 @@ def train(args):
         gradient_clip_val=0.05,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    trainer.validate(model, val_dataloader)
+    # trainer.validate(model, val_dataloader)
     
     # Run an initial test at step 0 if test_step is enabled
     # if test_dataloader is not None:
@@ -1234,4 +1246,13 @@ def train(args):
 if __name__ == '__main__':
     args = parse_args()
     os.makedirs(os.path.join(args.output_path, "checkpoints"), exist_ok=True)
-    train(args)
+    try:
+        train(args)
+    except Exception as e:
+        print(f"Fatal error encountered: {e}", flush=True)
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception as _:
+            pass
+        sys.exit(1)
