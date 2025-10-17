@@ -65,6 +65,7 @@ class LightningModelForTrain(pl.LightningModule):
         t_highfreq_ratio=0.0,
         frame_downsample_to=0,
         use_real_temporal_indices=False,
+        use_physical_index=False,
     ): 
         super().__init__()
         self.latent_path = latent_path
@@ -76,6 +77,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.t_highfreq_ratio = t_highfreq_ratio
         self.frame_downsample_to = frame_downsample_to
         self.use_real_temporal_indices = use_real_temporal_indices
+        self.use_physical_index = use_physical_index
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -321,6 +323,15 @@ class LightningModelForTrain(pl.LightningModule):
             F_total = latents.shape[2]
             temporal_indices = torch.arange(F_total, device=self.device, dtype=torch.long)
 
+        # 物理索引：将前半段索引复制到后半段，使两半不共享时间戳
+        if getattr(self, 'use_physical_index', False):
+            per_half = latents.shape[2] // 2
+            if temporal_indices is None:
+                half = torch.arange(per_half, device=self.device, dtype=torch.long)
+            else:
+                half = temporal_indices[:per_half]
+            temporal_indices = torch.cat([half, half], dim=0)
+
         # Loss
         self.pipe.device = self.device
         # Ensure training timesteps are set (validation/test may change it)
@@ -405,6 +416,13 @@ class LightningModelForTrain(pl.LightningModule):
                 cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
             # Record real indices
             temporal_indices = index_full
+        # 物理索引：将前半段索引复制到后半段，使两半不共享时间戳
+        if getattr(self, 'use_physical_index', False):
+            if temporal_indices is None:
+                half = torch.arange(per_half, device=self.device, dtype=torch.long)
+            else:
+                half = temporal_indices[:per_half]
+            temporal_indices = torch.cat([half, half], dim=0)
         
         # Split after optional downsampling
         tgt_latent_len = latents.shape[2] // 2
@@ -983,6 +1001,12 @@ def parse_args():
         default=False,
         help="Use real temporal indices for RoPE instead of continuous indices (default: False)"
     )
+    parser.add_argument(
+        "-P", "--use_physical_index",
+        action="store_true",
+        default=False,
+        help="Duplicate first-half temporal indices to second-half so tgt and cond do not share timestamps (applies regardless of downsampling)"
+    )
 
     parser.add_argument(
         "--distributed_timeout_seconds",
@@ -1077,6 +1101,7 @@ def train(args):
         t_highfreq_ratio=getattr(args, 't_highfreq_ratio', 0.0),
         frame_downsample_to=getattr(args, 'frame_downsample_to', 5),
         use_real_temporal_indices=getattr(args, 'use_real_temporal_indices', False),
+        use_physical_index=getattr(args, 'use_physical_index', False),
     )
     
     # Set test dataset for automatic test_step execution
