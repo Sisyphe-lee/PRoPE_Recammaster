@@ -233,6 +233,12 @@ cat <<CONFIG_EOF
 }
 CONFIG_EOF
 
+# Distributed/NCCL failure fast settings
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
+# Reduce chatty logs unless debugging
+export NCCL_DEBUG=${NCCL_DEBUG:-ERROR}
+
 # # set to num_workers 0 and batch_size 1 for debug
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src.train_recammaster  \
  --task train  \
@@ -260,6 +266,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --wandb_name "$WANDB_NAME" \
  --val_check_interval_batches 200 \
  --training_strategy deepspeed_stage_2 \
+ --distributed_timeout_seconds 1800 \
  --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
  $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
