@@ -1,5 +1,32 @@
 # Change Log
 
+## v0.2.6 @lcy - 2025-10-17
+
+### 新增
+- 分布式快速失败与超时控制：
+  - `scripts/train.sh` 注入 `NCCL_ASYNC_ERROR_HANDLING=1`、`NCCL_BLOCKING_WAIT=1`，并将 `NCCL_DEBUG` 缺省降为 `ERROR`，避免心跳刷屏。
+  - 训练入口新增超时参数 `--distributed_timeout_seconds`（默认 1800），用于配置分布式初始化超时。
+
+- 训练/验证新增 `-P/--use_physical_index`：开启时将时序索引前半段复制到后半段，使 tgt 与 cond 不共享时间戳（物理索引）。
+
+
+### 变更
+- `src/train_recammaster.py`：
+  - 读取 `--distributed_timeout_seconds` 并设置 `TORCH_DIST_INIT_TIMEOUT`；
+  - 将主入口包裹在 try/except 中，出现致命错误时调用 `dist.destroy_process_group()` 并 `sys.exit(1)`，确保各 rank 一致性退出。
+- `scripts/train.sh`：
+  - 将验证频率 `--val_check_interval_batches` 设为 200；
+  - 透传 `--distributed_timeout_seconds 1800` 给训练入口。
+
+- 物理索引适用于“开/关下采样”两种场景：由 `-P/--use_physical_index` 控制，默认关闭不改变现有行为；在 `training_step` 与 `validation_step` 中对 `temporal_indices` 执行“前半段复制到后半段”。
+- 更新 `src/train_recammaster.py` 注释与 CLI 帮助文案，明确物理索引适用于是否下采样皆可；本次仅调整训练/验证，推理暂未变更。
+
+### 实验
+- `src/inference_recammaster.py`：在目标相机轨迹归一化后、联合归一化前，对目标轨迹平移分量进行 3 倍放大（tgt translation ×3），以增强相机运动幅度（实验性）。
+
+### 修复
+- 分布式异常导致的 NCCL 心跳刷屏问题：通过异步错误处理与阻塞等待配置，让错误更快传播并干净退出，避免淹没根因日志。
+
 ## v0.2.5 @lcy - 2025-10-15
 
 ### 新增
