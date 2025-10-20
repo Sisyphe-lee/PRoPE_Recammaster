@@ -11,4 +11,6 @@
 # ## 因为训练中断，接着上一次训练的继续
 # bash ./scripts/train.sh -b 2 -c "4,5,6,7" -g 42 -w Exp07j -R /data1/lcy/projects/ReCamMaster/wandb/10-15-095226_Exp07j/checkpoints/step100.ckpt
  ## 因为训练中断，接着上一次训练的继续
-bash ./scripts/train.sh -b 2 -c "3,4,5,6,7" -g 42 -w Exp07j -R  /data1/lcy/projects/ReCamMaster/wandb/10-15-145432_Exp07j/checkpoints/step200.ckpt
+# bash ./scripts/train.sh -b 2 -c "3,4,5,6,7" -g 42 -w Exp07j -R  /data1/lcy/projects/ReCamMaster/wandb/10-15-145432_Exp07j/checkpoints/step200.ckpt
+## 因为训练中断，接着上一次训练的继续
+bash ./scripts/train.sh -b 2 -c "2,3,4,5,6,7" -g 42 -w Exp07j -R /data1/lcy/projects/ReCamMaster/wandb/10-16-160559_Exp07j/checkpoints/step1100.ckpt
