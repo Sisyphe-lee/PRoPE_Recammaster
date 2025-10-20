@@ -22,6 +22,7 @@ usage() {
     echo "  -F, --frame-downsample-to N       Per-half frames to sample (two-halves). Default: 0 (disabled); e.g., 5 means each half picks 5 frames"
     echo "  -T, --use-real-temporal-indices   Use real temporal indices for RoPE instead of continuous indices (default: false)"
     echo "                                    When enabled, RoPE uses actual frame positions instead of [0,1,2,3...]"
+    echo "  -P, --use-physical-index          Duplicate first-half temporal indices to second-half so tgt/cond do not share timestamps (default: false)"
     echo "  -h, --help                         Show this help message"
     exit 1
 }
@@ -43,6 +44,7 @@ FRAME_DOWNSAMPLE_TO="0"
 BATCH_SIZE="1"
 DATALOADER_DEFAULT=36
 USE_REAL_TEMPORAL_INDICES="false"
+USE_PHYSICAL_INDEX="false"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -148,6 +150,14 @@ while [[ $# -gt 0 ]]; do
             USE_REAL_TEMPORAL_INDICES="${1#*=}"
             shift
             ;;
+        -P|--use-physical-index)
+            USE_PHYSICAL_INDEX="true"
+            shift
+            ;;
+        --use-physical-index=*)
+            USE_PHYSICAL_INDEX="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -229,6 +239,7 @@ cat <<CONFIG_EOF
   "batch_size": $BATCH_SIZE,
   "frame_downsample_to": $FRAME_DOWNSAMPLE_TO,
   "use_real_temporal_indices": $USE_REAL_TEMPORAL_INDICES,
+  "use_physical_index": $USE_PHYSICAL_INDEX,
   "effective_dataloader_workers": $EFFECTIVE_DATALOADER_WORKERS
 }
 CONFIG_EOF
@@ -270,4 +281,5 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
  $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
+ $([ "$USE_PHYSICAL_INDEX" = "true" ] && echo "--use_physical_index") \
  $DEBUG_FLAG \

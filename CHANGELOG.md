@@ -1,5 +1,40 @@
 # Change Log
 
+## v0.2.7 @yyb - 2025-01-XX
+
+### 新增
+- **物理索引功能**: 添加 `-P/--use-physical-index` 参数，支持前半段时序索引复制到后半段，使 tgt/cond 不共享时间戳
+- **模型下载工具**: 完善 `tools/download_model.py` 支持多源模型下载
+  - 支持 HuggingFace Hub 和 ModelScope 双源下载
+  - 添加自动源选择功能，优先尝试 HuggingFace，失败时回退到 ModelScope
+  - 支持文件模式过滤（包含/排除特定文件）
+  - 支持断点续传和强制重新下载
+  - 添加使用示例：Wan2.1-T2V-1.3B、FLUX.1-Kontext-dev、Wan2.2-TI2V-5B
+- **PRoPE 测试工具**: 新增 `tools/prope_case.py` 用于 PRoPE 算法测试和验证
+  - 包含旋转矩阵计算、相对位姿编码、多种评分模式
+  - 支持 base、rel_scaled、modulated 三种评分策略
+
+### 变更
+- `scripts/train.sh` 添加物理索引参数支持和帮助文档
+- `src/train_recammaster.py` 优化时序索引处理逻辑，启用初始验证步骤
+- `exp_by_day/10.17/exp08a:5frame_physical.sh` 更新 GPU 配置和 batch size
+- `tools/download_model.py` 从简单脚本重构为功能完整的 CLI 工具
+  - 使用 `click` 库提供丰富的命令行参数支持
+  - 支持环境变量 `HF_TOKEN` 自动获取访问令牌
+  - 默认使用 HuggingFace 镜像端点提升下载速度
+
+### 修复
+- 优化物理索引实现，确保时序索引正确复制和处理
+- 改进训练逻辑中的索引设备一致性处理
+
+### 构建与工具链
+- 添加 `click` 依赖支持，用于构建命令行界面
+- 脚本添加执行权限，支持直接运行
+
+### 其他
+- 删除过时的 `tools/download_wan2.1.py` 脚本
+- 更新实验配置以适配新的多卡训练环境
+
 ## v0.2.6 @lcy - 2025-10-17
 
 ### 新增
