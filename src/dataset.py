@@ -29,7 +29,7 @@ def infer_dataset_id(path: str) -> str:
     match = DATASET_ID_PATTERN.search(path)
     if match:
         return match.group(1)
-    parts = re.split(r"[\\/]", path)
+    parts = re.split(r"[\\/]+", path)
     for part in parts:
         if part.startswith("f") and "aperture" in part:
             return part
@@ -149,7 +149,8 @@ class TensorDataset(torch.utils.data.Dataset):
             self._intrinsics_cache[dataset_id] = torch.from_numpy(intrinsics_np)
         Ks = self._intrinsics_cache[dataset_id]
         expanded = Ks.unsqueeze(0).repeat(repeat, 1, 1)
-        return expanded.to(torch.bfloat16)
+        # Keep intrinsics as float32 for numerical stability
+        return expanded.to(torch.float32)
 
     def __getitem__(self, index):
         # Return: 
@@ -195,7 +196,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 tgt_camera_path = os.path.join(base_path, "cameras", "camera_extrinsics.json")              
                 with open(tgt_camera_path, 'r') as file:
                     cam_data = json.load(file)
-                # Build c2w trajectories for cond and tgt with axis/scale normalization
+                # Build c2w trajectories for cond and tgt with axis normalization (no fixed scaling)
                 multiview_c2ws = []
                 cam_idx = list(range(81))[::4]
                 for view_idx in [cond_idx, tgt_idx]:
@@ -205,7 +206,7 @@ class TensorDataset(torch.utils.data.Dataset):
                     for c2w in traj:
                         c2w = c2w[:, [1, 2, 0, 3]]
                         c2w[:3, 1] *= -1.
-                        c2w[:3, 3] /= 100
+                        # Removed fixed /100 scaling; scale will be determined by baseline normalization
                         c2ws.append(c2w)
                     multiview_c2ws.append(c2ws)
                 # Make Camera objects for relative pose utility
@@ -247,16 +248,21 @@ class TensorDataset(torch.utils.data.Dataset):
                 cond_rel_c2w = compute_relative_c2w(cond_cam_params)
                 tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
 
-                # 2) Normalize all translations across both trajectories by the max norm
-                all_rel_c2w = np.concatenate([tgt_rel_c2w, cond_rel_c2w], axis=0)
-                translations = all_rel_c2w[:, :3, 3]
-                norms = np.linalg.norm(translations, axis=1)
-                max_norm = np.max(norms) if norms.size > 0 else 1.0
-                if max_norm < 1e-8:
-                    max_norm = 1.0
-                # Apply normalization back to each trajectory
-                tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / max_norm
-                cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / max_norm
+                # 2) Baseline normalization using cond last frame as baseline; fallback to median of cond distances
+                eps = 1e-3
+                # cond last frame translation norm relative to ref (cond[0])
+                baseline = float(np.linalg.norm(cond_rel_c2w[-1][:3, 3], ord=2))
+                if not np.isfinite(baseline):
+                    baseline = 0.0
+                if baseline <= eps:
+                    cond_dists = np.linalg.norm(cond_rel_c2w[:, :3, 3], axis=1)
+                    valid = cond_dists > eps
+                    if np.any(valid):
+                        baseline = float(np.median(cond_dists[valid]))
+                    else:
+                        baseline = 1.0
+                cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / baseline
+                tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / baseline
 
                 # 3) Invert to obtain relative w2c
                 tgt_rel_w2c = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
@@ -264,7 +270,7 @@ class TensorDataset(torch.utils.data.Dataset):
 
                 # Concatenate tgt first then cond to align with latents
                 all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0)
-                camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
+                camera_tensor = torch.from_numpy(all_w2c).to(torch.float32)
                 data['camera'] = camera_tensor
                 data['intrinsics'] = self._get_intrinsics_tensor(path_tgt, repeat=camera_tensor.shape[0])
                 break
@@ -402,7 +408,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             self._intrinsics_cache[dataset_id] = torch.from_numpy(intrinsics_np)
         Ks = self._intrinsics_cache[dataset_id]
         expanded = Ks.unsqueeze(0).repeat(repeat, 1, 1)
-        return expanded.to(torch.bfloat16)
+        return expanded.to(torch.float32)
 
     def __getitem__(self, index):
         """Get a validation sample"""
@@ -442,7 +448,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             with open(tgt_camera_path, 'r') as file:
                 cam_data = json.load(file)
             
-            # Build c2w trajectories with axis/scale normalization (cond first, then tgt)
+            # Build c2w trajectories with axis normalization (cond first, then tgt)
             multiview_c2ws = []
             cam_idx = list(range(81))[::4]
             for view_idx in [cond_cam_idx, tgt_cam_idx]:
@@ -452,7 +458,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                 for c2w in traj:
                     c2w = c2w[:, [1, 2, 0, 3]]
                     c2w[:3, 1] *= -1.
-                    c2w[:3, 3] /= 100
+                    # Removed fixed /100 scaling; scale will be determined by baseline normalization
                     c2ws.append(c2w)
                 multiview_c2ws.append(c2ws)
             # Reference is cond[0]
@@ -486,15 +492,20 @@ class ValidationDataset(torch.utils.data.Dataset):
             cond_rel_c2w = compute_relative_c2w(cond_cam_params)
             tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
 
-            # 2) Normalize translations across both trajectories using max norm
-            all_rel_c2w = np.concatenate([tgt_rel_c2w, cond_rel_c2w], axis=0)
-            translations = all_rel_c2w[:, :3, 3]
-            norms = np.linalg.norm(translations, axis=1)
-            max_norm = np.max(norms) if norms.size > 0 else 1.0
-            if max_norm < 1e-8:
-                max_norm = 1.0
-            tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / max_norm
-            cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / max_norm
+            # 2) Baseline normalization using cond last frame as baseline; fallback to median of cond distances
+            eps = 1e-3
+            baseline = float(np.linalg.norm(cond_rel_c2w[-1][:3, 3], ord=2))
+            if not np.isfinite(baseline):
+                baseline = 0.0
+            if baseline <= eps:
+                cond_dists = np.linalg.norm(cond_rel_c2w[:, :3, 3], axis=1)
+                valid = cond_dists > eps
+                if np.any(valid):
+                    baseline = float(np.median(cond_dists[valid]))
+                else:
+                    baseline = 1.0
+            cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / baseline
+            tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / baseline
 
             # 3) Invert to obtain relative w2c
             tgt_w2c_rel = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
@@ -502,7 +513,7 @@ class ValidationDataset(torch.utils.data.Dataset):
 
             # Concatenate tgt first then cond to align with latents order
             all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
-            camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
+            camera_tensor = torch.from_numpy(all_w2c).to(torch.float32)
             data['camera'] = camera_tensor
             data['intrinsics'] = self._get_intrinsics_tensor(tgt_path, repeat=camera_tensor.shape[0])
             

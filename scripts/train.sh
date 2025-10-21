@@ -15,6 +15,7 @@ usage() {
     echo "  -R, --wan21-resume-checkpoint PATH Wan2.1 resume checkpoint path (optional; used only when provided and ckpt_type=wan21)"
     echo "  -w, --wandb-name WANDB_NAME        Wandb experiment name (default: Exp07c)"
     echo "  -s, --dataset-path DATASET_PATH    Dataset path (default: /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train)"
+    echo "  -u, --select-random-latents        Randomly select frames per half (keep first/last, randomize the rest with global seed). Default: disabled"
     echo "  -m, --metadata-path METADATA_PATH  Metadata file path (default: ./metadata/metadata_all.csv)"
     echo "  -g, --global-seed SEED             Global seed (default: 42)"
     echo "  -t, --t-highfreq-ratio RATIO      Temporal low-frequency masking ratio for self-attn (default: 0.0)"
@@ -45,6 +46,7 @@ BATCH_SIZE="1"
 DATALOADER_DEFAULT=36
 USE_REAL_TEMPORAL_INDICES="false"
 USE_PHYSICAL_INDEX="false"
+SELECT_RANDOM_LATENTS="false"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -58,7 +60,6 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -c?*)
-            # support forms like -c7 or -c0,7
             CUDA_VISIBLE_DEVICES="${1#-c}"
             shift
             ;;
@@ -158,6 +159,14 @@ while [[ $# -gt 0 ]]; do
             USE_PHYSICAL_INDEX="${1#*=}"
             shift
             ;;
+        -u|--select-random-latents)
+            SELECT_RANDOM_LATENTS="true"
+            shift
+            ;;
+        --select-random-latents=*)
+            SELECT_RANDOM_LATENTS="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -240,6 +249,7 @@ cat <<CONFIG_EOF
   "frame_downsample_to": $FRAME_DOWNSAMPLE_TO,
   "use_real_temporal_indices": $USE_REAL_TEMPORAL_INDICES,
   "use_physical_index": $USE_PHYSICAL_INDEX,
+  "select_random_latents": $SELECT_RANDOM_LATENTS,
   "effective_dataloader_workers": $EFFECTIVE_DATALOADER_WORKERS
 }
 CONFIG_EOF
@@ -282,4 +292,5 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
  $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
  $([ "$USE_PHYSICAL_INDEX" = "true" ] && echo "--use_physical_index") \
+ $([ "$SELECT_RANDOM_LATENTS" = "true" ] && echo "--select_random_latents") \
  $DEBUG_FLAG \

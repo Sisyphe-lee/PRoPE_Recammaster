@@ -66,6 +66,7 @@ class LightningModelForTrain(pl.LightningModule):
         frame_downsample_to=0,
         use_real_temporal_indices=False,
         use_physical_index=False,
+        select_random_latents=False,
     ): 
         super().__init__()
         self.latent_path = latent_path
@@ -78,6 +79,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.frame_downsample_to = frame_downsample_to
         self.use_real_temporal_indices = use_real_temporal_indices
         self.use_physical_index = use_physical_index
+        self.select_random_latents = select_random_latents
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -305,7 +307,29 @@ class LightningModelForTrain(pl.LightningModule):
             F_total = latents.shape[2]
             halves = 2
             per_half = F_total // halves
-            base = torch.linspace(0, per_half - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            if self.select_random_latents:
+                # Deterministic random based on global seed and step
+                gen = torch.Generator(device='cpu').manual_seed(self.global_seed + int(self.global_step))
+                if self.frame_downsample_to <= 1:
+                    base = torch.tensor([0], device=self.device, dtype=torch.long)
+                elif self.frame_downsample_to == 2:
+                    base = torch.tensor([0, per_half - 1], device=self.device, dtype=torch.long)
+                else:
+                    remain = self.frame_downsample_to - 2
+                    # candidates from 1 .. per_half-2
+                    if per_half <= 2:
+                        # degenerate: fallback to linspace
+                        base = torch.linspace(0, per_half - 1, steps=min(self.frame_downsample_to, per_half), dtype=torch.float32).round().long().to(self.device)
+                    else:
+                        candidates = torch.arange(1, max(1, per_half - 1), dtype=torch.long)
+                        # shuffle deterministically
+                        rand_idx = torch.randperm(candidates.numel(), generator=gen)
+                        picked = candidates[rand_idx[:min(remain, candidates.numel())]]
+                        base = torch.sort(torch.cat([torch.tensor([0, per_half - 1], dtype=torch.long), picked]))[0].to(self.device)
+                # ensure unique and sorted
+                base = torch.unique(base, sorted=True)
+            else:
+                base = torch.linspace(0, per_half - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
             index_full = torch.cat([base, base + per_half], dim=0)
             # apply to latents (B, C, F, H, W)
             latents = latents.index_select(2, index_full)
@@ -369,7 +393,10 @@ class LightningModelForTrain(pl.LightningModule):
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
         if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0 and self.frame_downsample_to < tgt_latent_len:
-            base_indices = torch.linspace(0, tgt_latent_len - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            if self.select_random_latents:
+                base_indices = torch.arange(tgt_latent_len, device=self.device, dtype=torch.long)
+            else:
+                base_indices = torch.linspace(0, tgt_latent_len - 1, steps=self.frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
             tgt_sel = training_target[:, :, base_indices, ...]
             pred_sel = noise_pred[:, :, :base_indices.numel(), ...]
             loss = torch.nn.functional.mse_loss(pred_sel.float(), tgt_sel.float())
@@ -411,7 +438,24 @@ class LightningModelForTrain(pl.LightningModule):
         F_total = latents.shape[2]
         per_half = F_total // 2
         if isinstance(frame_downsample_to, int) and frame_downsample_to > 0:
-            base = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
+            if getattr(self, 'select_random_latents', False):
+                gen = torch.Generator(device='cpu').manual_seed(self.global_seed + int(self.global_step) + int(batch_idx))
+                if frame_downsample_to <= 1:
+                    base = torch.tensor([0], device=self.device, dtype=torch.long)
+                elif frame_downsample_to == 2:
+                    base = torch.tensor([0, per_half - 1], device=self.device, dtype=torch.long)
+                else:
+                    remain = frame_downsample_to - 2
+                    if per_half <= 2:
+                        base = torch.linspace(0, per_half - 1, steps=min(frame_downsample_to, per_half), dtype=torch.float32).round().long().to(self.device)
+                    else:
+                        candidates = torch.arange(1, max(1, per_half - 1), dtype=torch.long)
+                        rand_idx = torch.randperm(candidates.numel(), generator=gen)
+                        picked = candidates[rand_idx[:min(remain, candidates.numel())]]
+                        base = torch.sort(torch.cat([torch.tensor([0, per_half - 1], dtype=torch.long), picked]))[0].to(self.device)
+                base = torch.unique(base, sorted=True)
+            else:
+                base = torch.linspace(0, per_half - 1, steps=frame_downsample_to, device=self.device, dtype=torch.float32).round().long()
             index_full = torch.cat([base, base + per_half], dim=0)
             # Apply to latents (B, C, F, H, W)
             latents = latents.index_select(2, index_full)
@@ -1013,6 +1057,12 @@ def parse_args():
         help="Per-half frames to sample (two-halves scheme). Use 0 to disable downsampling (default: 0)"
     )
     parser.add_argument(
+        "-u", "--select_random_latents",
+        action="store_true",
+        default=False,
+        help="When enabled, for each half: keep first and last frames, randomly select the remaining (controlled by global seed). Default: disabled (use evenly-spaced)."
+    )
+    parser.add_argument(
         "--use_real_temporal_indices",
         action="store_true",
         default=False,
@@ -1119,6 +1169,7 @@ def train(args):
         frame_downsample_to=getattr(args, 'frame_downsample_to', 5),
         use_real_temporal_indices=getattr(args, 'use_real_temporal_indices', False),
         use_physical_index=getattr(args, 'use_physical_index', False),
+        select_random_latents=getattr(args, 'select_random_latents', False),
     )
     
     # Set test dataset for automatic test_step execution
