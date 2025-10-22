@@ -495,8 +495,6 @@ if __name__ == '__main__':
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
-            if cam_type_id < 5:
-                continue
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
