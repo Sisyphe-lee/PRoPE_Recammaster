@@ -300,6 +300,9 @@ class LightningModelForTrain(pl.LightningModule):
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
+        original_cam_t = batch.get("original_camera_translation")
+        if original_cam_t is not None:
+            original_cam_t = original_cam_t.to(self.device)
 
         # Optional external frame downsampling (two-halves: take base then base+per_half)
         temporal_indices = None
@@ -338,16 +341,15 @@ class LightningModelForTrain(pl.LightningModule):
                 cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
             if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
                 cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
+            # sync original_cam_t (F_total, 3)
+            if original_cam_t is not None and original_cam_t.dim() == 2:
+                original_cam_t = original_cam_t.index_select(0, index_full.to(original_cam_t.device))
             
-            # 只有在开启降采样且启用真实索引时才使用真实时序索引，否则使用连续索引
-            if self.use_real_temporal_indices:
-                temporal_indices = index_full
-            else:
-                # 使用连续索引：从0开始到降采样后的帧数-1
-                temporal_indices = torch.arange(index_full.shape[0], device=self.device, dtype=torch.long)
+            # 记录真实的时序索引
+            temporal_indices = index_full
         
-        # 如果没有降采样，使用连续索引
-        if temporal_indices is None:
+        # 如果启用了真实时序索引但没有降采样，使用连续索引
+        if self.use_real_temporal_indices and temporal_indices is None:
             F_total = latents.shape[2]
             temporal_indices = torch.arange(F_total, device=self.device, dtype=torch.long)
 
@@ -361,8 +363,6 @@ class LightningModelForTrain(pl.LightningModule):
             temporal_indices = torch.cat([half, half], dim=0)
 
         # Loss
-        # print(f"Temporal indices: {temporal_indices}")
-        # exit(0)
         self.pipe.device = self.device
         # Ensure training timesteps are set (validation/test may change it)
         self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
@@ -389,6 +389,7 @@ class LightningModelForTrain(pl.LightningModule):
             frame_downsample_to=self.frame_downsample_to,
             cam_intrinsics=cam_intrinsics,
             temporal_indices=temporal_indices,
+            original_camera_translation=original_cam_t,
         )
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
@@ -428,6 +429,9 @@ class LightningModelForTrain(pl.LightningModule):
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
+        original_cam_t = batch.get("original_camera_translation")
+        if original_cam_t is not None:
+            original_cam_t = original_cam_t.to(self.device)
 
         self.pipe.device = self.device
 
@@ -464,21 +468,10 @@ class LightningModelForTrain(pl.LightningModule):
                 cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
             if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
                 cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
-            
-            # 只有在开启降采样且启用真实索引时才使用真实时序索引，否则使用连续索引
-            if self.use_real_temporal_indices:
-                temporal_indices = index_full
-            else:
-                # 使用连续索引：从0开始到降采样后的帧数-1
-                temporal_indices = torch.arange(index_full.shape[0], device=self.device, dtype=torch.long)
-        # 如果没有降采样，使用连续索引
-        if temporal_indices is None:
-            F_total = latents.shape[2]
-            temporal_indices = torch.arange(F_total, device=self.device, dtype=torch.long)
-
+            # Record real indices
+            temporal_indices = index_full
         # 物理索引：将前半段索引复制到后半段，使两半不共享时间戳
         if getattr(self, 'use_physical_index', False):
-            per_half = latents.shape[2] // 2
             if temporal_indices is None:
                 half = torch.arange(per_half, device=self.device, dtype=torch.long)
             else:

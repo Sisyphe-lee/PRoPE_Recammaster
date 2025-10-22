@@ -1,4 +1,28 @@
 # Change Log
+## v0.2.10 @yyb - 2025-10-22
+
+### 新增
+- 距离感知 RoPE（实验性）：在 3D RoPE 中将 `t_highfreq_ratio` 复用为“w 维低频段比例”，对指定头的 w 维低频复用相位屏蔽，便于与相机平移幅度耦合（distance-aware masking）。
+  - `diffsynth/models/wan_video_dit.py`: `rope_apply` 支持在 w 段低频范围内屏蔽选定 head 的复数对；`DiTBlock.forward`/`PRoPE_SelfAttention.forward` 透传 `original_camera_translation`。
+  - `src/prope.py`: `_prepare_apply_fns` 对齐 3D RoPE 的 [t, h, w] 复杂频段划分，新增 w 维低频选择逻辑；支持接收 `original_trans`。
+- 数据通路：数据集返回原始相机平移轨迹（未归一化）以便 RoPE 使用。
+  - `src/dataset.py`: 在计算相对位姿后，保存 `original_camera_translation = concat(tgt_t, cond_t)` 并注入到 `data` 中。
+- 实验脚本：新增 `exp_by_day/10.22/exp09b:new_dist_rope.sh` 记录基于距离感知 RoPE 的实验。
+
+### 变更
+- 相机平移归一化策略：由“基线归一化（baseline）”调整为“最大范数归一化（max-norm, cond+tgt 联合）”。
+  - 在 cond 与 tgt 的相对 c2w 轨迹上，采用两者所有帧的平移 L2 范数最大值进行统一缩放；当最大值 < 1e-2 时不归一化。
+  - 移除数据管线内散落的临时缩放，归一化逻辑集中为 `normalize_translation`。
+- 位姿工具下沉：将 `invert_SE3_np`、`compute_relative_c2w`、`normalize_translation(_baseline)` 抽出至模块级函数，减少重复计算与提升可读性。
+- API 透传：`PRoPE_SelfAttention.forward` 与 `DiTBlock.forward` 新增 `**kwargs`/`original_camera_translation` 透传，避免未来接口膨胀。
+
+### 修复
+- 统一 `freqs.to(device=x.device)` 与 dtype 对齐，避免复杂数运算中的 device/dtype 不一致。
+
+### 兼容性
+- 归一化策略变化会影响训练/验证中相机尺度，非 API 破坏性但数值分布与旧结果不可完全对齐；建议在同策略下做对比。
+
+---
 ## v0.2.9 @lcy - 2025-10-22
 
 ### 新增
@@ -8,12 +32,12 @@
   - 训练：当启用时，每半段保留首/尾帧，其余位置在可选集合内按全局种子和 step/batch 构造的确定性随机顺序选择，保证可复现。
 
 ### 变更
-- 相机归一化策略：由“最大范数归一化（max-norm）”改为“基线归一化（baseline）”。
+- 相机归一化策略：由“最大范数归一化（max-norm）”改为“基线归一化（baseline）”，仍然保留以前的函数。
   - 以 cond 轨迹的最后一帧相对平移范数作为基线；若无效则回退到 cond 平移范数的中位数；再退化到 1.0。
   - 去除历史的固定 `/100` 平移缩放，改由基线统一控制尺度。
 - 数值稳定性：相机内参与相机张量类型统一为 float32。
   - `src/dataset.py` 的 `intrinsics` 与 `camera(w2c)` 从 bfloat16 改为 float32，训练/验证一致。
-- 路径解析鲁棒性：数据集路径分割从 `re.split(r"", path)` 改为 `re.split(r"+", path)`，兼容重复分隔符。
+- 路径解析鲁棒性：数据集路径分割从 `re.split(r",", path)` 改为 `re.split(r"/+", path)`，兼容重复分隔符。
 - 文案：相关注释与帮助信息同步更新（如“轴向归一化，去固定缩放”等）。
 
 ### 修复

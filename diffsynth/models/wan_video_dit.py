@@ -181,10 +181,10 @@ def rope_apply_(x, freqs, num_heads):
     return x_out.to(x.dtype)
 
 def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_highfreq_ratio: float = 0.0):
-    # TODO donot calc mask online
+    # NOTE: We repurpose t_highfreq_ratio to mask w-dim low-frequency complex bins instead of t-dim.
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     # Ensure freqs has the same dtype as x for complex operations
-    freqs = freqs.to( device=x.device)
+    freqs = freqs.to(device=x.device)
     x_out = torch.view_as_complex(x.to(torch.float32).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
 
@@ -192,22 +192,32 @@ def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_
         # Build per-head complex-frequency coefficients so we can mask specific heads
         # freqs shape: (seqlen, 1, Lc)
         seqlen, _, Lc = freqs.shape
-        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction)) 
-        # Assume 3D split order [t, h, w] across complex bins
+        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction))
+        # 3D split order [t, h, w] across complex bins
         tLc = Lc - 2 * (Lc // 3)
-        t_start = 0
-        t_end = t_start + tLc
+        hLc = (Lc // 3)
+        wLc = (Lc // 3)
+        
+        # t segment low-frequency at the end of t segment
         t_lo = max(1, int(tLc * t_highfreq_ratio + 1e-6))
-        t_lo = max(0, (t_lo // 2) * 2)
-        # Lowest frequencies are at the end of the t segment (from back to front)
-        t_lo_start = max(t_start, t_end - t_lo)
-        t_lo_end = t_end
-        # Create head-aware freqs tensor aligned as (1, seqlen, num_heads, Lc) to avoid s x s broadcast
+        t_lo = max(0, (t_lo // 2) * 2)  # keep even pairs
+        t_lo_start = max(0, tLc - t_lo)
+        t_lo_end = tLc
+        
+        # w segment in complex bins: [tLc + hLc, tLc + hLc + wLc)
+        w_start = tLc + hLc
+        w_end = tLc + hLc + wLc
+        # Low-frequency portion at the end of w segment
+        w_lo = max(1, int(wLc * t_highfreq_ratio + 1e-6))
+        w_lo = max(0, (w_lo // 2) * 2)  # keep even pairs
+        w_lo_start = max(w_start, w_end - w_lo)
+        w_lo_end = w_end
+        # Create head-aware freqs tensor aligned as (1, seqlen, num_heads, Lc)
         freqs_heads = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc).clone()
-        # Mask rotation for selected heads on t-lowfreq complex bins by setting multiplier to 1+0j
-        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device) # band 12-22 -> channel 22-44
+        # Mask rotation for selected heads on t-lowfreq and w-lowfreq complex bins by setting multiplier to 1+0j
+        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device)
         freqs_heads[:, :, :heads_to_mask, t_lo_start:t_lo_end] = one_c
-        # Broadcast to x_out shape (b, s, n, Lc)
+        freqs_heads[:, :, :heads_to_mask, w_lo_start:w_lo_end] = one_c
         freqs_effective = freqs_heads
     else:
         # Broadcast original freqs across heads aligned as (1, s, n, Lc)
@@ -285,7 +295,7 @@ class  PRoPE_SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.5):
+    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.5, **kwargs):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
@@ -320,6 +330,7 @@ class  PRoPE_SelfAttention(nn.Module):
             num_heads=self.num_heads,
             head_fraction=mask_first_head_fraction,
             t_highfreq_ratio=t_highfreq_ratio,
+            original_trans=kwargs.get("original_camera_translation", None),
         )
         
         # Apply PRoPE transforms
@@ -440,9 +451,17 @@ class DiTBlock(nn.Module):
 
         try:
             if self.enable_cam_layers:
-                x = x + gate_msa * self.projector(self.self_attn(input_x, freqs, cam_emb, Ks, t_highfreq_ratio=t_highfreq_ratio))
+                x = x + gate_msa * self.projector(self.self_attn(
+                    input_x, freqs, cam_emb, Ks,
+                    t_highfreq_ratio=t_highfreq_ratio,
+                    original_camera_translation=_kwargs.get("original_camera_translation", None),
+                ))
             else:
-                x = x + gate_msa * self.self_attn(input_x, freqs, cam_emb, Ks, t_highfreq_ratio=t_highfreq_ratio)
+                x = x + gate_msa * self.self_attn(
+                    input_x, freqs, cam_emb, Ks,
+                    t_highfreq_ratio=t_highfreq_ratio,
+                    original_camera_translation=_kwargs.get("original_camera_translation", None),
+                )
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 raise RuntimeError(f"[OOM][submodule=self_attn] {e}") from e

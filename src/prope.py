@@ -246,7 +246,8 @@ def _prepare_apply_fns(
     *,
     num_heads: Optional[int] = None,
     head_fraction: float = 0.0,  # e.g., 0.25 means first quarter heads
-    t_highfreq_ratio: float = 0.0,  # e.g., 0.2 means last 20% of t block
+    t_highfreq_ratio: float = 0.0,  # reused as w-lowfreq ratio for distance RoPE
+    original_trans: Optional[torch.Tensor] = None,  # (batch, cameras, 3)
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
@@ -292,50 +293,161 @@ def _prepare_apply_fns(
 
     # Configure subset selection
     assert head_dim % 4 == 0
-    # Align t-feature block with 3D RoPE's t bins in real space: size = 2 * tLc
-    # where Lc = head_dim // 2, tLc = Lc - 2 * (Lc // 3)
+    # Align 3D RoPE blocks: total complex bins Lc = head_dim//2; split [t,h,w] in complex bins
     Lc = head_dim // 2
     tLc = Lc - 2 * (Lc // 3)
+    hLc = (Lc // 3)
+    wLc = (Lc // 3)
+    # Real-channel index helpers
+    def complex_to_real_span(start_bin: int, end_bin: int) -> Tuple[int, int]:
+        # map complex-bin range [start_bin, end_bin) to real-channel [2*start, 2*end)
+        return 2 * start_bin, 2 * end_bin
+
+    # PRoPE projection still uses t low-frequency tail selected by t_highfreq_ratio
     t_block_start = 0
     t_block_end = 2 * tLc
     if t_highfreq_ratio > 0:
-        t_lo_len = int((t_block_end - t_block_start) * t_highfreq_ratio)
-        # ensure multiple of 4 for 4x4 projection blocks
-        t_lo_len = max(0, (t_lo_len // 4) * 4)
+        t_lo_len_bins = int((t_block_end - t_block_start) * t_highfreq_ratio) // 2  # convert to complex bins
+        t_lo_len_bins = max(0, (t_lo_len_bins // 2) * 2)  # ensure multiple of 2 bins => 4 real channels
     else:
-        t_lo_len = 0
-    # Lowest frequencies are at the end of t block (from back to front)
-    t_lo_start = max(t_block_start, t_block_end - t_lo_len)
-    t_lo_end = t_block_end
+        t_lo_len_bins = 0
+    t_lo_start_bin = max(t_block_start // 2, (t_block_end // 2) - t_lo_len_bins)
+    t_lo_end_bin = t_block_end // 2
+    t_real_start, t_real_end = complex_to_real_span(t_lo_start_bin, t_lo_end_bin)
+
+    # Distance RoPE uses w-dim low-frequency tail with the same ratio
+    w_start_bin = tLc + hLc
+    w_end_bin = tLc + hLc + wLc
+    if t_highfreq_ratio > 0:
+        w_lo_len_bins = int(wLc * t_highfreq_ratio)
+        w_lo_len_bins = max(0, (w_lo_len_bins // 2) * 2)  # even number of pairs
+    else:
+        w_lo_len_bins = 0
+    w_lo_start_bin = max(w_start_bin, w_end_bin - w_lo_len_bins)
+    w_lo_end_bin = w_end_bin
+    w_real_start, w_real_end = complex_to_real_span(w_lo_start_bin, w_lo_end_bin)
+    num_pairs_w = (w_real_end - w_real_start) // 2
 
     if num_heads is None or head_fraction <= 0:
         head_indices = None  # no-op
     else:
         head_indices = torch.arange(max(1, int(num_heads * head_fraction)), device=device)
 
+    # Fixed 16 unit vectors covering axes, plane diagonals, and space diagonals
+    U_const = torch.tensor([
+        [ 1.0,  0.0,  0.0],
+        [-1.0,  0.0,  0.0],
+        [ 0.0,  1.0,  0.0],
+        [ 0.0, -1.0,  0.0],
+        [ 0.0,  0.0,  1.0],
+        [ 0.0,  0.0, -1.0],
+        [ 0.70710678,  0.70710678,  0.0],
+        [ 0.70710678, -0.70710678,  0.0],
+        [ 0.70710678,  0.0,  0.70710678],
+        [ 0.70710678,  0.0, -0.70710678],
+        [ 0.0,  0.70710678,  0.70710678],
+        [ 0.0,  0.70710678, -0.70710678],
+        [ 0.57735027,  0.57735027,  0.57735027],
+        [ 0.57735027,  0.57735027, -0.57735027],
+        [ 0.57735027, -0.57735027,  0.57735027],
+        [-0.57735027,  0.57735027,  0.57735027],
+    ], dtype=torch.float32, device=device)
+
     def _apply_proj_subset(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
         """
         Apply projection matrix to a subset of heads and the low-frequency tail of the t-channel block.
         """
-        # feats: (batch, num_heads, seqlen, head_dim)
-        if t_lo_len == 0 or head_indices is None:
+        if t_lo_len_bins == 0 or head_indices is None:
             return feats
-        (batch, nheads, seqlen, feat_dim) = feats.shape
-        assert feat_dim == head_dim
-        # Slice the subset to transform
-
-        if feats[:, head_indices, :, t_lo_start:t_lo_end].shape[-1] == 0:
+        (B, H, S, D) = feats.shape
+        if (t_real_end - t_real_start) == 0:
             return feats
-        assert feats[:, head_indices, :, t_lo_start:t_lo_end].shape[-1] % 4 == 0
-        # Apply tiled projection
-        # Write back
-        # feats = feats.clone()
-        feats[:, head_indices, :, t_lo_start:t_lo_end] = _apply_tiled_projmat(feats[:, head_indices, :, t_lo_start:t_lo_end], matrix)
+        assert ((t_real_end - t_real_start) % 4) == 0
+        feats[:, head_indices, :, t_real_start:t_real_end] = _apply_tiled_projmat(
+            feats[:, head_indices, :, t_real_start:t_real_end], matrix
+        )
         return feats
 
-    apply_fn_q = partial(_apply_proj_subset, matrix=P_T)
-    apply_fn_kv = partial(_apply_proj_subset, matrix=P_inv)
-    apply_fn_o = partial(_apply_proj_subset, matrix=P)
+    def _apply_distance_rope(feats: torch.Tensor) -> torch.Tensor:
+        """Apply distance-based rotary on w-dim low-frequency real channels (2-ch pairs).
+        feats: (B,H,S,D)
+        """
+        if num_pairs_w == 0 or head_indices is None:
+            return feats
+        (B, H, S, D) = feats.shape
+        if (w_real_end - w_real_start) == 0:
+            return feats
+        # Determine cameras and patches
+        # Camera translations (original scale preferred), shape (B,C,3)
+        if original_trans is not None:
+            p = original_trans.to(device=device, dtype=feats.dtype)
+        else:
+            # use c2w translation from P_inv
+            p = P_inv[..., :3, 3].to(dtype=feats.dtype)
+        # fixed scaling by 1/100 
+        p = p / 100.0
+        # Align provided translations to cameras dimension from viewmats
+        # Ensure p shape is (B, cameras, 3)
+        if p.dim() == 2:
+            p = p.unsqueeze(0)
+        if p.shape[1] != cameras:
+            if p.shape[1] > cameras:
+                p = p[:, :cameras, :]
+            else:
+                raise RuntimeError(f"original_trans cams ({p.shape[1]}) != viewmats cams ({cameras})")
+        C = cameras
+        assert S % C == 0, f"S={S} not divisible by C={C}"
+        P = S // C
+        # Determine number of rotation pairs from span length to avoid mismatch
+        Kpairs = max(0, (w_real_end - w_real_start) // 2)
+        if Kpairs == 0:
+            return feats
+        # Prepare frequency magnitudes s_k with base=10000 for Kpairs
+        k_idx = torch.arange(Kpairs, device=device, dtype=torch.float32)
+        # s_k = 10000^(-k/Kpairs)
+        s_k = torch.pow(torch.tensor(10000.0, device=device, dtype=torch.float32), -k_idx / float(Kpairs))
+        s_k = s_k.to(feats.dtype)
+        # omega_k = s_k * u_k
+        U = U_const[:Kpairs, :].to(dtype=feats.dtype)
+        omega = U * s_k.reshape(-1, 1)
+        # theta[b,c,k] = dot(p[b,c], omega[k])
+        theta = torch.einsum('bcj,kj->bck', p, omega)  # (B,C,Kpairs)
+        cos_t = torch.cos(theta).unsqueeze(-1)  # (B,C,Kpairs,1)
+        sin_t = torch.sin(theta).unsqueeze(-1)  # (B,C,Kpairs,1)
+        # Reshape feats to (B,H,C,P,D)
+        x = feats.reshape(B, H, C, P, D)
+        sel = x[:, head_indices, :, :, w_real_start:w_real_end]
+        # Pairwise rotation along last dim (size = 2*Kpairs)
+        x1 = sel[..., 0::2]
+        x2 = sel[..., 1::2]
+        # Broadcast theta over heads and patches
+        cos_b = cos_t.reshape(B, 1, C, 1, Kpairs, 1)
+        sin_b = sin_t.reshape(B, 1, C, 1, Kpairs, 1)
+        x1r = x1.reshape(B, -1, C, P, Kpairs, 1)
+        x2r = x2.reshape(B, -1, C, P, Kpairs, 1)
+        rot1 = x1r * cos_b - x2r * sin_b
+        rot2 = x1r * sin_b + x2r * cos_b
+        sel_rot = torch.empty_like(sel)
+        sel_rot[..., 0::2] = rot1.reshape_as(x1)
+        sel_rot[..., 1::2] = rot2.reshape_as(x2)
+        x[:, head_indices, :, :, w_real_start:w_real_end] = sel_rot
+        return x.reshape(B, H, S, D)
+
+    def apply_fn_q(feats: torch.Tensor) -> torch.Tensor:
+        feats = _apply_distance_rope(feats)
+        feats = _apply_proj_subset(feats, P_T)
+        return feats
+
+    def apply_fn_kv(feats: torch.Tensor) -> torch.Tensor:
+        feats = _apply_distance_rope(feats)
+        feats = _apply_proj_subset(feats, P_inv)
+        return feats
+
+    def apply_fn_o(feats: torch.Tensor) -> torch.Tensor:
+        feats = _apply_distance_rope(feats)
+        feats = _apply_proj_subset(feats, P)
+        return feats
+
     return apply_fn_q, apply_fn_kv, apply_fn_o
    # relative projection matrix RP = torch.einsum('amn,bnk->abmk', P_T[0], P_inv[0].transpose(2,1)).shape
    # RP[i,j] = RT 

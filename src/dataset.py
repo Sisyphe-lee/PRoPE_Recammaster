@@ -90,6 +90,99 @@ class Camera(object):
         self.w2c_mat = np.linalg.inv(c2w_mat)
 
 
+# ------------------
+# Pose utilities (moved outside __getitem__)
+# ------------------
+
+def invert_SE3_np(T: np.ndarray) -> np.ndarray:
+    """Invert a 4x4 SE(3) matrix (numpy, float32 output)."""
+    T = T.astype(np.float64)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Rinv = R.T
+    tinv = -Rinv @ t
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = Rinv
+    out[:3, 3] = tinv
+    return out.astype(np.float32)
+
+
+def compute_relative_c2w(cam_params, ref_cam: Camera, get_relative_pose_fn) -> np.ndarray:
+    """
+    Compute relative c2w poses (cam_i <- ref) for a list of cameras.
+    - ref_cam: reference Camera (e.g., cond[0])
+    - get_relative_pose_fn: function that accepts [ref_cam, cam_i] and returns an array
+      whose second element [1] is cam_ref<-cam_i (relative pose in w2c form composed with ref).
+    Returns: [N, 4, 4] numpy array of relative c2w.
+    """
+    rel_c2w_list = []
+    for i in range(len(cam_params)):
+        relative_pose_matrix = get_relative_pose_fn([ref_cam, cam_params[i]])  # [I, cam_ref<-cam_i]
+        cam_ref_from_cami = relative_pose_matrix[1]
+        cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
+        rel_c2w_list.append(cami_from_ref)
+    return np.stack(rel_c2w_list, axis=0)
+
+
+def normalize_translation_baseline(cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-3):
+    """
+    Normalize only the translation components of relative c2w trajectories using a shared baseline.
+    Baseline strategy:
+      1) Use L2 norm of cond last frame translation relative to ref.
+      2) If invalid or too small, use median of cond translation norms across frames.
+      3) If still invalid, fall back to 1.0.
+    Operates on copies and returns (cond_rel_c2w_norm, tgt_rel_c2w_norm, baseline).
+    """
+    cond_rel = cond_rel_c2w.copy()
+    tgt_rel = tgt_rel_c2w.copy()
+
+    baseline = float(np.linalg.norm(cond_rel[-1][:3, 3], ord=2))
+    if not np.isfinite(baseline):
+        baseline = 0.0
+    if baseline <= eps:
+        cond_dists = np.linalg.norm(cond_rel[:, :3, 3], axis=1)
+        valid = cond_dists > eps
+        if np.any(valid):
+            baseline = float(np.median(cond_dists[valid]))
+        else:
+            baseline = 1.0
+
+    cond_rel[:, :3, 3] = cond_rel[:, :3, 3] / baseline
+    tgt_rel[:, :3, 3] = tgt_rel[:, :3, 3] / baseline
+    return cond_rel, tgt_rel, baseline
+
+
+def normalize_translation(cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-2):
+    """
+    Normalize translations by the maximum L2 norm across BOTH cond and tgt relative trajectories.
+    - Compute max_norm = max(||t_i||) over all frames i from both cond_rel_c2w and tgt_rel_c2w.
+    - If max_norm < eps (default 0.01), do NOT normalize and return copies unchanged.
+    - Otherwise divide both translations by max_norm.
+
+    Returns: (cond_rel_norm, tgt_rel_norm, max_norm)
+    Interface matches normalize_translation_baseline for easy drop-in replacement.
+    """
+    cond_rel = cond_rel_c2w.copy()
+    tgt_rel = tgt_rel_c2w.copy()
+
+    # Collect translation norms
+    cond_norms = np.linalg.norm(cond_rel[:, :3, 3], axis=1)
+    tgt_norms = np.linalg.norm(tgt_rel[:, :3, 3], axis=1)
+
+    max_norm = float(np.max([np.max(cond_norms) if cond_norms.size > 0 else 0.0,
+                              np.max(tgt_norms) if tgt_norms.size > 0 else 0.0]))
+    if not np.isfinite(max_norm):
+        max_norm = 0.0
+
+    if max_norm < eps:
+        # No normalization
+        return cond_rel, tgt_rel, max_norm
+
+    cond_rel[:, :3, 3] = cond_rel[:, :3, 3] / max_norm
+    tgt_rel[:, :3, 3] = tgt_rel[:, :3, 3] / max_norm
+    return cond_rel, tgt_rel, max_norm
+
+
 class TensorDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -216,53 +309,18 @@ class TensorDataset(torch.utils.data.Dataset):
                 # Reference is cond[0] in world coordinates
                 ref_cam = cond_cam_params[0]
 
-                def invert_SE3_np(T):
-                    """Invert a 4x4 SE(3) matrix."""
-                    T = T.astype(np.float64)
-                    R = T[:3, :3]
-                    t = T[:3, 3]
-                    Rinv = R.T
-                    tinv = -Rinv @ t
-                    out = np.eye(4, dtype=np.float64)
-                    out[:3, :3] = Rinv
-                    out[:3, 3] = tinv
-                    return out.astype(np.float32)
-
-                def compute_relative_c2w(cam_params):
-                    """
-                    Compute relative c2w poses (cam_i <- ref) for a list of cameras
-                    using ref_cam = cond[0]. We first compute cam_ref<-cam_i via
-                    get_relative_pose, then invert to get cam_i<-ref (c2w relative).
-                    Returns an array of shape [N, 4, 4].
-                    """
-                    rel_c2w_list = []
-                    for i in range(len(cam_params)):
-                        # get_relative_pose returns [I, cam_ref<-cam_i]
-                        relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])
-                        cam_ref_from_cami = relative_pose_matrix[1]
-                        cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
-                        rel_c2w_list.append(cami_from_ref)
-                    return np.stack(rel_c2w_list, axis=0)
-
                 # 1) Compute relative c2w for both trajectories
-                cond_rel_c2w = compute_relative_c2w(cond_cam_params)
-                tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
+                cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
+                tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
-                # 2) Baseline normalization using cond last frame as baseline; fallback to median of cond distances
-                eps = 1e-3
-                # cond last frame translation norm relative to ref (cond[0])
-                baseline = float(np.linalg.norm(cond_rel_c2w[-1][:3, 3], ord=2))
-                if not np.isfinite(baseline):
-                    baseline = 0.0
-                if baseline <= eps:
-                    cond_dists = np.linalg.norm(cond_rel_c2w[:, :3, 3], axis=1)
-                    valid = cond_dists > eps
-                    if np.any(valid):
-                        baseline = float(np.median(cond_dists[valid]))
-                    else:
-                        baseline = 1.0
-                cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / baseline
-                tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / baseline
+                # Save original (pre-normalization) relative translations (tgt then cond) for distance RoPE
+                orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
+                orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
+                orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0)
+                data['original_camera_translation'] = torch.from_numpy(orig_trans).to(torch.float32)
+
+                # 2) Normalize translation with shared baseline
+                cond_rel_c2w, tgt_rel_c2w, _baseline = normalize_translation(cond_rel_c2w, tgt_rel_c2w)
 
                 # 3) Invert to obtain relative w2c
                 tgt_rel_w2c = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
@@ -466,46 +524,18 @@ class ValidationDataset(torch.utils.data.Dataset):
             tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
             ref_cam = cond_cam_params[0]
 
-            # Stable SE(3) inverse
-            def invert_SE3_np(T):
-                T = T.astype(np.float64)
-                R = T[:3, :3]
-                t = T[:3, 3]
-                Rinv = R.T
-                tinv = -Rinv @ t
-                out = np.eye(4, dtype=np.float64)
-                out[:3, :3] = Rinv
-                out[:3, 3] = tinv
-                return out.astype(np.float32)
-
-            # Compute relative c2w: cam_i <- ref via get_relative_pose then inverse
-            def compute_relative_c2w(cam_params):
-                rel_c2w_list = []
-                for i in range(len(cam_params)):
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])
-                    cam_ref_from_cami = relative_pose_matrix[1]
-                    cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
-                    rel_c2w_list.append(cami_from_ref)
-                return np.stack(rel_c2w_list, axis=0)
-
             # 1) Relative c2w for both trajectories
-            cond_rel_c2w = compute_relative_c2w(cond_cam_params)
-            tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
+            cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
+            tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
-            # 2) Baseline normalization using cond last frame as baseline; fallback to median of cond distances
-            eps = 1e-3
-            baseline = float(np.linalg.norm(cond_rel_c2w[-1][:3, 3], ord=2))
-            if not np.isfinite(baseline):
-                baseline = 0.0
-            if baseline <= eps:
-                cond_dists = np.linalg.norm(cond_rel_c2w[:, :3, 3], axis=1)
-                valid = cond_dists > eps
-                if np.any(valid):
-                    baseline = float(np.median(cond_dists[valid]))
-                else:
-                    baseline = 1.0
-            cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / baseline
-            tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / baseline
+            # Save original (pre-normalization) relative translations (tgt then cond) for distance RoPE
+            orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
+            orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
+            orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0)
+            data['original_camera_translation'] = torch.from_numpy(orig_trans).to(torch.float32)
+
+            # 2) Normalize translation with shared baseline
+            cond_rel_c2w, tgt_rel_c2w, _baseline = normalize_translation(cond_rel_c2w, tgt_rel_c2w)
 
             # 3) Invert to obtain relative w2c
             tgt_w2c_rel = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
