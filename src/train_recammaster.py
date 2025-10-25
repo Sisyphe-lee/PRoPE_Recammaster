@@ -132,7 +132,7 @@ class LightningModelForTrain(pl.LightningModule):
                         self.pipe.dit.load_state_dict(dit_state_dict, strict=False)
                     else:
                         # Direct state dict
-                        self.pipe.dit.load_state_dict(state_dict, strict=False)
+                        self.pipe.dit.load_state_dict(state_dict, strict=True)
                 else:
                     # Load Wan2.1 original model - use safetensors format
                     from safetensors.torch import load_file
@@ -493,7 +493,7 @@ class LightningModelForTrain(pl.LightningModule):
         ).to(dtype=self.pipe.torch_dtype, device=self.device)
 
         # Use multi-step scheduler
-        self.pipe.scheduler.set_timesteps(self.test_inference_steps, denoising_strength=1.0)
+        self.pipe.scheduler.set_timesteps(self.test_inference_steps, shift=self.pipe.scheduler.shift, denoising_strength=1.0)
         latents_gen = noise
         for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
             timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
@@ -1090,7 +1090,7 @@ def train(args):
     if args.debug:
         print("Debug mode is enabled.") 
         import debugpy
-        debugpy.listen(6862)
+        debugpy.listen(5678)
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')

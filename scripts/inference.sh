@@ -1,5 +1,5 @@
 #!/bin/bash
-
+set -x
 # ReCamMaster Inference Script
 # Similar to train.sh but for inference
 
@@ -13,7 +13,7 @@ FRAME_DOWNSAMPLE_TO="${FRAME_DOWNSAMPLE_TO:-5}"
 WAN21_CHECKPOINT_PATH="./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
 # For ReCamMaster fine-tuned model:
 
-WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/10-18-103957_Exp08a/checkpoints/step5608.ckpt"
+WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/10-16-160559_Exp07j/checkpoints/step1100.ckpt"
 # Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
 CHECKPOINT_TYPE="wan21"  # Change to "wan21" if you want to use Wan2.1 model
 
@@ -28,12 +28,13 @@ fi
 
 PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
     "$PYTHON_BIN" src/inference_recammaster.py \
-    --dataset_path "./example_test_data" \
+    --dataset_path "eval_data2" \
     --ckpt_path "$CHECKPOINT_PATH" \
     --ckpt_type "$CHECKPOINT_TYPE" \
     $ENABLE_CAM_LAYERS \
     --output_dir "$OUTPUT_DIR" \
-    --cfg_scale 5.0 \
+    --cfg_scale 1.0 \
     --frame_downsample_to 0 \
     --dataloader_num_workers 1 \
-    --camera_extrinsics_filename "test.json"
+    --camera_extrinsics_filename "camera_extrinsics.json" \
+    # --debug

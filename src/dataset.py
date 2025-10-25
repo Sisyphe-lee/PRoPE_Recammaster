@@ -327,7 +327,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 cond_rel_w2c = np.stack([invert_SE3_np(T) for T in cond_rel_c2w], axis=0)
 
                 # Concatenate tgt first then cond to align with latents
-                all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0)
+                all_w2c = np.concatenate([tgt_rel_w2c, tgt_rel_w2c], axis=0)
                 camera_tensor = torch.from_numpy(all_w2c).to(torch.float32)
                 data['camera'] = camera_tensor
                 data['intrinsics'] = self._get_intrinsics_tensor(path_tgt, repeat=camera_tensor.shape[0])
@@ -542,7 +542,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             cond_w2c_rel = np.stack([invert_SE3_np(T) for T in cond_rel_c2w], axis=0)
 
             # Concatenate tgt first then cond to align with latents order
-            all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
+            all_w2c = np.concatenate([tgt_w2c_rel, tgt_w2c_rel], axis=0)
             camera_tensor = torch.from_numpy(all_w2c).to(torch.float32)
             data['camera'] = camera_tensor
             data['intrinsics'] = self._get_intrinsics_tensor(tgt_path, repeat=camera_tensor.shape[0])

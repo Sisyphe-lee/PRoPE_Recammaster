@@ -270,7 +270,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  --steps_per_epoch 10000   \
  --max_epochs 100   \
  --learning_rate 1e-5   \
- --accumulate_grad_batches  2  \
+ --accumulate_grad_batches  1  \
  --use_gradient_checkpointing  \
  --dataloader_num_workers "$EFFECTIVE_DATALOADER_WORKERS" \
  --batch_size "$EFFECTIVE_BATCH_SIZE" \

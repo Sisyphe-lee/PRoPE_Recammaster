@@ -434,17 +434,17 @@ def _prepare_apply_fns(
         return x.reshape(B, H, S, D)
 
     def apply_fn_q(feats: torch.Tensor) -> torch.Tensor:
-        feats = _apply_distance_rope(feats)
+        # feats = _apply_distance_rope(feats)
         feats = _apply_proj_subset(feats, P_T)
         return feats
 
     def apply_fn_kv(feats: torch.Tensor) -> torch.Tensor:
-        feats = _apply_distance_rope(feats)
+        # feats = _apply_distance_rope(feats)
         feats = _apply_proj_subset(feats, P_inv)
         return feats
 
     def apply_fn_o(feats: torch.Tensor) -> torch.Tensor:
-        feats = _apply_distance_rope(feats)
+        # feats = _apply_distance_rope(feats)
         feats = _apply_proj_subset(feats, P)
         return feats
 

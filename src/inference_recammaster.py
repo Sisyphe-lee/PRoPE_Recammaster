@@ -147,7 +147,7 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
         c2w = c2w.copy()
         c2w = c2w[:, [1, 2, 0, 3]]  # reorder axes
         c2w[:3, 1] *= -1.            # flip Y
-        c2w[:3, 3] /= 100.           # scale translation
+        # c2w[:3, 3] /= 100.           # scale translation
         return c2w
 
     def _to_homogeneous(self, mats: np.ndarray) -> np.ndarray:
@@ -279,15 +279,17 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
                 j = int(matches[0])
             else:
                 j = self._nearest_index(src_inds, t)
-            c2w = src_c2ws[j]
+            c2w = src_c2ws[j].T
             c2w = self._convert_c2w_convention(c2w)
             src_c2ws_sampled.append(c2w)
         src_cam_params = [Camera(c2w) for c2w in src_c2ws_sampled]
         cond_ref_cam = src_cam_params[0]
         cond_rel_c2w = self._compute_relative_c2w(cond_ref_cam, src_cam_params)
+        # cond_rel_c2w[:,:3,:3] = cond_rel_c2w[:,:3,:3]
         # cond_rel_c2w = self._normalize_pairwise_distance(cond_rel_c2w)
 
         camera_list = []
+        original_trans_list = []
         for cam_type in range(1, 11):
             traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type):02d}"]) for idx in cam_idx]
             traj = np.stack(traj).transpose(0, 2, 1)
@@ -297,13 +299,14 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
                 c2ws.append(c2w)
             tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
             tgt_rel_c2w = self._compute_relative_c2w(cond_ref_cam, tgt_cam_params)
-            # tgt_rel_c2w = self._normalize_pairwise_distance(tgt_rel_c2w)
+            # 保存未归一化的相对平移（先 target，再 cond），用于 distance RoPE
+            orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
+            orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
+            orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0).astype(np.float32)
+            original_trans_list.append(torch.from_numpy(orig_trans))
 
-            ## TODO: 放大tgt的translation 5倍
-            # tgt_rel_c2w[:, :3, 3] *= 20.0    
-
+            # 归一化仅用于模型 w2c 的输入，不影响 original translation
             cond_joint, tgt_joint = self._normalize_joint_translation(cond_rel_c2w, tgt_rel_c2w)
-            # tgt_joint[:, :3, 3] *= 5.0
             cond_rel_w2c = self._c2w_to_w2c(cond_joint)
             tgt_rel_w2c = self._c2w_to_w2c(tgt_joint)
             all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0).astype(np.float32)
@@ -311,6 +314,7 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             camera_list.append(pose_embedding)
         
         data['camera'] = camera_list
+        data['original_camera_translation'] = original_trans_list
         return data
     
 
@@ -322,7 +326,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="./example_test_data",
+        required=True,
         help="The path of the Dataset.",
     )
     parser.add_argument(
@@ -351,7 +355,7 @@ def parse_args():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=5.0,
+        default=1.0,
     )
     parser.add_argument(
         "--frame_downsample_to",
@@ -377,11 +381,23 @@ def parse_args():
         default="camera_extrinsics_ori.json",
         help="Filename of the target camera extrinsics JSON under {dataset_path}/cameras/"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+    )
     args = parser.parse_args()
     return args
 
 if __name__ == '__main__':
     args = parse_args()
+
+    if args.debug:
+        print("Debug mode is enabled.") 
+        import debugpy
+        debugpy.listen(5678)
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
+        print('Attached, continue...')
 
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
@@ -404,25 +420,26 @@ if __name__ == '__main__':
             # torch-based checkpoint
             raw = torch.load(args.ckpt_path, map_location="cpu")
             # Unwrap common containers
-            if isinstance(raw, dict) and 'state_dict' in raw:
-                raw = raw['state_dict']
-            if isinstance(raw, dict) and 'module' in raw:
-                raw = raw['module']
-            # Strip common prefixes
-            prefixes = ['model.', 'module.', 'pipe.dit.', 'dit.']
-            state_dict = {}
-            for k, v in raw.items():
-                kk = k
-                for p in prefixes:
-                    if kk.startswith(p):
-                        kk = kk[len(p):]
-                        break
-                # Filter out any camera-layer weights accidentally present
-                if '.cam_encoder.' in kk or '.projector.' in kk:
-                    continue
-                state_dict[kk] = v
+            if False:
+                if isinstance(raw, dict) and 'state_dict' in raw:
+                    raw = raw['state_dict']
+                if isinstance(raw, dict) and 'module' in raw:
+                    raw = raw['module']
+                # Strip common prefixes
+                prefixes = ['module.', 'pipe.dit.', 'dit.']
+                state_dict = {}
+                for k, v in raw.items():
+                    kk = k
+                    for p in prefixes:
+                        if kk.startswith(p):
+                            kk = kk[len(p):]
+                            break
+                    # Filter out any camera-layer weights accidentally present
+                    if '.cam_encoder.' in kk or '.projector.' in kk:
+                        continue
+                    state_dict[kk] = v
         print("Loading Wan2.1 DiT weights...")
-        pipe.dit.load_state_dict(state_dict, strict=True)
+        pipe.dit.load_state_dict(raw, strict=True)
     else:
         state_dict = torch.load(args.ckpt_path, map_location="cpu")
         if 'state_dict' in state_dict:
@@ -495,9 +512,14 @@ if __name__ == '__main__':
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
+            # if cam_type_id < 5:
+            #     continue
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
+            # Select corresponding original relative translations (target then cond), shape (F_total, 3)
+            orig_trans = batch["original_camera_translation"][cam_type_id-1].to(device=pipe.device, dtype=torch.float32)
+            pipe.eval()
             video = pipe(
                 prompt=target_text,
                 negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
@@ -505,8 +527,9 @@ if __name__ == '__main__':
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
                 frame_downsample_to=args.frame_downsample_to,
-                num_inference_steps=50,
-                seed=0, tiled=True
+                num_inference_steps=10,
+                seed=0, tiled=True,
+                # original_camera_translation=orig_trans,
             )
             filename = cam_fname
             save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)

@@ -217,7 +217,7 @@ def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_
         # Mask rotation for selected heads on t-lowfreq and w-lowfreq complex bins by setting multiplier to 1+0j
         one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device)
         freqs_heads[:, :, :heads_to_mask, t_lo_start:t_lo_end] = one_c
-        freqs_heads[:, :, :heads_to_mask, w_lo_start:w_lo_end] = one_c
+        # freqs_heads[:, :, :heads_to_mask, w_lo_start:w_lo_end] = one_c
         freqs_effective = freqs_heads
     else:
         # Broadcast original freqs across heads aligned as (1, s, n, Lc)
