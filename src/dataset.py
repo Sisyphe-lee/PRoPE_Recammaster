@@ -9,7 +9,7 @@ import numpy as np
 import random
 import json
 import pandas as pd
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Callable
 
 
 DEFAULT_IMAGE_WIDTH = 832.0
@@ -88,6 +88,67 @@ class Camera(object):
         c2w_mat = np.array(c2w).reshape(4, 4)
         self.c2w_mat = c2w_mat
         self.w2c_mat = np.linalg.inv(c2w_mat)
+
+
+def invert_SE3_np(T: np.ndarray) -> np.ndarray:
+    """Invert a 4x4 SE(3) matrix (numpy, float32 output).
+    Args:
+        T: [4,4] homogeneous transform.
+    Returns:
+        [4,4] inverse transform.
+    """
+    T = T.astype(np.float64)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Rinv = R.T
+    tinv = -Rinv @ t
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = Rinv
+    out[:3, 3] = tinv
+    return out.astype(np.float32)
+
+
+def compute_relative_c2w(
+    cam_params: list,
+    ref_cam: Camera,
+    get_relative_pose_fn: Callable[[list], np.ndarray],
+) -> np.ndarray:
+    """Compute relative c2w poses (cam_i <- ref) for a list of cameras.
+    We first compute cam_ref<-cam_i via get_relative_pose, then invert to get cam_i<-ref (c2w relative).
+    Args:
+        cam_params: list of Camera
+        ref_cam: reference Camera (e.g., cond[0])
+        get_relative_pose_fn: function that maps [ref_cam, cam_i] -> poses with index 1 being cam_ref<-cam_i
+    Returns:
+        Array [N,4,4] of relative c2w.
+    """
+    rel_c2w_list = []
+    for cam_i in cam_params:
+        relative_pose_matrix = get_relative_pose_fn([ref_cam, cam_i])
+        cam_ref_from_cami = relative_pose_matrix[1]
+        cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
+        rel_c2w_list.append(cami_from_ref)
+    return np.stack(rel_c2w_list, axis=0)
+
+
+def normalize_translations_by_max_norm(a_rel_c2w: np.ndarray, b_rel_c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Normalize the translation components of two pose sequences by their joint max L2 norm.
+    Args:
+        a_rel_c2w: [Na,4,4]
+        b_rel_c2w: [Nb,4,4]
+    Returns:
+        (a_normed, b_normed, max_norm)
+    """
+    a = a_rel_c2w.astype(np.float32).copy()
+    b = b_rel_c2w.astype(np.float32).copy()
+    all_trans = np.concatenate([a[:, :3, 3], b[:, :3, 3]], axis=0)
+    norms = np.linalg.norm(all_trans, axis=1)
+    max_norm = float(np.max(norms)) if norms.size > 0 else 1.0
+    if max_norm < 1e-8:
+        max_norm = 1.0
+    a[:, :3, 3] /= max_norm
+    b[:, :3, 3] /= max_norm
+    return a, b, max_norm
 
 
 class TensorDataset(torch.utils.data.Dataset):
@@ -215,55 +276,19 @@ class TensorDataset(torch.utils.data.Dataset):
                 # Reference is cond[0] in world coordinates
                 ref_cam = cond_cam_params[0]
 
-                def invert_SE3_np(T):
-                    """Invert a 4x4 SE(3) matrix."""
-                    T = T.astype(np.float64)
-                    R = T[:3, :3]
-                    t = T[:3, 3]
-                    Rinv = R.T
-                    tinv = -Rinv @ t
-                    out = np.eye(4, dtype=np.float64)
-                    out[:3, :3] = Rinv
-                    out[:3, 3] = tinv
-                    return out.astype(np.float32)
-
-                def compute_relative_c2w(cam_params):
-                    """
-                    Compute relative c2w poses (cam_i <- ref) for a list of cameras
-                    using ref_cam = cond[0]. We first compute cam_ref<-cam_i via
-                    get_relative_pose, then invert to get cam_i<-ref (c2w relative).
-                    Returns an array of shape [N, 4, 4].
-                    """
-                    rel_c2w_list = []
-                    for i in range(len(cam_params)):
-                        # get_relative_pose returns [I, cam_ref<-cam_i]
-                        relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])
-                        cam_ref_from_cami = relative_pose_matrix[1]
-                        cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
-                        rel_c2w_list.append(cami_from_ref)
-                    return np.stack(rel_c2w_list, axis=0)
-
-                # 1) Compute relative c2w for both trajectories
-                cond_rel_c2w = compute_relative_c2w(cond_cam_params)
-                tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
+                # 1) Compute relative c2w for both trajectories using shared helpers
+                cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
+                tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
                 # 2) Normalize all translations across both trajectories by the max norm
-                all_rel_c2w = np.concatenate([tgt_rel_c2w, cond_rel_c2w], axis=0)
-                translations = all_rel_c2w[:, :3, 3]
-                norms = np.linalg.norm(translations, axis=1)
-                max_norm = np.max(norms) if norms.size > 0 else 1.0
-                if max_norm < 1e-8:
-                    max_norm = 1.0
-                # Apply normalization back to each trajectory
-                tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / max_norm
-                cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / max_norm
+                tgt_rel_c2w, cond_rel_c2w, _ = normalize_translations_by_max_norm(tgt_rel_c2w, tgt_rel_c2w)
 
                 # 3) Invert to obtain relative w2c
                 tgt_rel_w2c = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
                 cond_rel_w2c = np.stack([invert_SE3_np(T) for T in cond_rel_c2w], axis=0)
 
                 # Concatenate tgt first then cond to align with latents
-                all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0)
+                all_w2c = np.concatenate([tgt_rel_w2c, tgt_rel_c2w], axis=0)
                 camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
                 data['camera'] = camera_tensor
                 data['intrinsics'] = self._get_intrinsics_tensor(path_tgt, repeat=camera_tensor.shape[0])
@@ -460,48 +485,19 @@ class ValidationDataset(torch.utils.data.Dataset):
             tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
             ref_cam = cond_cam_params[0]
 
-            # Stable SE(3) inverse
-            def invert_SE3_np(T):
-                T = T.astype(np.float64)
-                R = T[:3, :3]
-                t = T[:3, 3]
-                Rinv = R.T
-                tinv = -Rinv @ t
-                out = np.eye(4, dtype=np.float64)
-                out[:3, :3] = Rinv
-                out[:3, 3] = tinv
-                return out.astype(np.float32)
-
-            # Compute relative c2w: cam_i <- ref via get_relative_pose then inverse
-            def compute_relative_c2w(cam_params):
-                rel_c2w_list = []
-                for i in range(len(cam_params)):
-                    relative_pose_matrix = self.get_relative_pose([ref_cam, cam_params[i]])
-                    cam_ref_from_cami = relative_pose_matrix[1]
-                    cami_from_ref = invert_SE3_np(cam_ref_from_cami)  # c2w relative
-                    rel_c2w_list.append(cami_from_ref)
-                return np.stack(rel_c2w_list, axis=0)
-
-            # 1) Relative c2w for both trajectories
-            cond_rel_c2w = compute_relative_c2w(cond_cam_params)
-            tgt_rel_c2w = compute_relative_c2w(tgt_cam_params)
+            # 1) Relative c2w for both trajectories using shared helpers
+            cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
+            tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
             # 2) Normalize translations across both trajectories using max norm
-            all_rel_c2w = np.concatenate([tgt_rel_c2w, cond_rel_c2w], axis=0)
-            translations = all_rel_c2w[:, :3, 3]
-            norms = np.linalg.norm(translations, axis=1)
-            max_norm = np.max(norms) if norms.size > 0 else 1.0
-            if max_norm < 1e-8:
-                max_norm = 1.0
-            tgt_rel_c2w[:, :3, 3] = tgt_rel_c2w[:, :3, 3] / max_norm
-            cond_rel_c2w[:, :3, 3] = cond_rel_c2w[:, :3, 3] / max_norm
+            tgt_rel_c2w, cond_rel_c2w, _ = normalize_translations_by_max_norm(tgt_rel_c2w, tgt_rel_c2w)
 
             # 3) Invert to obtain relative w2c
             tgt_w2c_rel = np.stack([invert_SE3_np(T) for T in tgt_rel_c2w], axis=0)
             cond_w2c_rel = np.stack([invert_SE3_np(T) for T in cond_rel_c2w], axis=0)
 
             # Concatenate tgt first then cond to align with latents order
-            all_w2c = np.concatenate([tgt_w2c_rel, cond_w2c_rel], axis=0)
+            all_w2c = np.concatenate([tgt_w2c_rel, tgt_w2c_rel], axis=0)
             camera_tensor = torch.from_numpy(all_w2c).to(torch.bfloat16)
             data['camera'] = camera_tensor
             data['intrinsics'] = self._get_intrinsics_tensor(tgt_path, repeat=camera_tensor.shape[0])
