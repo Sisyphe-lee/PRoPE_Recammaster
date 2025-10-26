@@ -1,4 +1,14 @@
 # Change Log
+## v0.2.11 @lcy - 2025-10-23
+
+### 新增
+- 工具：`tools/convert_npz_dir_to_json.py` 支持将目录下的多段 `.npz` 位姿批量转换为旧版 `camera_extrinsics.json` 格式，便于与既有评估/可视化管线互通。
+
+### 变更
+- 轨迹可视化：`tools/visualize_compare_trajectories.py` 与 `tools/trajectory_viz_utils.py` 允许直接传入 `.npz` 文件或包含多段 `.npz` 的目录，自动聚合后与传统 JSON 数据同样绘制；保持对 Plotly/PyTorch3D 可视化逻辑的兼容。
+- 输出命名：比较脚本针对目录输入使用归一化后的目录名生成结果文件名，避免路径分隔符干扰。
+
+---
 ## v0.2.10 @yyb - 2025-10-22
 
 ### 新增
