@@ -1256,7 +1256,7 @@ def train(args):
         gradient_clip_val=0.05,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    # trainer.validate(model, val_dataloader)
+    trainer.validate(model, val_dataloader)
     
     # Run an initial test at step 0 if test_step is enabled
     # if test_dataloader is not None:
