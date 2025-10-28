@@ -78,6 +78,11 @@ class LightningModelForTrain(pl.LightningModule):
         pipeline_type="recammaster",
     ): 
         super().__init__()
+        if resume_ckpt_path in (None, "", "none"):
+            resume_ckpt_path = None
+        if ckpt_type in (None, "", "none"):
+            ckpt_type = "none"
+
         self.latent_path = latent_path
         self.global_seed = global_seed
         self.enable_test_step = enable_test_step
@@ -92,11 +97,15 @@ class LightningModelForTrain(pl.LightningModule):
         self.pipeline_type = pipeline_type
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
-        if os.path.isfile(dit_path):
-            models_to_load.append(dit_path)
+        if isinstance(dit_path, (list, tuple)):
+            shard_paths = list(dit_path)
         else:
-            dit_path = dit_path.split(",")
-            models_to_load.extend(dit_path)
+            dit_path = str(dit_path)
+            shard_paths = [p.strip() for p in dit_path.split(",") if p.strip()]
+        if len(shard_paths) == 1 and os.path.isfile(shard_paths[0]):
+            models_to_load.append(shard_paths[0])
+        else:
+            models_to_load.append(shard_paths)
         model_manager.load_models(models_to_load)
 
         self.pipe = self._init_pipeline(model_manager, pipeline_type)

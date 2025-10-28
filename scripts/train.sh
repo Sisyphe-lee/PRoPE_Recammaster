@@ -49,6 +49,7 @@ USE_REAL_TEMPORAL_INDICES="false"
 USE_PHYSICAL_INDEX="false"
 SELECT_RANDOM_LATENTS="false"
 PIPELINE_TYPE="recammaster"
+MODEL_BASE_PATH=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -129,6 +130,14 @@ while [[ $# -gt 0 ]]; do
             PIPELINE_TYPE="${1#*=}"
             shift
             ;;
+        -M|--model-base-path)
+            MODEL_BASE_PATH="$2"
+            shift 2
+            ;;
+        --model-base-path=*)
+            MODEL_BASE_PATH="${1#*=}"
+            shift
+            ;;
         -F|--frame-downsample-to)
             FRAME_DOWNSAMPLE_TO="$2"
             shift 2
@@ -188,29 +197,65 @@ while [[ $# -gt 0 ]]; do
 done
 
 # For clarity, define paths as variables
-MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
+if [[ -z "$MODEL_BASE_PATH" ]]; then
+    if [[ "$PIPELINE_TYPE" == "wan" ]]; then
+        MODEL_BASE_PATH="models/Wan-AI/Wan2.2-TI2V-5B"
+    else
+        MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
+    fi
+fi
+
+# Resolve diffusion and VAE weights under the chosen base path
+DIT_PATH="$MODEL_BASE_PATH/diffusion_pytorch_model.safetensors"
+if [[ ! -f "$DIT_PATH" ]]; then
+    mapfile -t __diff_shards < <(ls "$MODEL_BASE_PATH"/diffusion_pytorch_model-*.safetensors 2>/dev/null | sort)
+    if [[ ${#__diff_shards[@]} -gt 0 ]]; then
+        DIT_PATH="$(IFS=,; echo "${__diff_shards[*]}")"
+    else
+        DIT_PATH=""
+    fi
+fi
+
+if [[ -f "$MODEL_BASE_PATH/Wan2.1_VAE.pth" ]]; then
+    VAE_PATH="$MODEL_BASE_PATH/Wan2.1_VAE.pth"
+elif [[ -f "$MODEL_BASE_PATH/Wan2.2_VAE.pth" ]]; then
+    VAE_PATH="$MODEL_BASE_PATH/Wan2.2_VAE.pth"
+else
+    VAE_PATH=""
+fi
+
+if [[ -z "$DIT_PATH" ]]; then
+    echo -e "${RED}Error:${NC} diffusion weights not found under $MODEL_BASE_PATH" >&2
+    exit 1
+fi
+if [[ -z "$VAE_PATH" ]]; then
+    echo -e "${RED}Error:${NC} VAE weights not found under $MODEL_BASE_PATH" >&2
+    exit 1
+fi
 # Set the path to the checkpoint you want to resume from.
 # If you want to train from scratch, you can remove the --resume_ckpt_path line.
-# For Wan2.1 original model:
-WAN21_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
-
 # RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/train/wandb/ReCamMaster/08-21-151648_exp02b/checkpoints/step1079.ckpt"
 
-# Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
-CHECKPOINT_TYPE="wan21"  # Change to "recammaster" if you want to use ReCamMaster checkpoint
+# Choose checkpoint type: defaults depend on pipeline
+RESUME_CHECKPOINT_PATH=""
+CHECKPOINT_TYPE="wan21"
 
-# Set checkpoint path based on type
-if [ "$CHECKPOINT_TYPE" = "wan21" ]; then
-    # Prefer WAN21_RESUME_CHECKPOINT_PATH if provided; otherwise fall back to base WAN21 checkpoint
-    if [ -n "$WAN21_RESUME_CHECKPOINT_PATH" ]; then
-        RESUME_CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
-    else
-        RESUME_CHECKPOINT_PATH="$WAN21_CHECKPOINT_PATH"
-    fi
+if [[ "$PIPELINE_TYPE" == "wan" ]]; then
     ENABLE_CAM_LAYERS=""
 else
-    RESUME_CHECKPOINT_PATH="$RECAMMASTER_CHECKPOINT_PATH"
-    ENABLE_CAM_LAYERS="--enable_cam_layers"
+    # For Wan2.1 original model:
+    WAN21_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
+    if [[ "$CHECKPOINT_TYPE" == "wan21" ]]; then
+        if [[ -n "$WAN21_RESUME_CHECKPOINT_PATH" ]]; then
+            RESUME_CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
+        else
+            RESUME_CHECKPOINT_PATH="$WAN21_CHECKPOINT_PATH"
+        fi
+        ENABLE_CAM_LAYERS=""
+    else
+        RESUME_CHECKPOINT_PATH="$RECAMMASTER_CHECKPOINT_PATH"
+        ENABLE_CAM_LAYERS="--enable_cam_layers"
+    fi
 fi
 
 if [ -n "$DEBUG_FLAG" ]; then
@@ -258,6 +303,9 @@ cat <<CONFIG_EOF
   "wandb_name": "$WANDB_NAME",
   "dataset_path": "$DATASET_PATH",
   "metadata_path": "$METADATA_PATH",
+  "model_base_path": "$MODEL_BASE_PATH",
+  "dit_path": "$DIT_PATH",
+  "vae_path": "$VAE_PATH",
   "global_seed": $GLOBAL_SEED,
   "pipeline_type": "$PIPELINE_TYPE",
   "t_highfreq_ratio": $T_HIGHFREQ_RATIO,
@@ -277,37 +325,58 @@ export NCCL_BLOCKING_WAIT=1
 export NCCL_DEBUG=${NCCL_DEBUG:-ERROR}
 
 # # set to num_workers 0 and batch_size 1 for debug
-CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src.train_recammaster  \
- --task train  \
- --dataset_path "$DATASET_PATH"  \
- --output_path "$OUTPUT_DIR"   \
- --dit_path "$MODEL_BASE_PATH/diffusion_pytorch_model.safetensors"   \
- --vae_path "$MODEL_BASE_PATH/Wan2.1_VAE.pth"   \
- --steps_per_epoch 10000   \
- --max_epochs 100   \
- --learning_rate 1e-5   \
- --accumulate_grad_batches  1  \
- --use_gradient_checkpointing  \
- --dataloader_num_workers "$EFFECTIVE_DATALOADER_WORKERS" \
- --batch_size "$EFFECTIVE_BATCH_SIZE" \
- --num_val_scenes 2 \
- --global_seed "$GLOBAL_SEED" \
- --enable_test_step \
- --test_samples 10 \
- --test_inference_steps 10 \
- --val_size 36 \
- --resume_ckpt_path "$RESUME_CHECKPOINT_PATH" \
- --ckpt_type "$CHECKPOINT_TYPE" \
- $ENABLE_CAM_LAYERS \
- --metadata_path "$METADATA_PATH" \
- --wandb_name "$WANDB_NAME" \
- --val_check_interval_batches 200 \
- --training_strategy deepspeed_stage_2 \
- --distributed_timeout_seconds 1800 \
- --t_highfreq_ratio "$T_HIGHFREQ_RATIO" \
- --frame_downsample_to "$FRAME_DOWNSAMPLE_TO" \
- $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
- $([ "$USE_PHYSICAL_INDEX" = "true" ] && echo "--use_physical_index") \
- $([ "$SELECT_RANDOM_LATENTS" = "true" ] && echo "--select_random_latents") \
- --pipeline_type "$PIPELINE_TYPE" \
- $DEBUG_FLAG \
+CMD=(
+  python -u -m src.train_recammaster
+  --task train
+  --dataset_path "$DATASET_PATH"
+  --output_path "$OUTPUT_DIR"
+  --dit_path "$DIT_PATH"
+  --vae_path "$VAE_PATH"
+  --steps_per_epoch 10000
+  --max_epochs 100
+  --learning_rate 1e-5
+  --accumulate_grad_batches 1
+  --use_gradient_checkpointing
+  --dataloader_num_workers "$EFFECTIVE_DATALOADER_WORKERS"
+  --batch_size "$EFFECTIVE_BATCH_SIZE"
+  --num_val_scenes 2
+  --global_seed "$GLOBAL_SEED"
+  --enable_test_step
+  --test_samples 10
+  --test_inference_steps 10
+  --val_size 36
+  --metadata_path "$METADATA_PATH"
+  --wandb_name "$WANDB_NAME"
+  --val_check_interval_batches 200
+  --training_strategy deepspeed_stage_2
+  --distributed_timeout_seconds 1800
+  --t_highfreq_ratio "$T_HIGHFREQ_RATIO"
+  --frame_downsample_to "$FRAME_DOWNSAMPLE_TO"
+  --pipeline_type "$PIPELINE_TYPE"
+)
+if [[ -n "$RESUME_CHECKPOINT_PATH" ]]; then
+  CMD+=(--resume_ckpt_path "$RESUME_CHECKPOINT_PATH")
+fi
+if [[ "$CHECKPOINT_TYPE" == "wan21" || "$CHECKPOINT_TYPE" == "recammaster" ]]; then
+  CMD+=(--ckpt_type "$CHECKPOINT_TYPE")
+fi
+if [[ "$USE_REAL_TEMPORAL_INDICES" == "true" ]]; then
+  CMD+=(--use_real_temporal_indices)
+fi
+if [[ "$USE_PHYSICAL_INDEX" == "true" ]]; then
+  CMD+=(--use_physical_index)
+fi
+if [[ "$SELECT_RANDOM_LATENTS" == "true" ]]; then
+  CMD+=(--select_random_latents)
+fi
+if [[ -n "$ENABLE_CAM_LAYERS" ]]; then
+  CMD+=(--enable_cam_layers)
+fi
+if [[ "$DEBUG_BOOL" == true ]]; then
+  CMD+=(--debug)
+fi
+
+PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+PYTHONUNBUFFERED=1 \
+"${CMD[@]}"
