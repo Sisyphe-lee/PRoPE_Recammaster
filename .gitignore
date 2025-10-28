@@ -12,7 +12,7 @@ results/
 result/
 eval_data/
 eval_data2/
-example_data/
+example_test_data/
 .vscode/
 exp/
 metadata.csv

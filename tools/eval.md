@@ -3,7 +3,7 @@
 python /data1/lcy/projects/vipe/run.py \
 pipeline=default \
 streams=raw_mp4_stream \
-streams.base_path=/data1/lcy/projects/ReCamMaster/eval_data2/videos \
+streams.base_path=/data1/lcy/projects/ReCamMaster/example_test_data/videos \
 pipeline.init.instance=null \
 pipeline.post.depth_align_model=null \
 pipeline.slam.keyframe_depth=null \

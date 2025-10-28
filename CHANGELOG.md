@@ -1,4 +1,11 @@
 # Change Log
+## v0.2.12 @codex - 2025-10-28
+### 变更
+- 数据集：`src/inference_recammaster.py` 在 cond 与 tgt 轨迹计算相对位姿前，引入 `_center_trajectory` 将平移起点统一移至原点，确保两条轨迹共享参考帧并降低
+       尺度偏移风险。
+- 实现：新增 `_center_trajectory` 辅助函数，并在 cond/target 轨迹管线复用，避免重复的平移归零逻辑。
+
+---
 ## v0.2.11 @lcy - 2025-10-23
 
 ### 新增

@@ -28,7 +28,7 @@ fi
 
 PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
     "$PYTHON_BIN" src/inference_recammaster.py \
-    --dataset_path "example_test_data2" \
+    --dataset_path "example_test_data" \
     --ckpt_path "$CHECKPOINT_PATH" \
     --ckpt_type "$CHECKPOINT_TYPE" \
     $ENABLE_CAM_LAYERS \

@@ -203,6 +203,22 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             rel_c2w_list.append(cam_from_ref)
         return np.stack(rel_c2w_list, axis=0)
 
+    def _center_trajectory(self, c2ws: list[np.ndarray]) -> list[np.ndarray]:
+        """
+        Shift a trajectory so the first camera sits at the origin.
+        """
+        if not c2ws:
+            return c2ws
+        origin = c2ws[0][:3, 3].copy()
+        if np.allclose(origin, 0):
+            return [c2w.copy() for c2w in c2ws]
+        centered = []
+        for c2w in c2ws:
+            shifted = c2w.copy()
+            shifted[:3, 3] -= origin
+            centered.append(shifted)
+        return centered
+
     def _normalize_pairwise_distance(self, rel_c2w: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """
         Normalize a trajectory so that the maximum pairwise translation distance
@@ -279,17 +295,16 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
                 j = int(matches[0])
             else:
                 j = self._nearest_index(src_inds, t)
-            c2w = src_c2ws[j].T
+            c2w = src_c2ws[j]
             c2w = self._convert_c2w_convention(c2w)
             src_c2ws_sampled.append(c2w)
+        src_c2ws_sampled = self._center_trajectory(src_c2ws_sampled)
         src_cam_params = [Camera(c2w) for c2w in src_c2ws_sampled]
         cond_ref_cam = src_cam_params[0]
         cond_rel_c2w = self._compute_relative_c2w(cond_ref_cam, src_cam_params)
-        # cond_rel_c2w[:,:3,:3] = cond_rel_c2w[:,:3,:3]
-        # cond_rel_c2w = self._normalize_pairwise_distance(cond_rel_c2w)
+
 
         camera_list = []
-        original_trans_list = []
         for cam_type in range(1, 11):
             traj = [self.parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type):02d}"]) for idx in cam_idx]
             traj = np.stack(traj).transpose(0, 2, 1)
@@ -297,24 +312,21 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             for c2w in traj:
                 c2w = self._convert_c2w_convention(c2w)
                 c2ws.append(c2w)
+            c2ws = self._center_trajectory(c2ws)
             tgt_cam_params = [Camera(cam_param) for cam_param in c2ws]
+
             tgt_rel_c2w = self._compute_relative_c2w(cond_ref_cam, tgt_cam_params)
-            # 保存未归一化的相对平移（先 target，再 cond），用于 distance RoPE
-            orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
-            orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
-            orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0).astype(np.float32)
-            original_trans_list.append(torch.from_numpy(orig_trans))
 
             # 归一化仅用于模型 w2c 的输入，不影响 original translation
-            cond_joint, tgt_joint = self._normalize_joint_translation(tgt_rel_c2w, tgt_rel_c2w)
+            cond_joint, tgt_joint = self._normalize_joint_translation(cond_rel_c2w, tgt_rel_c2w)
             cond_rel_w2c = self._c2w_to_w2c(cond_joint)
             tgt_rel_w2c = self._c2w_to_w2c(tgt_joint)
-            all_w2c = np.concatenate([tgt_rel_w2c, tgt_rel_w2c], axis=0).astype(np.float32)
+            all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0).astype(np.float32)
             pose_embedding = torch.from_numpy(all_w2c).to(torch.bfloat16)
             camera_list.append(pose_embedding)
         
         data['camera'] = camera_list
-        data['original_camera_translation'] = original_trans_list
+        # data['original_camera_translation'] = original_trans_list
         return data
     
 
@@ -518,7 +530,7 @@ if __name__ == '__main__':
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
             # Select corresponding original relative translations (target then cond), shape (F_total, 3)
-            orig_trans = batch["original_camera_translation"][cam_type_id-1].to(device=pipe.device, dtype=torch.float32)
+            # orig_trans = batch["original_camera_translation"][cam_type_id-1].to(device=pipe.device, dtype=torch.float32)
             pipe.eval()
             video = pipe(
                 prompt=target_text,
