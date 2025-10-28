@@ -5,10 +5,18 @@ import copy
 import os
 import torch, os, imageio, argparse
 import sys
+from pathlib import Path
 from torchvision.transforms import v2
 import lightning as pl
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
+if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
+    sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
+
 from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
+from diffsynth.pipelines.wan_video_new import WanVideoPipeline
 import torchvision
 from PIL import Image
 import numpy as np
@@ -67,6 +75,7 @@ class LightningModelForTrain(pl.LightningModule):
         use_real_temporal_indices=False,
         use_physical_index=False,
         select_random_latents=False,
+        pipeline_type="recammaster",
     ): 
         super().__init__()
         self.latent_path = latent_path
@@ -80,6 +89,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.use_real_temporal_indices = use_real_temporal_indices
         self.use_physical_index = use_physical_index
         self.select_random_latents = select_random_latents
+        self.pipeline_type = pipeline_type
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
         if os.path.isfile(dit_path):
@@ -88,14 +98,16 @@ class LightningModelForTrain(pl.LightningModule):
             dit_path = dit_path.split(",")
             models_to_load.extend(dit_path)
         model_manager.load_models(models_to_load)
-        
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+
+        self.pipe = self._init_pipeline(model_manager, pipeline_type)
+        self._ensure_pipeline_compat()
+        _ = self._get_denoising_model()
         self.train_timesteps = 1000
         self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
 
         # Store parameters for later use
         self.ckpt_type = ckpt_type
-        self.enable_cam_layers = enable_cam_layers
+        self.enable_cam_layers = enable_cam_layers and pipeline_type == "recammaster"
         # Only inject camera layers if enabled (for ReCamMaster training)
         if self.enable_cam_layers:
             dim=self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
@@ -170,14 +182,14 @@ class LightningModelForTrain(pl.LightningModule):
         self.freeze_parameters()
         # Only set camera layers as trainable if they are enabled
         if self.enable_cam_layers:
-            for name, module in self.pipe.denoising_model().named_modules():
+            for name, module in self._get_denoising_model().named_modules():
                 if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn"]):
                     # print(f"Trainable: {name}")
                     for param in module.parameters():
                         param.requires_grad = True
         else:
             # If camera layers are not enabled, only make self_attn trainable
-            for name, module in self.pipe.denoising_model().named_modules():
+            for name, module in self._get_denoising_model().named_modules():
                 if "self_attn" in name:
                     # print(f"Trainable: {name}")
                     for param in module.parameters():
@@ -185,7 +197,7 @@ class LightningModelForTrain(pl.LightningModule):
 
         trainable_params = 0
         seen_params = set()
-        for name, module in self.pipe.denoising_model().named_modules():
+        for name, module in self._get_denoising_model().named_modules():
             for param in module.parameters():
                 if param.requires_grad and param not in seen_params:
                     trainable_params += param.numel()
@@ -213,11 +225,80 @@ class LightningModelForTrain(pl.LightningModule):
         self.video_decoder = VideoDecoder(self.pipe)
         
         
+    def _init_pipeline(self, model_manager, pipeline_type):
+        if pipeline_type == "recammaster":
+            return WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        pipe = WanVideoPipeline(device="cpu", torch_dtype=torch.bfloat16)
+        available_names = set(model_manager.model_name)
+        if "wan_video_text_encoder" in available_names:
+            pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
+        if "wan_video_image_encoder" in available_names:
+            pipe.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
+        if "wan_video_dit" in available_names:
+            pipe.dit = model_manager.fetch_model("wan_video_dit")
+        if "wan_video_vae" in available_names:
+            pipe.vae = model_manager.fetch_model("wan_video_vae")
+        if "wan_video_dit2" in available_names:
+            pipe.dit2 = model_manager.fetch_model("wan_video_dit2")
+        if "wan_video_motion_controller" in available_names:
+            pipe.motion_controller = model_manager.fetch_model("wan_video_motion_controller")
+        if "wan_video_vace" in available_names:
+            pipe.vace = model_manager.fetch_model("wan_video_vace")
+        if "wan_video_animate_adapter" in available_names:
+            pipe.animate_adapter = model_manager.fetch_model("wan_video_animate_adapter")
+        existing_names = list(getattr(pipe, "model_names", []))
+        tracked = []
+        for name in ["text_encoder", "image_encoder", "dit", "dit2", "vae", "motion_controller", "vace", "animate_adapter"]:
+            if getattr(pipe, name, None) is not None:
+                tracked.append(name)
+        pipe.model_names = list(dict.fromkeys(existing_names + tracked))
+        return pipe
+
+
+    def _ensure_pipeline_compat(self):
+        if not callable(getattr(self.pipe, "denoising_model", None)):
+            self.pipe.denoising_model = lambda: getattr(self.pipe, "dit", None)
+        if not callable(getattr(self.pipe, "prepare_extra_input", None)):
+            self.pipe.prepare_extra_input = lambda latents=None: {}
+        if not hasattr(self.pipe, "decode_video"):
+            def _decode_video(latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+                return self.pipe.vae.decode(latents, device=self.pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            self.pipe.decode_video = _decode_video
+        if not hasattr(self.pipe, "tensor2video"):
+            def _tensor2video(frames):
+                frames_np = rearrange(frames, "C T H W -> T H W C")
+                frames_np = ((frames_np.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                return [Image.fromarray(frame) for frame in frames_np]
+            self.pipe.tensor2video = _tensor2video
+        if not hasattr(self.pipe, "encode_video"):
+            def _encode_video(input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+                return self.pipe.vae.encode(input_video, device=self.pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            self.pipe.encode_video = _encode_video
+        if not getattr(self.pipe, "model_names", None):
+            names = []
+            for name in ["text_encoder", "image_encoder", "dit", "dit2", "vae", "motion_controller", "vace", "animate_adapter"]:
+                if getattr(self.pipe, name, None) is not None:
+                    names.append(name)
+            self.pipe.model_names = names
+
+
+    def _get_denoising_model(self):
+        model = None
+        denoiser = getattr(self.pipe, "denoising_model", None)
+        if callable(denoiser):
+            model = denoiser()
+        if model is None:
+            model = getattr(self.pipe, "dit", None)
+        if model is None:
+            raise AttributeError("Unable to locate denoising model for the current pipeline.")
+        return model
+
+
     def freeze_parameters(self):
         # Freeze parameters
         self.pipe.requires_grad_(False)
         self.pipe.eval()
-        self.pipe.denoising_model().train()
+        self._get_denoising_model().train()
 
 
 
@@ -381,7 +462,7 @@ class LightningModelForTrain(pl.LightningModule):
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
         
         # Compute loss with model-internal downsampling; match targets by selecting same indices
-        noise_pred = self.pipe.denoising_model()(
+        noise_pred = self._get_denoising_model()(
             noisy_latents, timestep=timestep, cam_emb=cam_emb, **prompt_emb, **extra_input, **image_emb,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
@@ -499,7 +580,7 @@ class LightningModelForTrain(pl.LightningModule):
             timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
             latents_input = torch.cat([latents_gen, condition_latents], dim=2)
             extra_input = self.pipe.prepare_extra_input(latents_input)
-            noise_pred = self.pipe.denoising_model()(
+            noise_pred = self._get_denoising_model()(
                 latents_input,
                 timestep=timestep,
                 cam_emb=cam_emb,
@@ -749,7 +830,7 @@ class LightningModelForTrain(pl.LightningModule):
             os.makedirs(checkpoint_dir, exist_ok=True)
             
             current_step = self.global_step
-            state_dict = self.pipe.denoising_model().state_dict()
+            state_dict = self._get_denoising_model().state_dict()
             
             checkpoint_path = os.path.join(checkpoint_dir, f"validation_step{current_step}.ckpt")
             torch.save(state_dict, checkpoint_path)
@@ -764,7 +845,7 @@ class LightningModelForTrain(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
+        trainable_modules = filter(lambda p: p.requires_grad, self._get_denoising_model().parameters())
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
     
@@ -776,9 +857,9 @@ class LightningModelForTrain(pl.LightningModule):
         print(f"Current step: {current_step}")
 
         checkpoint.clear()
-        trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.pipe.denoising_model().named_parameters()))
+        trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self._get_denoising_model().named_parameters()))
         trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
-        state_dict = self.pipe.denoising_model().state_dict()
+        state_dict = self._get_denoising_model().state_dict()
         if not (os.path.exists(os.path.join(checkpoint_dir))):
             os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -811,6 +892,13 @@ def parse_args():
         type=str,
         default="./",
         help="Path to save the model.",
+    )
+    parser.add_argument(
+        "--pipeline_type",
+        type=str,
+        default="recammaster",
+        choices=["recammaster", "wan"],
+        help="Which DiffSynth pipeline to use for training.",
     )
 
     parser.add_argument(
@@ -1163,6 +1251,7 @@ def train(args):
         use_real_temporal_indices=getattr(args, 'use_real_temporal_indices', False),
         use_physical_index=getattr(args, 'use_physical_index', False),
         select_random_latents=getattr(args, 'select_random_latents', False),
+        pipeline_type=getattr(args, 'pipeline_type', 'recammaster'),
     )
     
     # Set test dataset for automatic test_step execution

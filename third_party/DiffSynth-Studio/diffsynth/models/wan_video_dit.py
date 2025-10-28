@@ -1,7 +1,9 @@
 import torch
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
@@ -23,41 +25,129 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
+
+# TODO: move to src
+try:
+    from src.prope import _prepare_apply_fns
+except ModuleNotFoundError:
+    raise ModuleNotFoundError("prope module not found, please install it with `pip install prope`")
+
+DEFAULT_IMAGE_WIDTH = 832.0
+DEFAULT_IMAGE_HEIGHT = 480.0
+DEFAULT_SENSOR_WIDTH_MM = 23.76
+DEFAULT_SENSOR_HEIGHT_MM = 23.76
+DEFAULT_FOCAL_MM = 18.0
+
+
+def _default_intrinsics_matrix(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    fx = DEFAULT_FOCAL_MM * (DEFAULT_IMAGE_WIDTH / DEFAULT_SENSOR_WIDTH_MM)
+    fy = DEFAULT_FOCAL_MM * (DEFAULT_IMAGE_HEIGHT / DEFAULT_SENSOR_HEIGHT_MM)
+    cx = DEFAULT_IMAGE_WIDTH / 2.0
+    cy = DEFAULT_IMAGE_HEIGHT / 2.0
+    base = torch.tensor(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+    )
+    return base.to(dtype=dtype, device=device)
+
+
+def _normalize_cam_intrinsics(
+    cam_intrinsics: Optional[torch.Tensor],
+    batch: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Ensure camera intrinsics tensor is (B, seq_len, 3, 3) on the correct device/dtype.
+    """
+    if cam_intrinsics is None:
+        base = _default_intrinsics_matrix(dtype, device)
+        return base.view(1, 1, 3, 3).expand(batch, seq_len, 3, 3).contiguous()
+
+    if cam_intrinsics.dim() == 3:
+        cam_intrinsics = cam_intrinsics.unsqueeze(0)
+    if cam_intrinsics.dim() != 4:
+        raise ValueError(f"Unexpected cam_intrinsics shape: {cam_intrinsics.shape}. Expected (B,N,3,3) or (N,3,3).")
+
+    if cam_intrinsics.shape[0] == 1 and batch > 1:
+        cam_intrinsics = cam_intrinsics.expand(batch, -1, -1, -1)
+    if cam_intrinsics.shape[1] != seq_len:
+        if cam_intrinsics.shape[1] == seq_len * 2:
+            raise ValueError(
+                f"cam_intrinsics has twice the expected sequence length ({cam_intrinsics.shape[1]} vs {seq_len}). "
+                "Please downsample or reorder intrinsics to match cam embeddings."
+            )
+        raise ValueError(
+            f"cam_intrinsics sequence dimension mismatch: expected {seq_len}, got {cam_intrinsics.shape[1]}"
+        )
+    return cam_intrinsics.to(dtype=dtype, device=device).contiguous()
+
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
-    if compatibility_mode:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn_interface.flash_attn_func(q, k, v)
-        if isinstance(x,tuple):
-            x = x[0]
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    # Check if inputs are already in multi-head format by checking tensor dimensions
+    # len(shape) == 4 means (batch, num_heads, seqlen, head_dim)
+    # len(shape) == 3 means (batch, seqlen, dim)
+    already_multihead = len(q.shape) == 4
+    
+    if already_multihead:
+        # Inputs are already in (batch, num_heads, seqlen, head_dim) format
+        if compatibility_mode:
+            x = F.scaled_dot_product_attention(q, k, v)
+        elif FLASH_ATTN_3_AVAILABLE:
+            # Rearrange to (batch, seqlen, num_heads, head_dim) for flash_attn_3
+            q = rearrange(q, "b n s d -> b s n d", n=num_heads)
+            k = rearrange(k, "b n s d -> b s n d", n=num_heads)
+            v = rearrange(v, "b n s d -> b s n d", n=num_heads)
+            x = flash_attn_interface.flash_attn_func(q, k, v)
+            if isinstance(x, tuple):
+                x = x[0]
+            x = rearrange(x, "b s n d -> b n s d", n=num_heads)
+        elif FLASH_ATTN_2_AVAILABLE:
+            # Rearrange to (batch, seqlen, num_heads, head_dim) for flash_attn_2
+            q = rearrange(q, "b n s d -> b s n d", n=num_heads)
+            k = rearrange(k, "b n s d -> b s n d", n=num_heads)
+            v = rearrange(v, "b n s d -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b n s d", n=num_heads)
+        elif SAGE_ATTN_AVAILABLE:
+            x = sageattn(q, k, v)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v)
     else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        # Original behavior: inputs are in (batch, seqlen, dim) format
+        if compatibility_mode:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        elif FLASH_ATTN_3_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn_interface.flash_attn_func(q, k, v)
+            if isinstance(x, tuple):
+                x = x[0]
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        elif FLASH_ATTN_2_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q, k, v)
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        elif SAGE_ATTN_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = sageattn(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        else:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
 
 
@@ -88,12 +178,58 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-
-def rope_apply(x, freqs, num_heads):
+def rope_apply_(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
+    return x_out.to(x.dtype)
+
+def rope_apply(x, freqs, num_heads, *, mask_first_head_fraction: float = 0.0, t_highfreq_ratio: float = 0.0):
+    # NOTE: We repurpose t_highfreq_ratio to mask w-dim low-frequency complex bins instead of t-dim.
+    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    # Ensure freqs has the same dtype as x for complex operations
+    freqs = freqs.to(device=x.device)
+    x_out = torch.view_as_complex(x.to(torch.float32).reshape(
+        x.shape[0], x.shape[1], x.shape[2], -1, 2))
+
+    if mask_first_head_fraction > 0 and t_highfreq_ratio > 0:
+        # Build per-head complex-frequency coefficients so we can mask specific heads
+        # freqs shape: (seqlen, 1, Lc)
+        seqlen, _, Lc = freqs.shape
+        heads_to_mask = max(1, int(num_heads * mask_first_head_fraction))
+        # 3D split order [t, h, w] across complex bins
+        tLc = Lc - 2 * (Lc // 3)
+        hLc = (Lc // 3)
+        wLc = (Lc // 3)
+        
+        # t segment low-frequency at the end of t segment
+        t_lo = max(1, int(tLc * t_highfreq_ratio + 1e-6))
+        t_lo = max(0, (t_lo // 2) * 2)  # keep even pairs
+        t_lo_start = max(0, tLc - t_lo)
+        t_lo_end = tLc
+        
+        # w segment in complex bins: [tLc + hLc, tLc + hLc + wLc)
+        w_start = tLc + hLc
+        w_end = tLc + hLc + wLc
+        # Low-frequency portion at the end of w segment
+        w_lo = max(1, int(wLc * t_highfreq_ratio + 1e-6))
+        w_lo = max(0, (w_lo // 2) * 2)  # keep even pairs
+        w_lo_start = max(w_start, w_end - w_lo)
+        w_lo_end = w_end
+        # Create head-aware freqs tensor aligned as (1, seqlen, num_heads, Lc)
+        freqs_heads = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc).clone()
+        # Mask rotation for selected heads on t-lowfreq and w-lowfreq complex bins by setting multiplier to 1+0j
+        one_c = torch.ones(1, dtype=freqs_heads.dtype, device=freqs_heads.device)
+        freqs_heads[:, :, :heads_to_mask, t_lo_start:t_lo_end] = one_c
+        # freqs_heads[:, :, :heads_to_mask, w_lo_start:w_lo_end] = one_c
+        freqs_effective = freqs_heads
+    else:
+        # Broadcast original freqs across heads aligned as (1, s, n, Lc)
+        seqlen, _, Lc = freqs.shape
+        freqs_effective = freqs.view(1, seqlen, 1, Lc).expand(1, seqlen, num_heads, Lc)
+
+    x_out = torch.view_as_real(x_out * freqs_effective).flatten(2)
     return x_out.to(x.dtype)
 
 
@@ -147,6 +283,78 @@ class SelfAttention(nn.Module):
         return self.o(x)
 
 
+class  PRoPE_SelfAttention(nn.Module):
+    """PRoPE SelfAttention"""
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        
+        self.attn = AttentionModule(self.num_heads)
+
+    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.5, **kwargs):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(x))
+        v = self.v(x)
+        
+        # Apply 3D RoPE first, but mask low-frequency t channels on the first fraction of heads
+        q = rope_apply(q, freqs, self.num_heads, mask_first_head_fraction=mask_first_head_fraction, t_highfreq_ratio=t_highfreq_ratio)
+        k = rope_apply(k, freqs, self.num_heads, mask_first_head_fraction=mask_first_head_fraction, t_highfreq_ratio=t_highfreq_ratio)
+        
+        # Rearrange to multi-head format: (batch, seqlen, dim) -> (batch, num_heads, seqlen, head_dim)
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        
+        # Ensure data type consistency for PRoPE operations
+        target_dtype = q.dtype
+        target_device = q.device
+        
+        # Convert viewmats and Ks to match input tensor dtype and device
+        viewmats = viewmats.to(dtype=target_dtype, device=target_device)
+        if Ks is not None:
+            Ks = Ks.to(dtype=target_dtype, device=target_device)
+        
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
+            head_dim=self.head_dim,
+            viewmats=viewmats,
+            Ks=Ks,
+            #TODO: hardcode
+            patches_x=52,
+            patches_y=30,
+            image_width=832,
+            image_height=480,
+            num_heads=self.num_heads,
+            head_fraction=mask_first_head_fraction,
+            t_highfreq_ratio=t_highfreq_ratio,
+            original_trans=kwargs.get("original_camera_translation", None),
+        )
+        
+        # Apply PRoPE transforms
+        q = apply_fn_q(q)
+        k = apply_fn_kv(k)
+        # v = apply_fn_kv(v)
+
+        # Apply attention (inputs are already in multi-head format)
+        x = self.attn(q, k, v)
+        
+        # Apply output transform
+        # x = apply_fn_o(x)
+        
+        # Rearrange back to original format: (batch, num_heads, seqlen, head_dim) -> (batch, seqlen, dim)
+        x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+        
+        return self.o(x)
+
+
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False):
         super().__init__()
@@ -194,13 +402,18 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, enable_cam_layers: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.enable_cam_layers = enable_cam_layers
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
+
+        self.self_attn = PRoPE_SelfAttention(dim, num_heads, eps)
+        #Vanilla ReCamMaster is not supported anymore
+        # self.self_attn = SelfAttention(dim, num_heads, eps)
+
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -211,7 +424,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, cam_emb, t_mod, freqs, temporal_indices=None, **_kwargs):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -223,8 +436,60 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+
+        # cam_emb can be either (B, N, 12) as flattened 3x4, or (B, N, 4, 4) absolute w2c matrices.
+        if cam_emb.dim() == 3 and cam_emb.shape[-1] == 12:
+            B, N, _ = cam_emb.shape
+            reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
+            bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
+            bottom_row = bottom_row.view(1,1,1,4).expand(B, N, 1, 4)
+            viewmats = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
+        elif cam_emb.dim() == 4 and cam_emb.shape[-2:] == (4, 4):
+            B, N = cam_emb.shape[:2]
+            viewmats = cam_emb
+        else:
+            raise ValueError(f"Unexpected cam_emb shape: {cam_emb.shape}. Expected (B,N,12) or (B,N,4,4).")
+        
+        N = viewmats.shape[1]
+        
+        # Ensure Ks has the same dtype and device as input_x
+        cam_intrinsics = _kwargs.get("cam_intrinsics", None)
+        Ks = _normalize_cam_intrinsics(cam_intrinsics, B, N, input_x.dtype, input_x.device)
+        
+        # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
+        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
+
+        try:
+            attn_out = self.self_attn(
+                input_x, freqs, cam_emb, Ks,
+                t_highfreq_ratio=t_highfreq_ratio,
+                original_camera_translation=_kwargs.get("original_camera_translation", None),
+            )
+            if self.enable_cam_layers:
+                attn_out = self.projector(attn_out)
+            x = self.gate(x, gate_msa, attn_out)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                raise RuntimeError(f"[OOM][submodule=self_attn] {e}") from e
+            raise
+
+
+        # cam_emb = self.cam_encoder(cam_emb)
+        # cam_emb = cam_emb.repeat(1, 2, 1)
+        # cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, 30, 52, 1)
+        # cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
+        # input_x = input_x + cam_emb
+        # x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
+
+        
+        
+        
+        try:
+            x = x + self.cross_attn(self.norm3(x), context)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                raise RuntimeError(f"[OOM][submodule=cross_attn] {e}") from e
+            raise
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -291,6 +556,7 @@ class WanModel(torch.nn.Module):
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
+        enable_cam_layers: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -318,7 +584,7 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)  # Always start with False, will be set dynamically
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -354,11 +620,13 @@ class WanModel(torch.nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
+                cam_emb: torch.Tensor,
                 context: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                temporal_indices: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -371,36 +639,66 @@ class WanModel(torch.nn.Module):
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
         
-        x, (f, h, w) = self.patchify(x)
+        control_camera_latents_input = kwargs.pop("control_camera_latents_input", None)
+        # Patchify (all downsampling handled outside the model)
+        patchify_out = self.patchify(x, control_camera_latents_input)
+        if isinstance(patchify_out, tuple):
+            x, grid_size = patchify_out
+        else:
+            grid_size = patchify_out.shape[2:]
+            x = rearrange(patchify_out, "b c f h w -> b (f h w) c").contiguous()
+        f, h, w = grid_size
+
+        # Build RoPE freqs with real temporal indices
+        if temporal_indices is not None:
+            # 使用真实的时序索引，确保在正确的设备上
+            selected_t_idx = temporal_indices.to(device=self.freqs[0].device, dtype=torch.long)
+        else:
+            # 回退到连续索引 (向后兼容)
+            selected_t_idx = torch.arange(f, device=self.freqs[0].device, dtype=torch.long)
         
+        f_freqs = self.freqs[0].index_select(0, selected_t_idx)
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-        
+
         def create_custom_forward(module):
             def custom_forward(*inputs):
-                return module(*inputs)
+                return module(*inputs, **kwargs)
             return custom_forward
 
-        for block in self.blocks:
-            if self.training and use_gradient_checkpointing:
-                if use_gradient_checkpointing_offload:
-                    with torch.autograd.graph.save_on_cpu():
+        # Iterate blocks with OOM reporting per DiT layer
+        for layer_index, block in enumerate(self.blocks):
+            try:
+                if self.training and use_gradient_checkpointing:
+                    if use_gradient_checkpointing_offload:
+                        with torch.autograd.graph.save_on_cpu():
+                            x = torch.utils.checkpoint.checkpoint(
+                                create_custom_forward(block),
+                                x, context, cam_emb, t_mod, freqs,
+                                use_reentrant=False,
+                            )
+                    else:
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, cam_emb, t_mod, freqs,
                             use_reentrant=False,
                         )
                 else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x, context, t_mod, freqs,
-                        use_reentrant=False,
-                    )
-            else:
-                x = block(x, context, t_mod, freqs)
+                    x = block(x, context, cam_emb, t_mod, freqs, **kwargs)
+            except RuntimeError as e:
+                # Augment CUDA OOM with layer index and rank information
+                msg = str(e)
+                if "out of memory" in msg.lower():
+                    try:
+                        import torch.distributed as dist
+                        rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("LOCAL_RANK", -1))
+                    except Exception:
+                        rank = int(os.environ.get("LOCAL_RANK", -1))
+                    raise RuntimeError(f"[OOM][rank{rank}] DiTBlock index {layer_index}: {msg}") from e
+                raise
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

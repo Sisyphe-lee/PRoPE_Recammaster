@@ -1,6 +1,11 @@
 import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
+if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
+    sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData
 import torch, os, imageio, argparse
 from torchvision.transforms import v2

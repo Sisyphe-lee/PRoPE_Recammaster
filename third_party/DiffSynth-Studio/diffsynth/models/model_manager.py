@@ -399,11 +399,15 @@ class ModelManager:
         if isinstance(file_path, list):
             state_dict = {}
             for path in file_path:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Model file not found: {path}")
                 state_dict.update(load_state_dict(path))
         elif os.path.isfile(file_path):
             state_dict = load_state_dict(file_path)
+        elif os.path.isdir(file_path):
+            state_dict = {}
         else:
-            state_dict = None
+            raise FileNotFoundError(f"Model path not found: {file_path}")
         for model_detector in self.model_detector:
             if model_detector.match(file_path, state_dict):
                 model_names, models = model_detector.load(
@@ -426,7 +430,7 @@ class ModelManager:
             self.load_model(file_path, model_names, device=device, torch_dtype=torch_dtype)
 
     
-    def fetch_model(self, model_name, file_path=None, require_model_path=False, index=None):
+    def fetch_model(self, model_name, file_path=None, require_model_path=False):
         fetched_models = []
         fetched_model_paths = []
         for model, model_path, model_name_ in zip(self.model, self.model_path, self.model_name):
@@ -440,28 +444,14 @@ class ModelManager:
             return None
         if len(fetched_models) == 1:
             print(f"Using {model_name} from {fetched_model_paths[0]}.")
-            model = fetched_models[0]
-            path = fetched_model_paths[0]
         else:
-            if index is None:
-                model = fetched_models[0]
-                path = fetched_model_paths[0]
-                print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths[0]}.")
-            elif isinstance(index, int):
-                model = fetched_models[:index]
-                path = fetched_model_paths[:index]
-                print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths[:index]}.")
-            else:
-                model = fetched_models
-                path = fetched_model_paths
-                print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths}.")
+            print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths[0]}.")
         if require_model_path:
-            return model, path
+            return fetched_models[0], fetched_model_paths[0]
         else:
-            return model
+            return fetched_models[0]
         
 
     def to(self, device):
         for model in self.model:
             model.to(device)
-

@@ -24,6 +24,7 @@ usage() {
     echo "  -T, --use-real-temporal-indices   Use real temporal indices for RoPE instead of continuous indices (default: false)"
     echo "                                    When enabled, RoPE uses actual frame positions instead of [0,1,2,3...]"
     echo "  -P, --use-physical-index          Duplicate first-half temporal indices to second-half so tgt/cond do not share timestamps (default: false)"
+    echo "  -y, --pipeline-type TYPE          Pipeline type for training (recammaster or wan; default: recammaster)"
     echo "  -h, --help                         Show this help message"
     exit 1
 }
@@ -47,6 +48,7 @@ DATALOADER_DEFAULT=36
 USE_REAL_TEMPORAL_INDICES="false"
 USE_PHYSICAL_INDEX="false"
 SELECT_RANDOM_LATENTS="false"
+PIPELINE_TYPE="recammaster"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -117,6 +119,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --t-highfreq-ratio=*)
             T_HIGHFREQ_RATIO="${1#*=}"
+            shift
+            ;;
+        -y|--pipeline-type)
+            PIPELINE_TYPE="$2"
+            shift 2
+            ;;
+        --pipeline-type=*)
+            PIPELINE_TYPE="${1#*=}"
             shift
             ;;
         -F|--frame-downsample-to)
@@ -209,6 +219,11 @@ else
     DEBUG_BOOL=false
 fi
 
+# Wan pipeline does not support camera layer injection
+if [[ "${PIPELINE_TYPE}" != "recammaster" ]]; then
+    ENABLE_CAM_LAYERS=""
+fi
+
 # Build log file and redirect all outputs
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/logs"
@@ -244,6 +259,7 @@ cat <<CONFIG_EOF
   "dataset_path": "$DATASET_PATH",
   "metadata_path": "$METADATA_PATH",
   "global_seed": $GLOBAL_SEED,
+  "pipeline_type": "$PIPELINE_TYPE",
   "t_highfreq_ratio": $T_HIGHFREQ_RATIO,
   "batch_size": $BATCH_SIZE,
   "frame_downsample_to": $FRAME_DOWNSAMPLE_TO,
@@ -293,4 +309,5 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u -m src
  $([ "$USE_REAL_TEMPORAL_INDICES" = "true" ] && echo "--use_real_temporal_indices") \
  $([ "$USE_PHYSICAL_INDEX" = "true" ] && echo "--use_physical_index") \
  $([ "$SELECT_RANDOM_LATENTS" = "true" ] && echo "--select_random_latents") \
+ --pipeline_type "$PIPELINE_TYPE" \
  $DEBUG_FLAG \
