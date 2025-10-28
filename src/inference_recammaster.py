@@ -306,10 +306,10 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             original_trans_list.append(torch.from_numpy(orig_trans))
 
             # 归一化仅用于模型 w2c 的输入，不影响 original translation
-            cond_joint, tgt_joint = self._normalize_joint_translation(cond_rel_c2w, tgt_rel_c2w)
+            cond_joint, tgt_joint = self._normalize_joint_translation(tgt_rel_c2w, tgt_rel_c2w)
             cond_rel_w2c = self._c2w_to_w2c(cond_joint)
             tgt_rel_w2c = self._c2w_to_w2c(tgt_joint)
-            all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0).astype(np.float32)
+            all_w2c = np.concatenate([tgt_rel_w2c, tgt_rel_w2c], axis=0).astype(np.float32)
             pose_embedding = torch.from_numpy(all_w2c).to(torch.bfloat16)
             camera_list.append(pose_embedding)
         
@@ -512,8 +512,8 @@ if __name__ == '__main__':
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
-            # if cam_type_id < 5:
-            #     continue
+            if cam_type_id < 5:
+                continue
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
