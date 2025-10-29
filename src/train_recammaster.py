@@ -22,6 +22,7 @@ from PIL import Image
 import numpy as np
 import random
 import json
+from einops import rearrange
 import torch.nn as nn
 import torch.nn.functional as F
 import shutil
@@ -579,7 +580,6 @@ class LightningModelForTrain(pl.LightningModule):
             target_latents.shape,
             seed=val_seed,
             device=self.device,
-            dtype=torch.float32
         ).to(dtype=self.pipe.torch_dtype, device=self.device)
 
         # Use multi-step scheduler
@@ -1203,6 +1203,7 @@ def train(args):
         seed=args.global_seed,
         dataset_root=args.dataset_path,
         image_size=(args.width, args.height),
+        pipeline_type=args.pipeline_type,
     )
 
     def worker_init_fn(worker_id):

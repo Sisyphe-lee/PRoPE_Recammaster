@@ -4,7 +4,7 @@ set -euo pipefail
 : "${CUDA_VISIBLE_DEVICES:=0,1}"
 
 DATASET_PATH=${1:-/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f24_aperture5}
-METADATA_PATH="/data1/lcy/projects/ReCamMaster/metadata/metadata_f24_aperture5.csv"
+METADATA_PATH=${2:-/data1/lcy/projects/ReCamMaster/metadata/metadata_f24_aperture5.csv}
 
 PIPELINE_TYPE=${PIPELINE_TYPE:-recammaster}
 

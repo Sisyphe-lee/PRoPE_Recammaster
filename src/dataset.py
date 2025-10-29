@@ -68,18 +68,47 @@ def compute_intrinsics_for_dataset(
     )
 
 
-def resolve_tensor_path(video_path: str, dataset_root: Optional[str] = None) -> str:
-    """
-    Resolve absolute tensor path from a video path and optional dataset root.
-    """
+def resolve_tensor_path(
+    video_path: str,
+    dataset_root: Optional[str] = None,
+    pipeline_type: Optional[str] = None,
+) -> str:
+    """Resolve absolute tensor path from a video path and optional dataset root."""
+
     candidate = video_path
     if not os.path.isabs(candidate):
         if dataset_root is not None:
             candidate = os.path.join(dataset_root, candidate.lstrip("/"))
         candidate = os.path.abspath(candidate)
-    tensor_path = candidate + ".tensors.pth"
-    if os.path.exists(tensor_path):
-        return tensor_path
+
+    # Determine suffix search order based on pipeline hints
+    suffixes = []
+    env_pipeline = os.environ.get("PIPELINE_TYPE", "").strip().lower()
+    pipe = (pipeline_type or env_pipeline).strip().lower()
+
+    if pipe:
+        if pipe == "wan":
+            suffixes.append(".wan22.tensors.pth")
+        elif pipe == "recammaster":
+            suffixes.append(".tensors.pth")
+        else:
+            suffixes.append(f".{pipe}.tensors.pth")
+    else:
+        suffixes.extend([".tensors.pth", ".wan22.tensors.pth"])
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered_suffixes = []
+    for s in suffixes:
+        if s not in seen:
+            ordered_suffixes.append(s)
+            seen.add(s)
+
+    for suffix in ordered_suffixes:
+        tensor_path = candidate + suffix
+        if os.path.exists(tensor_path):
+            return tensor_path
+
     return ""
 
 
@@ -570,6 +599,7 @@ def create_datasets(
     dataset_root: Optional[str] = None,
     image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
     sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
+    pipeline_type: Optional[str] = None,
 ):
     """
     Create training and validation datasets
@@ -596,7 +626,7 @@ def create_datasets(
     all_paths = []
     missing = []
     for p in metadata["video_absolute_path"]:
-        tp = resolve_tensor_path(p, dataset_root=dataset_root)
+        tp = resolve_tensor_path(p, dataset_root=dataset_root, pipeline_type=pipeline_type)
         if tp and os.path.exists(tp):
             all_paths.append(tp)
         else:

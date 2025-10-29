@@ -633,7 +633,12 @@ def parse_args():
 def resolve_tensor_suffix(args):
     if args.tensor_suffix:
         return args.tensor_suffix
-    return ".tensors.pth" if args.pipeline_type == "recammaster" else f".{args.pipeline_type}.tensors.pth"
+    if args.pipeline_type == "recammaster":
+        return ".tensors.pth"
+    elif args.pipeline_type == "wan":
+        return ".wan22.tensors.pth"
+    else:
+        return f".{args.pipeline_type}.tensors.pth"
 
 def data_process(args):
     metadata_path = args.metadata_path
