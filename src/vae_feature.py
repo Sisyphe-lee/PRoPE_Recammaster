@@ -14,7 +14,7 @@ THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
 if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
     sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
 
-from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
+from diffsynth import WanVideoReCamMasterPipeline, WanVideoPipeline, ModelManager, load_state_dict
 import torchvision
 from PIL import Image
 import numpy as np
@@ -138,14 +138,43 @@ class TextVideoDataset(torch.utils.data.Dataset):
 
 
 class LightningModelForDataProcess(pl.LightningModule):
-    def __init__(self, text_encoder_path, vae_path, image_encoder_path=None, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+    def __init__(
+        self,
+        text_encoder_path,
+        vae_path,
+        image_encoder_path=None,
+        tiled=False,
+        tile_size=(34, 34),
+        tile_stride=(18, 16),
+        pipeline_type="recammaster",
+        tensor_suffix=".tensors.pth",
+    ):
         super().__init__()
-        model_path = [text_encoder_path, vae_path]
+        self.tensor_suffix = tensor_suffix
+        self.pipeline_type = pipeline_type
+
+        if text_encoder_path is None:
+            raise ValueError("text_encoder_path must be provided for latent extraction.")
+        if vae_path is None:
+            raise ValueError("vae_path must be provided for latent extraction.")
+
+        model_path = []
+        if text_encoder_path is not None:
+            model_path.append(text_encoder_path)
+        if vae_path is not None:
+            model_path.append(vae_path)
         if image_encoder_path is not None:
             model_path.append(image_encoder_path)
+        if len(model_path) == 0:
+            raise ValueError("At least VAE path must be provided for latent extraction.")
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         model_manager.load_models(model_path)
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        if pipeline_type == "recammaster":
+            self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        elif pipeline_type == "wan":
+            self.pipe = WanVideoPipeline.from_model_manager(model_manager)
+        else:
+            raise ValueError(f"Unsupported pipeline_type: {pipeline_type}")
 
         self.tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
         
@@ -154,13 +183,19 @@ class LightningModelForDataProcess(pl.LightningModule):
         
         self.pipe.device = self.device
         if video is not None:
-            pth_path = path + ".tensors.pth"
+            pth_path = path + self.tensor_suffix
             if not os.path.exists(pth_path):
                 # prompt
                 prompt_emb = self.pipe.encode_prompt(text)
                 # video
                 video = video.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-                latents = self.pipe.encode_video(video, **self.tiler_kwargs)[0]
+                latents_encoded = self.pipe.encode_video(video, **self.tiler_kwargs)
+                if isinstance(latents_encoded, (list, tuple)):
+                    latents = latents_encoded[0]
+                else:
+                    latents = latents_encoded
+                if latents.dim() == 5:
+                    latents = latents[0]
                 # image
                 if "first_frame" in batch:
                     first_frame = Image.fromarray(batch["first_frame"][0].cpu().numpy())
@@ -182,15 +217,17 @@ class Camera(object):
 
 
 class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, steps_per_epoch):
+    def __init__(self, base_path, metadata_path, steps_per_epoch, tensor_suffix=".tensors.pth"):
         metadata = pd.read_csv(metadata_path)
         raw_paths = metadata["video_absolute_path"].tolist()
         video_paths = [
             p if os.path.isabs(p) else os.path.join(base_path, p)
             for p in raw_paths
         ]
+        video_paths = sorted(video_paths)
         print(len(video_paths), "videos in metadata.")
-        tensor_paths = [f"{p}.tensors.pth" for p in video_paths if os.path.exists(f"{p}.tensors.pth")]
+        self.tensor_suffix = tensor_suffix
+        tensor_paths = [f"{p}{tensor_suffix}" for p in video_paths if os.path.exists(f"{p}{tensor_suffix}")]
         self.path = tensor_paths
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
@@ -422,6 +459,13 @@ def parse_args():
         help="The path of the Dataset.",
     )
     parser.add_argument(
+        "--pipeline_type",
+        type=str,
+        default="recammaster",
+        choices=["recammaster", "wan"],
+        help="Pipeline type used for latent extraction or training.",
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default="./",
@@ -444,6 +488,12 @@ def parse_args():
         type=str,
         default=None,
         help="Path of VAE.",
+    )
+    parser.add_argument(
+        "--tensor_suffix",
+        type=str,
+        default=None,
+        help="Suffix for cached latent tensors (e.g., .tensors.pth or .wan22.tensors.pth).",
     )
     parser.add_argument(
         "--dit_path",
@@ -580,6 +630,11 @@ def parse_args():
     return args
 
 
+def resolve_tensor_suffix(args):
+    if args.tensor_suffix:
+        return args.tensor_suffix
+    return ".tensors.pth" if args.pipeline_type == "recammaster" else f".{args.pipeline_type}.tensors.pth"
+
 def data_process(args):
     metadata_path = args.metadata_path
     if metadata_path is None:
@@ -594,6 +649,7 @@ def data_process(args):
         width=args.width,
         is_i2v=args.image_encoder_path is not None
     )
+    tensor_suffix = resolve_tensor_suffix(args)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=False,
@@ -607,6 +663,8 @@ def data_process(args):
         tiled=args.tiled,
         tile_size=(args.tile_size_height, args.tile_size_width),
         tile_stride=(args.tile_stride_height, args.tile_stride_width),
+        pipeline_type=args.pipeline_type,
+        tensor_suffix=tensor_suffix,
     )
     trainer = pl.Trainer(
         accelerator="gpu",
@@ -617,13 +675,17 @@ def data_process(args):
     
     
 def train(args):
+    if args.pipeline_type != "recammaster":
+        raise ValueError("Training mode currently supports only the recammaster pipeline.")
     metadata_path = args.metadata_path
     if metadata_path is None:
         metadata_path = os.path.join(args.dataset_path, args.metadata_file_name)
+    tensor_suffix = resolve_tensor_suffix(args)
     dataset = TensorDataset(
         args.dataset_path,
         metadata_path,
         steps_per_epoch=args.steps_per_epoch,
+        tensor_suffix=tensor_suffix,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
