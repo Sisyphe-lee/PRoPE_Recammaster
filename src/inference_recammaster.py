@@ -524,8 +524,8 @@ if __name__ == '__main__':
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
-            if cam_type_id < 5:
-                continue
+            # if cam_type_id < 5:
+            #     continue
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
@@ -539,7 +539,7 @@ if __name__ == '__main__':
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
                 frame_downsample_to=args.frame_downsample_to,
-                num_inference_steps=10,
+                num_inference_steps=20,
                 seed=0, tiled=True,
                 # original_camera_translation=orig_trans,
             )

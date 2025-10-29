@@ -15,6 +15,61 @@ from pytorch3d.renderer import PerspectiveCameras
 from pytorch3d.vis.plotly_vis import plot_scene
 
 
+def _normalize_c2w_matrix(mat: np.ndarray) -> np.ndarray:
+    """
+    Convert RayDiffusion-style camera extrinsics to the PyTorch3D convention.
+
+    The source data encodes c2w transforms with axes ordered as (Z, X, Y) and
+    translations in centimetres. We reorder axes to (X, Y, Z), flip the Y axis
+    to match the expected handedness, and convert translations to metres.
+    """
+    mat = np.asarray(mat, dtype=float)
+    if mat.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 matrix, got shape {mat.shape}")
+
+    converted = mat[:, [1, 2, 0, 3]].copy()
+    converted[:3, 1] *= -1.0
+    converted[:3, 3] /= 100.0
+    return converted
+
+
+def _recompute_T_from_positions(traj_entry: Dict[str, np.ndarray]) -> None:
+    R = traj_entry.get('R_p3d')
+    pos = traj_entry.get('pos')
+    if R is None or pos is None or R.size == 0 or pos.size == 0:
+        return
+    traj_entry['T_p3d'] = -np.einsum('nij,nj->ni', R, pos)
+
+
+def recompute_translations(trajectories: Dict) -> None:
+    for traj in trajectories.values():
+        _recompute_T_from_positions(traj)
+
+
+def apply_translation_offset(trajectories: Dict, offset: np.ndarray) -> None:
+    offset = np.asarray(offset, dtype=float)
+    if offset.shape != (3,):
+        raise ValueError(f"Expected offset shape (3,), got {offset.shape}")
+    if np.allclose(offset, 0.0):
+        return
+    for traj in trajectories.values():
+        pos = traj.get('pos')
+        if pos is None or pos.size == 0:
+            continue
+        traj['pos'] = pos - offset
+        _recompute_T_from_positions(traj)
+
+
+def anchor_trajectories_at_origin(trajectories: Dict) -> None:
+    for traj in trajectories.values():
+        pos = traj.get('pos')
+        if pos is None or pos.size == 0:
+            continue
+        start = pos[0]
+        traj['pos'] = pos - start
+        _recompute_T_from_positions(traj)
+
+
 def parse_transformation_matrix(matrix_str: str) -> np.ndarray:
     parts = matrix_str.strip().split('] ')
     cols = []
@@ -25,10 +80,7 @@ def parse_transformation_matrix(matrix_str: str) -> np.ndarray:
         values = [float(x) for x in chunk.split() if x]
         cols.append(values)
     mat = np.array(cols, dtype=float).T
-    mat = mat[:, [1, 2, 0, 3]].copy()
-    mat[:3, 1] *= -1.0
-    mat[:3, 3] /= 100.0
-    return mat
+    return _normalize_c2w_matrix(mat)
 
 
 def extract_camera_pose(c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -85,7 +137,7 @@ def _load_npz_trajectory(npz_file: str) -> Dict:
     trajectory = {'R_p3d': [], 'T_p3d': [], 'pos': [], 'Rcw': [], 'frames': []}
 
     for mat, frame_idx in zip(matrices, frame_indices):
-        c2w = np.asarray(mat, dtype=float)
+        c2w = _normalize_c2w_matrix(mat)
         R_p3d, T_p3d, pos, Rcw = extract_camera_pose(c2w)
         trajectory['R_p3d'].append(R_p3d)
         trajectory['T_p3d'].append(T_p3d)
@@ -152,8 +204,61 @@ def auto_scale_trajectories(
     scale = target_span / span
     for traj in trajectories.values():
         traj['pos'] *= scale
-        traj['T_p3d'] *= scale
+        _recompute_T_from_positions(traj)
     return scale
+
+
+def scale_trajectories(trajectories: Dict, scale: float) -> None:
+    if scale <= 0.0:
+        raise ValueError(f"Scale must be positive, got {scale}")
+    if np.isclose(scale, 1.0):
+        return
+    for traj in trajectories.values():
+        pos = traj.get('pos')
+        if pos is None or pos.size == 0:
+            continue
+        traj['pos'] = pos * scale
+        _recompute_T_from_positions(traj)
+
+
+def trajectory_span(trajectories: Dict) -> float:
+    positions = [d['pos'] for d in trajectories.values() if d['pos'].size > 0]
+    if not positions:
+        return 0.0
+    stacked = np.concatenate(positions, axis=0)
+    return float(np.max(np.max(stacked, axis=0) - np.min(stacked, axis=0)))
+
+
+def principal_axes(trajectories: Dict) -> np.ndarray:
+    positions = [d['pos'] for d in trajectories.values() if d['pos'].size > 0]
+    if not positions:
+        return np.eye(3)
+    stacked = np.concatenate(positions, axis=0)
+    if np.allclose(stacked, stacked[0]):
+        return np.eye(3)
+    cov = np.cov(stacked.T)
+    U, _, _ = np.linalg.svd(cov)
+    axes = U
+    if np.linalg.det(axes) < 0:
+        axes[:, -1] *= -1.0
+    return axes
+
+
+def rotate_trajectories(trajectories: Dict, rotation: np.ndarray) -> None:
+    rotation = np.asarray(rotation, dtype=float)
+    if rotation.shape != (3, 3):
+        raise ValueError(f"Expected rotation matrix of shape (3,3), got {rotation.shape}")
+    for traj in trajectories.values():
+        pos = traj.get('pos')
+        if pos is not None and pos.size > 0:
+            traj['pos'] = (rotation @ pos.T).T
+        Rcw = traj.get('Rcw')
+        if Rcw is not None and Rcw.size > 0:
+            traj['Rcw'] = rotation @ Rcw
+        Rp3d = traj.get('R_p3d')
+        if Rp3d is not None and Rp3d.size > 0:
+            traj['R_p3d'] = Rp3d @ rotation.T
+        _recompute_T_from_positions(traj)
 
 
 def add_origin_and_arcs(fig: go.Figure, radius: float = 5.0) -> None:
