@@ -18,3 +18,5 @@ exp/
 metadata.csv
 metadata_all.csv
 wandb/
+
+.venv/

@@ -2,10 +2,18 @@ import copy
 import os
 import re
 import torch, os, imageio, argparse
+import sys
+from pathlib import Path
 from torchvision.transforms import v2
 from einops import rearrange
 import lightning as pl
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
+if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
+    sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
+
 from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
 import torchvision
 from PIL import Image
