@@ -329,7 +329,7 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
             camera_list.append(pose_embedding)
         
         data['camera'] = camera_list
-        # data['original_camera_translation'] = original_trans_list
+
         return data
     
 
@@ -532,8 +532,7 @@ if __name__ == '__main__':
             cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
             if not os.path.exists(cam_output_dir):
                 os.makedirs(cam_output_dir) 
-            # Select corresponding original relative translations (target then cond), shape (F_total, 3)
-            # orig_trans = batch["original_camera_translation"][cam_type_id-1].to(device=pipe.device, dtype=torch.float32)
+
             pipe.eval()
             video = pipe(
                 prompt=target_text,
@@ -544,7 +543,7 @@ if __name__ == '__main__':
                 frame_downsample_to=args.frame_downsample_to,
                 num_inference_steps=20,
                 seed=0, tiled=True,
-                # original_camera_translation=orig_trans,
+
             )
             filename = cam_fname
             save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)

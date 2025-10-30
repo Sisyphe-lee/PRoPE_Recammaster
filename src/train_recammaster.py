@@ -9,6 +9,7 @@ from pathlib import Path
 from torchvision.transforms import v2
 import lightning as pl
 import pandas as pd
+import inspect
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
@@ -22,6 +23,7 @@ from PIL import Image
 import numpy as np
 import random
 import json
+from einops import rearrange
 import torch.nn as nn
 import torch.nn.functional as F
 import shutil
@@ -113,6 +115,7 @@ class LightningModelForTrain(pl.LightningModule):
         _ = self._get_denoising_model()
         self.train_timesteps = 1000
         self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
+        self._generate_noise_params = set(inspect.signature(self.pipe.generate_noise).parameters.keys())
 
         # Store parameters for later use
         self.ckpt_type = ckpt_type
@@ -390,10 +393,6 @@ class LightningModelForTrain(pl.LightningModule):
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
-        original_cam_t = batch.get("original_camera_translation")
-        if original_cam_t is not None:
-            original_cam_t = original_cam_t.to(self.device)
-
         # Optional external frame downsampling (two-halves: take base then base+per_half)
         temporal_indices = None
         if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0:
@@ -431,10 +430,6 @@ class LightningModelForTrain(pl.LightningModule):
                 cam_emb = cam_emb.index_select(1, index_full.to(cam_emb.device))
             if cam_intrinsics is not None and cam_intrinsics.dim() >= 2:
                 cam_intrinsics = cam_intrinsics.index_select(1, index_full.to(cam_intrinsics.device))
-            # sync original_cam_t (F_total, 3)
-            if original_cam_t is not None and original_cam_t.dim() == 2:
-                original_cam_t = original_cam_t.index_select(0, index_full.to(original_cam_t.device))
-            
             # 记录真实的时序索引
             temporal_indices = index_full
         
@@ -478,8 +473,7 @@ class LightningModelForTrain(pl.LightningModule):
             t_highfreq_ratio=self.t_highfreq_ratio,
             frame_downsample_to=self.frame_downsample_to,
             cam_intrinsics=cam_intrinsics,
-            temporal_indices=temporal_indices,
-            original_camera_translation=original_cam_t,
+            temporal_indices=temporal_indices
         )
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
@@ -519,9 +513,7 @@ class LightningModelForTrain(pl.LightningModule):
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
-        original_cam_t = batch.get("original_camera_translation")
-        if original_cam_t is not None:
-            original_cam_t = original_cam_t.to(self.device)
+
 
         self.pipe.device = self.device
 
@@ -575,12 +567,27 @@ class LightningModelForTrain(pl.LightningModule):
         
         # Deterministic seed per step/batch (use downsampled target shape)
         val_seed = self.global_seed + self.global_step + batch_idx
-        noise = self.pipe.generate_noise(
-            target_latents.shape,
-            seed=val_seed,
-            device=self.device,
-            dtype=torch.float32
-        ).to(dtype=self.pipe.torch_dtype, device=self.device)
+        if "dtype" in self._generate_noise_params:
+            noise = self.pipe.generate_noise(
+                target_latents.shape,
+                seed=val_seed,
+                device=self.device,
+                dtype=torch.float32,
+            )
+        else:
+            extra_kwargs = {}
+            if "rand_torch_dtype" in self._generate_noise_params:
+                extra_kwargs["rand_torch_dtype"] = torch.float32
+            if "device" in self._generate_noise_params:
+                extra_kwargs["device"] = self.device
+            if "torch_dtype" in self._generate_noise_params:
+                extra_kwargs["torch_dtype"] = self.pipe.torch_dtype
+            noise = self.pipe.generate_noise(
+                target_latents.shape,
+                seed=val_seed,
+                **extra_kwargs,
+            )
+        noise = noise.to(dtype=self.pipe.torch_dtype, device=self.device)
 
         # Use multi-step scheduler
         self.pipe.scheduler.set_timesteps(self.test_inference_steps, shift=self.pipe.scheduler.shift, denoising_strength=1.0)
@@ -1203,6 +1210,7 @@ def train(args):
         seed=args.global_seed,
         dataset_root=args.dataset_path,
         image_size=(args.width, args.height),
+        pipeline_type=args.pipeline_type,
     )
 
     def worker_init_fn(worker_id):

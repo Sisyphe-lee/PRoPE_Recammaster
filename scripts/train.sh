@@ -344,10 +344,10 @@ CMD=(
   --enable_test_step
   --test_samples 10
   --test_inference_steps 10
-  --val_size 36
+  --val_size 12
   --metadata_path "$METADATA_PATH"
   --wandb_name "$WANDB_NAME"
-  --val_check_interval_batches 200
+  --val_check_interval_batches 50
   --training_strategy deepspeed_stage_2
   --distributed_timeout_seconds 1800
   --t_highfreq_ratio "$T_HIGHFREQ_RATIO"

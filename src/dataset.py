@@ -68,18 +68,41 @@ def compute_intrinsics_for_dataset(
     )
 
 
-def resolve_tensor_path(video_path: str, dataset_root: Optional[str] = None) -> str:
+def resolve_tensor_path(
+    video_path: str,
+    dataset_root: Optional[str] = None,
+    tensor_suffixes: Optional[Tuple[str, ...]] = None,
+) -> str:
     """
     Resolve absolute tensor path from a video path and optional dataset root.
     """
+    tensor_suffixes = tensor_suffixes or (".tensors.pth",)
     candidate = video_path
     if not os.path.isabs(candidate):
         if dataset_root is not None:
             candidate = os.path.join(dataset_root, candidate.lstrip("/"))
         candidate = os.path.abspath(candidate)
-    tensor_path = candidate + ".tensors.pth"
-    if os.path.exists(tensor_path):
-        return tensor_path
+    possible_bases = [candidate]
+    root, ext = os.path.splitext(candidate)
+    if ext:
+        possible_bases.append(root)
+        second_root, second_ext = os.path.splitext(root)
+        if second_ext:
+            possible_bases.append(second_root)
+    seen = set()
+    ordered_bases = []
+    for base in possible_bases:
+        if base not in seen:
+            ordered_bases.append(base)
+            seen.add(base)
+    for base in ordered_bases:
+        for suffix in tensor_suffixes:
+            if base.endswith(suffix):
+                tensor_path = base
+            else:
+                tensor_path = base + suffix
+            if os.path.exists(tensor_path):
+                return tensor_path
     return ""
 
 
@@ -313,12 +336,6 @@ class TensorDataset(torch.utils.data.Dataset):
                 cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
                 tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
-                # Save original (pre-normalization) relative translations (tgt then cond) for distance RoPE
-                orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
-                orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
-                orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0)
-                data['original_camera_translation'] = torch.from_numpy(orig_trans).to(torch.float32)
-
                 # 2) Normalize translation with shared baseline
                 cond_rel_c2w, tgt_rel_c2w, _baseline = normalize_translation(cond_rel_c2w, tgt_rel_c2w)
 
@@ -528,12 +545,6 @@ class ValidationDataset(torch.utils.data.Dataset):
             cond_rel_c2w = compute_relative_c2w(cond_cam_params, ref_cam, self.get_relative_pose)
             tgt_rel_c2w = compute_relative_c2w(tgt_cam_params, ref_cam, self.get_relative_pose)
 
-            # Save original (pre-normalization) relative translations (tgt then cond) for distance RoPE
-            orig_tgt_t = tgt_rel_c2w[:, :3, 3].copy()
-            orig_cond_t = cond_rel_c2w[:, :3, 3].copy()
-            orig_trans = np.concatenate([orig_tgt_t, orig_cond_t], axis=0)
-            data['original_camera_translation'] = torch.from_numpy(orig_trans).to(torch.float32)
-
             # 2) Normalize translation with shared baseline
             cond_rel_c2w, tgt_rel_c2w, _baseline = normalize_translation(cond_rel_c2w, tgt_rel_c2w)
 
@@ -570,6 +581,7 @@ def create_datasets(
     dataset_root: Optional[str] = None,
     image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
     sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
+    pipeline_type: str = "recammaster",
 ):
     """
     Create training and validation datasets
@@ -582,10 +594,12 @@ def create_datasets(
         num_val_scenes: Number of scenes for ValidationDataset
         cameras_per_scene: Number of cameras per scene for ValidationDataset
         seed: Random seed for ValidationDataset
+        pipeline_type: Selects which latent tensors to load (recammaster=16ch, wan=48ch)
     
     Returns:
         train_dataset, val_dataset
     """
+    tensor_suffixes = (".wan22.tensors.pth",) if pipeline_type == "wan" else (".tensors.pth",)
     # Load metadata and get all tensor file paths
     metadata = pd.read_csv(metadata_path)
     if "video_absolute_path" not in metadata.columns:
@@ -596,7 +610,7 @@ def create_datasets(
     all_paths = []
     missing = []
     for p in metadata["video_absolute_path"]:
-        tp = resolve_tensor_path(p, dataset_root=dataset_root)
+        tp = resolve_tensor_path(p, dataset_root=dataset_root, tensor_suffixes=tensor_suffixes)
         if tp and os.path.exists(tp):
             all_paths.append(tp)
         else:
