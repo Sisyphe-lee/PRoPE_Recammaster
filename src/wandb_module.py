@@ -247,7 +247,7 @@ class WandBVideoLogger:
 class VideoDecoder:
     """Handles video decoding and processing for validation"""
     
-    def __init__(self, pipe):
+    def __init__(self, pipe, pipeline_type="v2v"):
         """
         Initialize video decoder
         
@@ -255,6 +255,7 @@ class VideoDecoder:
             pipe: The diffusion pipeline for video processing
         """
         self.pipe = pipe
+        self.pipeline_type = pipeline_type
     
     def decode_and_create_combined_video(
         self, 
@@ -264,7 +265,8 @@ class VideoDecoder:
         origin_latents, 
         timestep, 
         batch,
-        output_path=None
+        output_path=None,
+        condition_latents=None,
     ):
         """
         Decode video and create combined visualization
@@ -293,14 +295,27 @@ class VideoDecoder:
 
         # Prepare ground truth and condition latents
         gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
-        cond_original_sample = origin_latents[0:1, :, tgt_latent_len:, ...]
+        if condition_latents is not None:
+            cond_original_sample = condition_latents[0:1]
+        elif origin_latents.shape[2] > tgt_latent_len:
+            cond_original_sample = origin_latents[0:1, :, tgt_latent_len:, ...]
+        elif self.pipeline_type == "i2v":
+            cond_original_sample = origin_latents[0:1, :, :1, ...]
+        else:
+            cond_original_sample = None
 
         # 2. DECODE ALL THREE VIDEOS
         self.pipe.load_models_to_device(['vae'])
         
         pred_frames_tensor = self.pipe.decode_video(pred_original_sample.to(dtype=self.pipe.torch_dtype))[0]
         gt_frames_tensor = self.pipe.decode_video(gt_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        cond_frames_tensor = self.pipe.decode_video(cond_original_sample.to(dtype=self.pipe.torch_dtype))[0]
+        if cond_original_sample is not None:
+            cond_frames_tensor = self.pipe.decode_video(cond_original_sample.to(dtype=self.pipe.torch_dtype))[0]
+        else:
+            cond_frames_tensor = torch.zeros_like(gt_frames_tensor[:, :1, ...])
+        # Broadcast static conditioning frame for I2V
+        if cond_frames_tensor.shape[1] == 1 and gt_frames_tensor.shape[1] > 1:
+            cond_frames_tensor = cond_frames_tensor.repeat(1, gt_frames_tensor.shape[1], 1, 1)
         
         self.pipe.load_models_to_device([])
 

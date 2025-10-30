@@ -146,7 +146,7 @@ class LightningModelForDataProcess(pl.LightningModule):
         tiled=False,
         tile_size=(34, 34),
         tile_stride=(18, 16),
-        pipeline_type="recammaster",
+        pipeline_type="v2v",
         tensor_suffix=".tensors.pth",
     ):
         super().__init__()
@@ -169,9 +169,9 @@ class LightningModelForDataProcess(pl.LightningModule):
             raise ValueError("At least VAE path must be provided for latent extraction.")
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         model_manager.load_models(model_path)
-        if pipeline_type == "recammaster":
+        if pipeline_type == "v2v":
             self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
-        elif pipeline_type == "wan":
+        elif pipeline_type == "i2v":
             self.pipe = WanVideoPipeline.from_model_manager(model_manager)
         else:
             raise ValueError(f"Unsupported pipeline_type: {pipeline_type}")
@@ -461,8 +461,8 @@ def parse_args():
     parser.add_argument(
         "--pipeline_type",
         type=str,
-        default="recammaster",
-        choices=["recammaster", "wan"],
+        default="v2v",
+        choices=["v2v", "i2v"],
         help="Pipeline type used for latent extraction or training.",
     )
     parser.add_argument(
@@ -633,7 +633,7 @@ def parse_args():
 def resolve_tensor_suffix(args):
     if args.tensor_suffix:
         return args.tensor_suffix
-    return ".tensors.pth" if args.pipeline_type == "recammaster" else f".{args.pipeline_type}.tensors.pth"
+    return ".tensors.pth" if args.pipeline_type == "v2v" else f".{args.pipeline_type}.tensors.pth"
 
 def data_process(args):
     metadata_path = args.metadata_path
@@ -675,8 +675,8 @@ def data_process(args):
     
     
 def train(args):
-    if args.pipeline_type != "recammaster":
-        raise ValueError("Training mode currently supports only the recammaster pipeline.")
+    if args.pipeline_type != "v2v":
+        raise ValueError("Training mode currently supports only the v2v pipeline.")
     metadata_path = args.metadata_path
     if metadata_path is None:
         metadata_path = os.path.join(args.dataset_path, args.metadata_file_name)

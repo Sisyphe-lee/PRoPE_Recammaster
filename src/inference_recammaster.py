@@ -379,16 +379,11 @@ def parse_args():
         help="Temporal latent downsample count (0 表示不降采样)"
     )
     parser.add_argument(
-        "--ckpt_type",
+        "--pipeline_type",
         type=str,
-        default="recammaster",
-        choices=["wan21", "recammaster"],
-        help="Type of checkpoint to load: 'wan21' for original Wan2.1 model, 'recammaster' for ReCamMaster fine-tuned model"
-    )
-    parser.add_argument(
-        "--enable_cam_layers",
-        action="store_true",
-        help="Enable camera encoder and projector layers injection (only for ReCamMaster)"
+        default="v2v",
+        choices=["v2v", "i2v"],
+        help="Inference mode: 'v2v' (Wan2.1) or 'i2v' (Wan2.2)."
     )
     parser.add_argument(
         "--camera_extrinsics_filename",
@@ -423,80 +418,38 @@ if __name__ == '__main__':
     pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device="cuda")
 
     print(f"Loading checkpoint from: {args.ckpt_path}")
-    print(f"Checkpoint type: {args.ckpt_type}")
-    
-    if args.ckpt_type == "wan21":
-        # Support both safetensors and torch formats for Wan2.1 DiT checkpoints
-        state_dict = None
-        if str(args.ckpt_path).endswith(".safetensors"):
-            from safetensors.torch import load_file
-            state_dict = load_file(args.ckpt_path)
-        else:
-            # torch-based checkpoint
-            raw = torch.load(args.ckpt_path, map_location="cpu")
-            # Unwrap common containers
-            if False:
-                if isinstance(raw, dict) and 'state_dict' in raw:
-                    raw = raw['state_dict']
-                if isinstance(raw, dict) and 'module' in raw:
-                    raw = raw['module']
-                # Strip common prefixes
-                prefixes = ['module.', 'pipe.dit.', 'dit.']
-                state_dict = {}
-                for k, v in raw.items():
-                    kk = k
-                    for p in prefixes:
-                        if kk.startswith(p):
-                            kk = kk[len(p):]
-                            break
-                    # Filter out any camera-layer weights accidentally present
-                    if '.cam_encoder.' in kk or '.projector.' in kk:
-                        continue
-                    state_dict[kk] = v
-        print("Loading Wan2.1 DiT weights...")
-        pipe.dit.load_state_dict(raw, strict=True)
+    ckpt_type = "wan21" if args.pipeline_type == "v2v" else "wan22"
+    print(f"Checkpoint type: {ckpt_type}")
+
+    if args.pipeline_type != "v2v":
+        raise NotImplementedError("Only v2v inference is currently supported.")
+
+    if str(args.ckpt_path).endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(args.ckpt_path)
     else:
         state_dict = torch.load(args.ckpt_path, map_location="cpu")
-        if 'state_dict' in state_dict:
+        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
-        if "module" in state_dict:
-            state_dict = state_dict["module"]
-        prefixes_to_remove = ['model.', 'module.', 'pipe.dit.']
-        has_prefix = any(any(key.startswith(p) for p in prefixes_to_remove) for key in state_dict.keys())
-        if has_prefix:
-            print("Prefix detected in checkpoint keys. Attempting to strip them.")
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                for p in prefixes_to_remove:
-                    if k.startswith(p):
-                        k = k[len(p):]
-                        break
-                new_state_dict[k] = v
-            state_dict = new_state_dict
-            print("Prefixes stripped. Using the new state_dict.")
-        contains_cam_layers = any('.cam_encoder.' in k or '.projector.' in k for k in state_dict.keys())
-        if contains_cam_layers:
-            print("Checkpoint contains camera layers; registering modules before loading...")
-            dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-            for block in pipe.dit.blocks:
-                if not hasattr(block, 'cam_encoder'):
-                    block.cam_encoder = nn.Linear(12, dim)
-                if not hasattr(block, 'projector'):
-                    block.projector = nn.Linear(dim, dim, bias=True)
-                block.enable_cam_layers = True
-        pipe.dit.load_state_dict(state_dict, strict=True)
-        if args.enable_cam_layers and not contains_cam_layers:
-            print("Enabling camera layers (not present in checkpoint); registering with identity/zero init...")
-            dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-            for block in pipe.dit.blocks:
-                block.cam_encoder = nn.Linear(12, dim)
-                block.projector = nn.Linear(dim, dim)
-                with torch.no_grad():
-                    block.cam_encoder.weight.zero_()
-                    block.cam_encoder.bias.zero_()
-                    block.projector.weight.copy_(torch.eye(dim))
-                    block.projector.bias.zero_()
-                block.enable_cam_layers = True
+        if isinstance(state_dict, dict) and 'module' in state_dict:
+            state_dict = state_dict['module']
+
+    prefixes_to_remove = ['model.', 'module.', 'pipe.dit.', 'dit.']
+    cleaned_state = {}
+    for k, v in state_dict.items():
+        key = k
+        for p in prefixes_to_remove:
+            if key.startswith(p):
+                key = key[len(p):]
+                break
+        if '.cam_encoder.' in key or '.projector.' in key:
+            continue
+        cleaned_state[key] = v
+    if cleaned_state:
+        state_dict = cleaned_state
+
+    print(f"Loading {ckpt_type} DiT weights...")
+    pipe.dit.load_state_dict(state_dict, strict=True)
     
     pipe.to("cuda")
     pipe.to(dtype=torch.bfloat16)

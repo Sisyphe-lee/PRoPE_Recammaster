@@ -335,7 +335,7 @@ class  PRoPE_SelfAttention(nn.Module):
             num_heads=self.num_heads,
             head_fraction=mask_first_head_fraction,
             t_highfreq_ratio=t_highfreq_ratio,
-            original_trans=kwargs.get("original_camera_translation", None),
+            
         )
         
         # Apply PRoPE transforms
@@ -402,12 +402,11 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, enable_cam_layers: bool = False):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
-        self.enable_cam_layers = enable_cam_layers
 
 
         self.self_attn = PRoPE_SelfAttention(dim, num_heads, eps)
@@ -463,10 +462,7 @@ class DiTBlock(nn.Module):
             attn_out = self.self_attn(
                 input_x, freqs, cam_emb, Ks,
                 t_highfreq_ratio=t_highfreq_ratio,
-                original_camera_translation=_kwargs.get("original_camera_translation", None),
             )
-            if self.enable_cam_layers:
-                attn_out = self.projector(attn_out)
             x = self.gate(x, gate_msa, attn_out)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -556,7 +552,6 @@ class WanModel(torch.nn.Module):
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
-        enable_cam_layers: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -584,7 +579,7 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)  # Always start with False, will be set dynamically
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)

@@ -8,30 +8,28 @@ MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
 OUTPUT_DIR="./results"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 FRAME_DOWNSAMPLE_TO="${FRAME_DOWNSAMPLE_TO:-5}"
+PIPELINE_TYPE="${PIPELINE_TYPE:-v2v}"
 # Set the path to the checkpoint you want to use for inference
 # For Wan2.1 original model:
 WAN21_CHECKPOINT_PATH="./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
-# For ReCamMaster fine-tuned model:
-
+# For Wan2.2 original model:
+WAN22_CHECKPOINT_PATH="./models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model.safetensors"
 WAN21_RESUME_CHECKPOINT_PATH="/data1/lcy/projects/ReCamMaster/wandb/10-16-160559_Exp07j/checkpoints/step1100.ckpt"
-# Choose checkpoint type: "wan21" for original Wan2.1 model, "recammaster" for ReCamMaster fine-tuned model
-CHECKPOINT_TYPE="wan21"  # Change to "wan21" if you want to use Wan2.1 model
-
-# Set checkpoint path based on type
-if [ "$CHECKPOINT_TYPE" = "wan21" ]; then
-    CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
-    ENABLE_CAM_LAYERS=""
+if [ "$PIPELINE_TYPE" = "i2v" ]; then
+    CHECKPOINT_PATH="$WAN22_CHECKPOINT_PATH"
 else
-    CHECKPOINT_PATH="$RECAMMASTER_CHECKPOINT_PATH"
-    ENABLE_CAM_LAYERS=""
+    if [ -n "$WAN21_RESUME_CHECKPOINT_PATH" ]; then
+        CHECKPOINT_PATH="$WAN21_RESUME_CHECKPOINT_PATH"
+    else
+        CHECKPOINT_PATH="$WAN21_CHECKPOINT_PATH"
+    fi
 fi
 
 PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
     "$PYTHON_BIN" src/inference_recammaster.py \
     --dataset_path "example_test_data" \
     --ckpt_path "$CHECKPOINT_PATH" \
-    --ckpt_type "$CHECKPOINT_TYPE" \
-    $ENABLE_CAM_LAYERS \
+    --pipeline_type "$PIPELINE_TYPE" \
     --output_dir "$OUTPUT_DIR" \
     --cfg_scale 1.0 \
     --frame_downsample_to 0 \

@@ -1,4 +1,12 @@
 # Change Log
+## v0.2.13 @codex - 2025-10-30
+
+### 变更
+- 训练入口重构：将 `LightningModelForTrain` 独立到 `src/lightning_trainer.py`，`src/train_recammaster.py` 专注于 CLI 解析与调度，便于后续复用。
+- I2V 条件逻辑：在训练/验证阶段固定首帧作为图像条件，不参与加噪与损失，采样循环每步都会写回真实首帧，保持与 Wan2.2 官方策略一致。
+- 训练脚本：`scripts/train.sh` 新增 `-v/--val-size` 与 `-i/--val-check-interval-batches` 短选项，默认值仍为 `12/50`，方便在实验脚本中覆写。
+- 重构代码，去除冗余逻辑
+
 ## v0.2.12 @codex - 2025-10-28
 ### 变更
 - 数据集：`src/inference_recammaster.py` 在 cond 与 tgt 轨迹计算相对位姿前，引入 `_center_trajectory` 将平移起点统一移至原点，确保两条轨迹共享参考帧并降低
@@ -43,10 +51,7 @@
 ## v0.2.9 @lcy - 2025-10-22
 
 ### 新增
-- 训练采样策略：新增按半段“端点固定 + 中间随机”抽帧的开关。
-  - CLI：`src/train_recammaster.py` 增加 `-u/--select_random_latents`（默认关闭）。
-  - 脚本：`scripts/train.sh` 增加 `-u, --select-random-latents`，并在生成的训练配置与最终 python 启动命令中透传。
-  - 训练：当启用时，每半段保留首/尾帧，其余位置在可选集合内按全局种子和 step/batch 构造的确定性随机顺序选择，保证可复现。
+- 训练采样策略：默认按半段均匀抽帧，取消历史的随机抽帧开关，逻辑简化为固定的等间隔采样。
 
 ### 变更
 - 相机归一化策略：由“最大范数归一化（max-norm）”改为“基线归一化（baseline）”，仍然保留以前的函数。
@@ -56,12 +61,15 @@
   - `src/dataset.py` 的 `intrinsics` 与 `camera(w2c)` 从 bfloat16 改为 float32，训练/验证一致。
 - 路径解析鲁棒性：数据集路径分割从 `re.split(r",", path)` 改为 `re.split(r"/+", path)`，兼容重复分隔符。
 - 文案：相关注释与帮助信息同步更新（如“轴向归一化，去固定缩放”等）。
+- 精简训练开关：移除 `--enable_cam_layers`、`--enable_test_step` 及计时回调 `ConciseTimingCallback`，脚本与入口保持默认最小化配置。
+- CLI：将 `--pipeline_type` 映射为 `v2v/i2v`，移除 `--ckpt_type`，训练/推理均自动根据管线加载 Wan2.1 或 Wan2.2 原始权重。
+- 训练/推理 CLI 改用 `v2v/i2v` 管线枚举，并限定 `ckpt_type` 为 `wan21/wan22`；脚本默认加载 Wan 原始模型，不再依赖 ReCamMaster 微调权重。
 
 ### 修复
 - 在极小平移场景下，归一化基线可能退化为 0 的问题：增加 epsilon 与中位数回退，避免数值发散。
 
 ### 影响范围与兼容性
-- 默认行为保持“均匀抽帧”，仅在显式传入 `--select_random_latents` 时启用随机抽帧。
+- 训练抽帧策略现固定为均匀抽帧，移除随机抽帧相关参数配置，避免多余分支。
 - 相机归一化策略的更改会影响训练与验证中的相机尺度，数值更稳定但与旧版本结果不可完全对齐（非 API 破坏性；建议在同一策略下对比）。
 
 ## v0.2.8 @yyb - 2025-10-22

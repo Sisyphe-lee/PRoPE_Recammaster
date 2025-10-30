@@ -20,3 +20,11 @@
 1. 修改已用的trainer：LightningModelForTrain。通过-y来适配不同的训练模式。请你补充选择i2v时training和validation的逻辑。
 2. 这种情况下我们需要对整段video的latents做加噪去噪，计算loss
 3. 在log video时，condition video表示为一张静态图片，可以把广播到对应帧数
+
+### 说明补充
+1. **wan2.2 的 condition 机制**：I2V 模式下条件输入不再是整段条件视频潜变量，而是源图像（或其 VAE 潜变量）作为首帧，后续帧由模型在去噪过程中生成。DiffSynth 的 `WanVideoPipeline.encode_image` 会生成 `clip_feature` 与 `y` 两类嵌入：`clip_feature` 来自图像编码器的语义向量，`y` 则由 VAE 对首尾帧编码并拼接掩膜，用于向扩散模型注入固定的首帧潜变量。在推理或训练时，调度器会始终保持首帧潜变量不被加噪，其他帧则依据噪声预测逐步还原。
+
+2. **已完成的代码修改**：
+   - 在 `src/dataset.py` 新增 `ImageConditionTensorDataset` 与 `ImageConditionValidationDataset`，并在 `create_datasets` 中根据 `-y i2v` 自动使用新的 I2V 数据集逻辑。数据集中仅读取单段视频潜变量，将第一帧视作条件，整段序列为 target，同时重用首帧作为相机轨迹的归一化参考。
+   - 更新 `LightningModelForTrain`（`src/train_recammaster.py`），通过 `pipeline_type` 区分 v2v 与 i2v：i2v 模式对整段潜变量加噪并计算 loss，验证阶段迭代时仅需 target 序列，无需额外拼接条件段；同时在 WandB/本地日志中将静态条件帧广播到视频帧数。
+   - `VideoDecoder`（`src/wandb_module.py`）接收 `pipeline_type` 与可选 `condition_latents`，在 I2V 场景下会将首帧潜变量解码为静态图片并在可视化时广播，保证视频展示结构稳定。

@@ -6,9 +6,9 @@ set -euo pipefail
 DATASET_PATH=${1:-/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f24_aperture5}
 METADATA_PATH="/data1/lcy/projects/ReCamMaster/metadata/metadata_f24_aperture5.csv"
 
-PIPELINE_TYPE=${PIPELINE_TYPE:-recammaster}
+PIPELINE_TYPE=${PIPELINE_TYPE:-v2v}
 
-if [[ "$PIPELINE_TYPE" == "wan" ]]; then
+if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
   MODEL_BASE_PATH=${MODEL_BASE_PATH:-models/Wan-AI/Wan2.2-TI2V-5B}
   DEFAULT_TEXT_ENCODER_PATH="$MODEL_BASE_PATH/models_t5_umt5-xxl-enc-bf16.pth"
   DEFAULT_VAE_PATH="$MODEL_BASE_PATH/Wan2.2_VAE.pth"

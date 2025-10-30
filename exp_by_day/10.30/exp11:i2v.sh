@@ -1,1 +1,1 @@
-bash ./scripts/train.sh -F 5 -T -b 1 -c "2,3,4,5,6,7" -g 42 -w Exp11a -y wan
+bash ./scripts/train.sh   -b 8 -c "2,3,4,5,6,7" -g 42 -w Exp11a -y i2v -v 12 -i 50

@@ -247,7 +247,6 @@ def _prepare_apply_fns(
     num_heads: Optional[int] = None,
     head_fraction: float = 0.0,  # e.g., 0.25 means first quarter heads
     t_highfreq_ratio: float = 0.0,  # reused as w-lowfreq ratio for distance RoPE
-    original_trans: Optional[torch.Tensor] = None,  # (batch, cameras, 3)
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
@@ -368,70 +367,7 @@ def _prepare_apply_fns(
         )
         return feats
 
-    def _apply_distance_rope(feats: torch.Tensor) -> torch.Tensor:
-        """Apply distance-based rotary on w-dim low-frequency real channels (2-ch pairs).
-        feats: (B,H,S,D)
-        """
-        if num_pairs_w == 0 or head_indices is None:
-            return feats
-        (B, H, S, D) = feats.shape
-        if (w_real_end - w_real_start) == 0:
-            return feats
-        # Determine cameras and patches
-        # Camera translations (original scale preferred), shape (B,C,3)
-        if original_trans is not None:
-            p = original_trans.to(device=device, dtype=feats.dtype)
-        else:
-            # use c2w translation from P_inv
-            p = P_inv[..., :3, 3].to(dtype=feats.dtype)
-        # fixed scaling by 1/100 
-        p = p / 100.0
-        # Align provided translations to cameras dimension from viewmats
-        # Ensure p shape is (B, cameras, 3)
-        if p.dim() == 2:
-            p = p.unsqueeze(0)
-        if p.shape[1] != cameras:
-            if p.shape[1] > cameras:
-                p = p[:, :cameras, :]
-            else:
-                raise RuntimeError(f"original_trans cams ({p.shape[1]}) != viewmats cams ({cameras})")
-        C = cameras
-        assert S % C == 0, f"S={S} not divisible by C={C}"
-        P = S // C
-        # Determine number of rotation pairs from span length to avoid mismatch
-        Kpairs = max(0, (w_real_end - w_real_start) // 2)
-        if Kpairs == 0:
-            return feats
-        # Prepare frequency magnitudes s_k with base=10000 for Kpairs
-        k_idx = torch.arange(Kpairs, device=device, dtype=torch.float32)
-        # s_k = 10000^(-k/Kpairs)
-        s_k = torch.pow(torch.tensor(10000.0, device=device, dtype=torch.float32), -k_idx / float(Kpairs))
-        s_k = s_k.to(feats.dtype)
-        # omega_k = s_k * u_k
-        U = U_const[:Kpairs, :].to(dtype=feats.dtype)
-        omega = U * s_k.reshape(-1, 1)
-        # theta[b,c,k] = dot(p[b,c], omega[k])
-        theta = torch.einsum('bcj,kj->bck', p, omega)  # (B,C,Kpairs)
-        cos_t = torch.cos(theta).unsqueeze(-1)  # (B,C,Kpairs,1)
-        sin_t = torch.sin(theta).unsqueeze(-1)  # (B,C,Kpairs,1)
-        # Reshape feats to (B,H,C,P,D)
-        x = feats.reshape(B, H, C, P, D)
-        sel = x[:, head_indices, :, :, w_real_start:w_real_end]
-        # Pairwise rotation along last dim (size = 2*Kpairs)
-        x1 = sel[..., 0::2]
-        x2 = sel[..., 1::2]
-        # Broadcast theta over heads and patches
-        cos_b = cos_t.reshape(B, 1, C, 1, Kpairs, 1)
-        sin_b = sin_t.reshape(B, 1, C, 1, Kpairs, 1)
-        x1r = x1.reshape(B, -1, C, P, Kpairs, 1)
-        x2r = x2.reshape(B, -1, C, P, Kpairs, 1)
-        rot1 = x1r * cos_b - x2r * sin_b
-        rot2 = x1r * sin_b + x2r * cos_b
-        sel_rot = torch.empty_like(sel)
-        sel_rot[..., 0::2] = rot1.reshape_as(x1)
-        sel_rot[..., 1::2] = rot2.reshape_as(x2)
-        x[:, head_indices, :, :, w_real_start:w_real_end] = sel_rot
-        return x.reshape(B, H, S, D)
+    
 
     def apply_fn_q(feats: torch.Tensor) -> torch.Tensor:
         # feats = _apply_distance_rope(feats)
