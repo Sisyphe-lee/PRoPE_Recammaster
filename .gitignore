@@ -12,8 +12,11 @@ results/
 result/
 example_test_data/
 .vscode/
+eval_data/
+eval_data2/
 exp/
 metadata.csv
 metadata_all.csv
 wandb/
 .venv/
+clean_empty_experiments.py
