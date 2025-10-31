@@ -6,8 +6,9 @@ compression, and upload management, separated from the core training logic.
 """
 
 import os
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
 import imageio
 from PIL import Image
 import wandb
@@ -258,112 +259,106 @@ class VideoDecoder:
         self.pipeline_type = pipeline_type
     
     def decode_and_create_combined_video(
-        self, 
-        noise_pred, 
-        noisy_latents, 
-        tgt_latent_len, 
-        origin_latents, 
-        timestep, 
+        self,
+        pred_latents,
+        gt_target_latents,
+        condition_latents,
         batch,
-        output_path=None,
-        condition_latents=None,
     ):
         """
-        Decode video and create combined visualization
+        根据预测与参考潜变量解码视频，并拼接成 2×2 可视化网格。
         
         Args:
-            noise_pred: Predicted noise from the model
-            noisy_latents: Noisy latent representations
-            tgt_latent_len: Length of target latent
-            origin_latents: Original latent representations
-            timestep: Current timestep
-            batch: Batch data containing metadata
-            output_path: Path to save the combined video (optional)
-            
-        Returns:
-            Tuple of (psnr_value, combined_frames, metadata)
+            pred_latents: 模型输出的目标潜变量 (B, C, T, H, W)
+            gt_target_latents: GT 目标潜变量 (B, C, T, H, W)
+            condition_latents: 条件潜变量，V2V 时为视频半段，I2V 时可为空
+            batch: 当前 batch，包含元数据
         """
-        # 1. PREPARE PREDICTED AND GT LATENTS
-        noise_pred_sample = noise_pred[0:1, :, :tgt_latent_len, ...]
-        noisy_latents_sample = noisy_latents[0:1, :, :tgt_latent_len, ...]
+        # 仅展示第一个样本，保持与 WandB 视频策略一致
+        pred_sample = pred_latents[0:1]
+        gt_sample = gt_target_latents[0:1]
+        cond_latents_resolved = self._resolve_condition_latents(gt_target_latents, condition_latents)
+        cond_sample = cond_latents_resolved[0:1] if cond_latents_resolved is not None else None
 
-        # For FlowMatch, project to the final (sigma=0) in one step using scheduler
-        # This aligns validation restoration with the pipeline's inference update rule
-        pred_original_sample = self.pipe.scheduler.step(
-            noise_pred_sample, timestep, noisy_latents_sample, to_final=True
-        )
-
-        # Prepare ground truth and condition latents
-        gt_original_sample = origin_latents[0:1, :, :tgt_latent_len, ...]
-        if condition_latents is not None:
-            cond_original_sample = condition_latents[0:1]
-        elif origin_latents.shape[2] > tgt_latent_len:
-            cond_original_sample = origin_latents[0:1, :, tgt_latent_len:, ...]
-        elif self.pipeline_type == "i2v":
-            cond_original_sample = origin_latents[0:1, :, :1, ...]
-        else:
-            cond_original_sample = None
-
-        # 2. DECODE ALL THREE VIDEOS
-        self.pipe.load_models_to_device(['vae'])
-        
-        pred_frames_tensor = self.pipe.decode_video(pred_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        gt_frames_tensor = self.pipe.decode_video(gt_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        if cond_original_sample is not None:
-            cond_frames_tensor = self.pipe.decode_video(cond_original_sample.to(dtype=self.pipe.torch_dtype))[0]
-        else:
-            cond_frames_tensor = torch.zeros_like(gt_frames_tensor[:, :1, ...])
-        # Broadcast static conditioning frame for I2V
-        if cond_frames_tensor.shape[1] == 1 and gt_frames_tensor.shape[1] > 1:
-            cond_frames_tensor = cond_frames_tensor.repeat(1, gt_frames_tensor.shape[1], 1, 1)
-        
+        # 解码潜变量到像素空间
+        self.pipe.load_models_to_device(["vae"])
+        pred_frames = self._decode_latents(pred_sample)
+        gt_frames = self._decode_latents(gt_sample)
+        cond_frames = self._decode_condition_frames(cond_sample, gt_frames)
         self.pipe.load_models_to_device([])
 
-        # 3. CALCULATE PSNR
-        pred_frames_norm = (pred_frames_tensor.clamp(-1, 1) + 1) / 2
-        gt_frames_norm = (gt_frames_tensor.clamp(-1, 1) + 1) / 2
-        
-        mse = torch.nn.functional.mse_loss(pred_frames_norm, gt_frames_norm)
-        psnr_value = 100.0 if mse == 0 else 20 * torch.log10(1.0 / torch.sqrt(mse))
+        # 计算 PSNR，并生成误差可视化
+        psnr_value = self._compute_psnr(pred_frames, gt_frames)
+        error_frames = self._create_heatmap_error_frames(torch.abs(gt_frames - pred_frames))
 
-        # 4. CALCULATE ERROR MAP WITH HEATMAP VISUALIZATION
-        error_frames_tensor = torch.abs(gt_frames_tensor - pred_frames_tensor)
-        
-        # Create heatmap error visualization
-        error_video_frames = self._create_heatmap_error_frames(error_frames_tensor)
+        # 拼接四宫格视频
+        combined_frames = self._combine_frames(cond_frames, gt_frames, pred_frames, error_frames)
+        metadata = self._extract_metadata(batch)
 
-        # 5. CREATE COMBINED VIDEO (2x2 layout)
-        pred_video_frames = self.pipe.tensor2video(pred_frames_tensor)
-        gt_video_frames = self.pipe.tensor2video(gt_frames_tensor)
-        cond_video_frames = self.pipe.tensor2video(cond_frames_tensor)
-        
-        combined_frames = []
-        for i in range(len(pred_video_frames)):
-            # Create 2x2 grid: [condition, gt]
-            #                  [pred, error_map]
-            top_row = np.concatenate([cond_video_frames[i], gt_video_frames[i]], axis=1)
-            bottom_row = np.concatenate([pred_video_frames[i], error_video_frames[i]], axis=1)
-            combined_frame = np.concatenate([top_row, bottom_row], axis=0)
-            combined_frames.append(combined_frame)
-        
-        # 6. EXTRACT METADATA
+        return psnr_value, combined_frames, metadata
+
+    def _resolve_condition_latents(self, gt_target_latents, provided_condition):
+        if provided_condition is not None:
+            return provided_condition
+        if self.pipeline_type == "i2v":
+            return gt_target_latents[:, :, :1, ...]
+        return None
+
+    def _decode_latents(self, latents):
+        latents = latents.to(dtype=self.pipe.torch_dtype)
+        return self.pipe.decode_video(latents)[0]
+
+    def _decode_condition_frames(self, cond_sample, gt_frames):
+        if cond_sample is None:
+            return torch.zeros_like(gt_frames[:, :1, ...])
+        cond_frames = self._decode_latents(cond_sample)
+        if cond_frames.shape[1] == 1 and gt_frames.shape[1] > 1:
+            cond_frames = cond_frames.repeat(1, gt_frames.shape[1], 1, 1)
+        return cond_frames
+
+    def _compute_psnr(self, pred_frames, gt_frames):
+        pred_norm = (pred_frames.clamp(-1, 1) + 1) / 2
+        gt_norm = (gt_frames.clamp(-1, 1) + 1) / 2
+        mse = F.mse_loss(pred_norm, gt_norm)
+        mse_value = float(mse.item())
+        if mse_value == 0.0:
+            return 100.0
+        return 20.0 * np.log10(1.0 / np.sqrt(mse_value))
+
+    def _frames_to_numpy(self, frames_tensor):
+        frames = self.pipe.tensor2video(frames_tensor)
+        return [np.array(frame) for frame in frames]
+
+    def _combine_frames(self, cond_frames, gt_frames, pred_frames, error_frames):
+        cond_np = self._frames_to_numpy(cond_frames)
+        gt_np = self._frames_to_numpy(gt_frames)
+        pred_np = self._frames_to_numpy(pred_frames)
+        error_np = [np.array(frame) for frame in error_frames]
+
+        combined = []
+        for cond_frame, gt_frame, pred_frame, err_frame in zip(cond_np, gt_np, pred_np, error_np):
+            top_row = np.concatenate([cond_frame, gt_frame], axis=1)
+            bottom_row = np.concatenate([pred_frame, err_frame], axis=1)
+            combined.append(np.concatenate([top_row, bottom_row], axis=0))
+        return combined
+
+    def _extract_metadata(self, batch):
         try:
-            scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
-            condition_cam_type = batch.get('condition_cam_type', ['unknown'])[0] if isinstance(batch.get('condition_cam_type'), list) else str(batch.get('condition_cam_type', 'unknown'))
-            target_cam_type = batch.get('target_cam_type', ['unknown'])[0] if isinstance(batch.get('target_cam_type'), list) else str(batch.get('target_cam_type', 'unknown'))
-        except Exception as e:
-            print(f"Error extracting metadata from batch: {e}")
-            scene_id = "unknown"
-            condition_cam_type = "unknown"
-            target_cam_type = "unknown"
-        
-        metadata = {
-            'scene_id': scene_id,
-            'condition_cam_type': condition_cam_type,
-            'target_cam_type': target_cam_type
+            scene_raw = batch.get("scene_id", ["unknown"])
+            cond_raw = batch.get("condition_cam_type", ["unknown"])
+            tgt_raw = batch.get("target_cam_type", ["unknown"])
+            scene_id = scene_raw[0] if isinstance(scene_raw, list) else scene_raw
+            cond_type = cond_raw[0] if isinstance(cond_raw, list) else cond_raw
+            tgt_type = tgt_raw[0] if isinstance(tgt_raw, list) else tgt_raw
+        except Exception as exc:
+            print(f"Error extracting metadata from batch: {exc}")
+            scene_id, cond_type, tgt_type = "unknown", "unknown", "unknown"
+
+        return {
+            "scene_id": str(scene_id),
+            "condition_cam_type": str(cond_type),
+            "target_cam_type": str(tgt_type),
         }
-        
-        return psnr_value.detach().float().cpu().item(), combined_frames, metadata
 
     def _create_heatmap_error_frames(self, error_frames_tensor):
         """Convert error tensor to heatmap visualization using colormap"""

@@ -23,8 +23,14 @@
 
 ### 说明补充
 1. **wan2.2 的 condition 机制**：I2V 模式下条件输入不再是整段条件视频潜变量，而是源图像（或其 VAE 潜变量）作为首帧，后续帧由模型在去噪过程中生成。DiffSynth 的 `WanVideoPipeline.encode_image` 会生成 `clip_feature` 与 `y` 两类嵌入：`clip_feature` 来自图像编码器的语义向量，`y` 则由 VAE 对首尾帧编码并拼接掩膜，用于向扩散模型注入固定的首帧潜变量。在推理或训练时，调度器会始终保持首帧潜变量不被加噪，其他帧则依据噪声预测逐步还原。
+2. **官方 TI2V 时间步控制**：DiffSynth 的 Wan2.2 推理（`WanVideoPipeline`）在首帧图像编码后，会设置 `fuse_vae_embedding_in_latents=True` 并缓存 `first_frame_latents`。`model_fn_wan_video` 检测到该标记后，调用 `WanModel` 时会：
+   - 在每次 `scheduler.step` 后把首帧潜变量重写为原图；
+   - 生成补丁级 timestep 序列：首帧所有 patch 的时间步被强制设为 0，其余帧按常规 timestep 赋值；
+   - 将该二维 timestep 传给 `WanModel.forward`，后者在 `seperated_timestep` 模式下把时间嵌入按 patch 展开（首帧恒为 0，其余帧跟随噪声 schedule）。这一流程确保模型明确知道首帧是参考图像，其余帧围绕它去噪。
+   我们在 `validation_step` 中复刻了这条数据流：生成噪声后缓存 `first_frame_latents`，构造和官方一致的 patch-level timestep（首帧补丁全为 0，其余补丁为当前 timestep），再将 `fuse_vae_embedding_in_latents=True`、`first_frame_latents` 一并传给 DiT；`WanModel.forward` 支持接收二维 timestep 并按官方方式展开。这样 I2V 验证与 DiffSynth 推理保持一致，首帧条件可以稳定生效。
 
-2. **已完成的代码修改**：
-   - 在 `src/dataset.py` 新增 `ImageConditionTensorDataset` 与 `ImageConditionValidationDataset`，并在 `create_datasets` 中根据 `-y i2v` 自动使用新的 I2V 数据集逻辑。数据集中仅读取单段视频潜变量，将第一帧视作条件，整段序列为 target，同时重用首帧作为相机轨迹的归一化参考。
-   - 更新 `LightningModelForTrain`（`src/train_recammaster.py`），通过 `pipeline_type` 区分 v2v 与 i2v：i2v 模式对整段潜变量加噪并计算 loss，验证阶段迭代时仅需 target 序列，无需额外拼接条件段；同时在 WandB/本地日志中将静态条件帧广播到视频帧数。
-   - `VideoDecoder`（`src/wandb_module.py`）接收 `pipeline_type` 与可选 `condition_latents`，在 I2V 场景下会将首帧潜变量解码为静态图片并在可视化时广播，保证视频展示结构稳定。
+## 需求2
++ 目前已经实现i2v的dataset和train_step,val_step。但是在val_step的时候遇到了bug，下面我为你详细描述这个bug
++ 首先i2v时load的model是wan2.2 TI2V 5B。我的val_step是给首帧的latents，然后其余的F-1个latents全是高斯噪声，和推理的行为一致。并且当我的T_HIGHFREQ_RATIO=0时，即不进行PRoPE，理论上模型与原始模型一模一样，那么应该就和TI2V的正常推理结果一致，但是目前进行在训练前进行的第一次val_step效果不太好，似乎后续生成的video和第一个latents（image condition）没关系，并且质量不够高。请你排查两个地方，一个是我的validation_step的逻辑是否错误，另一个是模型文件有误。目前我已经对齐了ti2v默认的720p分辨率(在train.sh) 。这是我的启动脚本：exp_by_day/10.30/exp11:i2v.sh
++ 我现在基本已经确认原因所在，因为我没有在validation时对timestep做处理，Diffsynth官方是在对首帧timestep置0，其余的正常去噪。而我的首帧没有置0。请确认是不是这个问题，如果是我们可以进一步讨论该如何修改。
++ 我给你一个Diffsynth 推理wan2.2的代码供参考,应该有助于你排查bug。它的TI2V的推理启动命令：python /data1/lcy/projects/ReCamMaster/third_party/DiffSynth-Studio/examples/wanvideo/model_inference/Wan2.2-TI2V-5B.py

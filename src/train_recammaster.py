@@ -60,7 +60,7 @@ def parse_args():
         type=str,
         default="v2v",
         choices=["v2v", "i2v"],
-        help="Training mode: 'v2v' (ReCamMaster) or 'i2v' (Wan2.2 image-to-video).",
+        help="Training mode: 'v2v' (wan2.1 T2V 1.5B) or 'i2v' (Wan2.2 TI2V 5B).",
     )
 
     parser.add_argument(
@@ -207,6 +207,12 @@ def parse_args():
         type=int,
         default=None,
         help="Number of batches between validation runs (overrides val_check_interval if set)"
+    )
+    parser.add_argument(
+        "--val_guidance_scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale for validation sampling. Default: 1.0 (v2v) / 5.0 (i2v)."
     )
     parser.add_argument(
         "--t_highfreq_ratio",

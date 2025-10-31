@@ -300,7 +300,18 @@ class  PRoPE_SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, viewmats, Ks=None, *, mask_first_head_fraction: float = 1, t_highfreq_ratio: float = 0.5, **kwargs):
+    def forward(
+        self,
+        x,
+        freqs,
+        viewmats,
+        Ks=None,
+        *,
+        mask_first_head_fraction: float = 1,
+        t_highfreq_ratio: float = 0.5,
+        prpe_meta=None,
+        **kwargs,
+    ):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
@@ -323,15 +334,37 @@ class  PRoPE_SelfAttention(nn.Module):
         if Ks is not None:
             Ks = Ks.to(dtype=target_dtype, device=target_device)
         
+        if prpe_meta is None:
+            raise ValueError("prpe_meta must be provided for PRoPE attention.")
+        patches_x = int(prpe_meta.get("patches_x", 0))
+        patches_y = int(prpe_meta.get("patches_y", 0))
+        image_width = prpe_meta.get("image_width")
+        image_height = prpe_meta.get("image_height")
+        if patches_x <= 0 or patches_y <= 0:
+            raise ValueError(f"Invalid patch grid in prpe_meta: ({patches_y}, {patches_x}).")
+
+        if image_width is None or image_height is None:
+            if Ks is None:
+                raise ValueError("Camera intrinsics Ks must be provided for PRoPE attention.")
+            cx_vals = Ks[..., 0, 2].reshape(-1).float()
+            cy_vals = Ks[..., 1, 2].reshape(-1).float()
+            if torch.allclose(cx_vals, torch.zeros_like(cx_vals)) or torch.allclose(cy_vals, torch.zeros_like(cy_vals)):
+                raise ValueError("Unable to infer image size from camera intrinsics; principal point is zero.")
+            image_width = max(1, int(round(float(torch.median(cx_vals) * 2.0))))
+            image_height = max(1, int(round(float(torch.median(cy_vals) * 2.0))))
+        else:
+            image_width = int(image_width)
+            image_height = int(image_height)
+
+        
         apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
             head_dim=self.head_dim,
             viewmats=viewmats,
             Ks=Ks,
-            #TODO: hardcode
-            patches_x=52,
-            patches_y=30,
-            image_width=832,
-            image_height=480,
+            patches_x=patches_x,
+            patches_y=patches_y,
+            image_width=image_width,
+            image_height=image_height,
             num_heads=self.num_heads,
             head_fraction=mask_first_head_fraction,
             t_highfreq_ratio=t_highfreq_ratio,
@@ -451,9 +484,9 @@ class DiTBlock(nn.Module):
         
         N = viewmats.shape[1]
         
-        # Ensure Ks has the same dtype and device as input_x
         cam_intrinsics = _kwargs.get("cam_intrinsics", None)
         Ks = _normalize_cam_intrinsics(cam_intrinsics, B, N, input_x.dtype, input_x.device)
+        prpe_meta = _kwargs.get("prpe_meta")
         
         # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
         t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
@@ -462,6 +495,7 @@ class DiTBlock(nn.Module):
             attn_out = self.self_attn(
                 input_x, freqs, cam_emb, Ks,
                 t_highfreq_ratio=t_highfreq_ratio,
+                prpe_meta=prpe_meta,
             )
             x = self.gate(x, gate_msa, attn_out)
         except RuntimeError as e:
@@ -624,9 +658,42 @@ class WanModel(torch.nn.Module):
                 temporal_indices: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
-        t = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        fuse_vae_embedding = kwargs.get("fuse_vae_embedding_in_latents", False)
+        use_separated_timestep = self.seperated_timestep and fuse_vae_embedding and x.dim() == 5
+        if use_separated_timestep:
+            patch_size = getattr(self, "patch_size", (1, 2, 2))
+            if len(patch_size) == 3:
+                _, patch_h, patch_w = patch_size
+            else:
+                patch_h, patch_w = patch_size[-2], patch_size[-1]
+            frames = x.shape[2]
+            tokens_per_frame = (x.shape[3] // patch_h) * (x.shape[4] // patch_w)
+            if tokens_per_frame <= 0:
+                use_separated_timestep = False
+        if use_separated_timestep:
+            timestep_value = timestep.reshape(-1)[0]
+            first_tokens = torch.zeros(
+                (1, tokens_per_frame),
+                dtype=timestep.dtype,
+                device=timestep.device,
+            )
+            if frames > 1:
+                remaining_tokens = torch.ones(
+                    (frames - 1, tokens_per_frame),
+                    dtype=timestep.dtype,
+                    device=timestep.device,
+                ) * timestep_value
+                expanded = torch.cat([first_tokens, remaining_tokens], dim=0)
+            else:
+                expanded = first_tokens
+            expanded = expanded.flatten()
+            sinusoid = sinusoidal_embedding_1d(self.freq_dim, expanded)
+            t = self.time_embedding(sinusoid).unsqueeze(0)
+            t_mod = self.time_projection(t).unflatten(2, (6, self.dim))
+        else:
+            t = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, timestep))
+            t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
         
         if self.has_image_input:
@@ -635,14 +702,29 @@ class WanModel(torch.nn.Module):
             context = torch.cat([clip_embdding, context], dim=1)
         
         control_camera_latents_input = kwargs.pop("control_camera_latents_input", None)
-        # Patchify (all downsampling handled outside the model)
-        patchify_out = self.patchify(x, control_camera_latents_input)
-        if isinstance(patchify_out, tuple):
-            x, grid_size = patchify_out
+        conv_out = self.patchify(x, control_camera_latents_input)
+        if isinstance(conv_out, tuple):
+            x, grid_size = conv_out
         else:
-            grid_size = patchify_out.shape[2:]
-            x = rearrange(patchify_out, "b c f h w -> b (f h w) c").contiguous()
+            grid_size = conv_out.shape[2:]
+            x = rearrange(conv_out, "b c f h w -> b (f h w) c").contiguous()
         f, h, w = grid_size
+
+        patch_h = self.patch_size[1] if len(self.patch_size) == 3 else self.patch_size[-2]
+        patch_w = self.patch_size[2] if len(self.patch_size) == 3 else self.patch_size[-1]
+        latent_h = patch_h * h
+        latent_w = patch_w * w
+        prpe_meta = {
+            "patches_x": int(w),
+            "patches_y": int(h),
+            "image_width": None,
+            "image_height": None,
+            "patch_size": tuple(int(v) for v in self.patch_size),
+            "latent_hw": (latent_h, latent_w),
+        }
+
+        kwargs_with_prpe = dict(kwargs)
+        kwargs_with_prpe.setdefault("prpe_meta", prpe_meta)
 
         # Build RoPE freqs with real temporal indices
         if temporal_indices is not None:
@@ -661,7 +743,7 @@ class WanModel(torch.nn.Module):
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
-                return module(*inputs, **kwargs)
+                return module(*inputs, **dict(kwargs_with_prpe))
             return custom_forward
 
         # Iterate blocks with OOM reporting per DiT layer
@@ -682,7 +764,7 @@ class WanModel(torch.nn.Module):
                             use_reentrant=False,
                         )
                 else:
-                    x = block(x, context, cam_emb, t_mod, freqs, **kwargs)
+                    x = block(x, context, cam_emb, t_mod, freqs, **dict(kwargs_with_prpe))
             except RuntimeError as e:
                 # Augment CUDA OOM with layer index and rank information
                 msg = str(e)

@@ -48,7 +48,8 @@ PIPELINE_TYPE="v2v"
 DATALOADER_WORKERS_DEFAULT=36
 MODEL_BASE_PATH=""
 VAL_SIZE=12
-VAL_CHECK_INTERVAL_BATCHES=50
+VAL_CHECK_INTERVAL_BATCHES=100
+VAL_STEPS=10
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -134,8 +135,11 @@ done
 if [[ -z "$MODEL_BASE_PATH" ]]; then
   if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
     MODEL_BASE_PATH="models/Wan-AI/Wan2.2-TI2V-5B"
+    VAL_GUIDANCE_SCALE="${VAL_GUIDANCE_SCALE:-5.0}"
+    VAL_STEPS=40
   else
     MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
+    VAL_GUIDANCE_SCALE="${VAL_GUIDANCE_SCALE:-1.0}"
   fi
 fi
 
@@ -186,13 +190,13 @@ CMD=(
   --vae_path "$VAE_PATH"
   --steps_per_epoch 10000
   --max_epochs 100
-  --learning_rate 1e-5
+  --learning_rate 1e-4
   --accumulate_grad_batches 1
   --use_gradient_checkpointing
   --dataloader_num_workers "$EFFECTIVE_DATALOADER_WORKERS"
   --batch_size "$EFFECTIVE_BATCH_SIZE"
   --global_seed "$GLOBAL_SEED"
-  --val_steps 10
+  --val_steps "$VAL_STEPS"
   --val_size "$VAL_SIZE"
   --metadata_path "$METADATA_PATH"
   --wandb_name "$WANDB_NAME"
@@ -202,6 +206,9 @@ CMD=(
   --t_highfreq_ratio "$T_HIGHFREQ_RATIO"
   --frame_downsample_to "$FRAME_DOWNSAMPLE_TO"
   --pipeline_type "$PIPELINE_TYPE"
+  --height 704
+  --width 1280
+  --val_guidance_scale "$VAL_GUIDANCE_SCALE"
 )
 
 if [[ -n "$RESUME_CHECKPOINT_PATH" ]]; then

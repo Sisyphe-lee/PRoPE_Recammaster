@@ -10,13 +10,10 @@ models/
 latents_debug/
 results/
 result/
-eval_data/
-eval_data2/
 example_test_data/
 .vscode/
 exp/
 metadata.csv
 metadata_all.csv
 wandb/
-
 .venv/

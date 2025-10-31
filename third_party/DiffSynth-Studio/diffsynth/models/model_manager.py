@@ -430,7 +430,7 @@ class ModelManager:
             self.load_model(file_path, model_names, device=device, torch_dtype=torch_dtype)
 
     
-    def fetch_model(self, model_name, file_path=None, require_model_path=False):
+    def fetch_model(self, model_name, file_path=None, require_model_path=False, index=None):
         fetched_models = []
         fetched_model_paths = []
         for model, model_path, model_name_ in zip(self.model, self.model_path, self.model_name):
@@ -442,14 +442,20 @@ class ModelManager:
         if len(fetched_models) == 0:
             print(f"No {model_name} models available.")
             return None
+        if index is not None:
+            if index < 0 or index >= len(fetched_models):
+                raise IndexError(f"Requested index {index} for {model_name} out of range (found {len(fetched_models)} models).")
+            select_idx = index
+        else:
+            select_idx = 0
         if len(fetched_models) == 1:
-            print(f"Using {model_name} from {fetched_model_paths[0]}.")
+            print(f"Using {model_name} from {fetched_model_paths[select_idx]}.")
         else:
-            print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths[0]}.")
+            print(f"More than one {model_name} models are loaded in model manager: {fetched_model_paths}. Using {model_name} from {fetched_model_paths[select_idx]}.")
         if require_model_path:
-            return fetched_models[0], fetched_model_paths[0]
+            return fetched_models[select_idx], fetched_model_paths[select_idx]
         else:
-            return fetched_models[0]
+            return fetched_models[select_idx]
         
 
     def to(self, device):

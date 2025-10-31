@@ -314,18 +314,18 @@ def _prepare_apply_fns(
     t_lo_end_bin = t_block_end // 2
     t_real_start, t_real_end = complex_to_real_span(t_lo_start_bin, t_lo_end_bin)
 
-    # Distance RoPE uses w-dim low-frequency tail with the same ratio
-    w_start_bin = tLc + hLc
-    w_end_bin = tLc + hLc + wLc
-    if t_highfreq_ratio > 0:
-        w_lo_len_bins = int(wLc * t_highfreq_ratio)
-        w_lo_len_bins = max(0, (w_lo_len_bins // 2) * 2)  # even number of pairs
-    else:
-        w_lo_len_bins = 0
-    w_lo_start_bin = max(w_start_bin, w_end_bin - w_lo_len_bins)
-    w_lo_end_bin = w_end_bin
-    w_real_start, w_real_end = complex_to_real_span(w_lo_start_bin, w_lo_end_bin)
-    num_pairs_w = (w_real_end - w_real_start) // 2
+    # # Distance RoPE uses w-dim low-frequency tail with the same ratio
+    # w_start_bin = tLc + hLc
+    # w_end_bin = tLc + hLc + wLc
+    # if t_highfreq_ratio > 0:
+    #     w_lo_len_bins = int(wLc * t_highfreq_ratio)
+    #     w_lo_len_bins = max(0, (w_lo_len_bins // 2) * 2)  # even number of pairs
+    # else:
+    #     w_lo_len_bins = 0
+    # w_lo_start_bin = max(w_start_bin, w_end_bin - w_lo_len_bins)
+    # w_lo_end_bin = w_end_bin
+    # w_real_start, w_real_end = complex_to_real_span(w_lo_start_bin, w_lo_end_bin)
+    # num_pairs_w = (w_real_end - w_real_start) // 2
 
     if num_heads is None or head_fraction <= 0:
         head_indices = None  # no-op
@@ -333,24 +333,7 @@ def _prepare_apply_fns(
         head_indices = torch.arange(max(1, int(num_heads * head_fraction)), device=device)
 
     # Fixed 16 unit vectors covering axes, plane diagonals, and space diagonals
-    U_const = torch.tensor([
-        [ 1.0,  0.0,  0.0],
-        [-1.0,  0.0,  0.0],
-        [ 0.0,  1.0,  0.0],
-        [ 0.0, -1.0,  0.0],
-        [ 0.0,  0.0,  1.0],
-        [ 0.0,  0.0, -1.0],
-        [ 0.70710678,  0.70710678,  0.0],
-        [ 0.70710678, -0.70710678,  0.0],
-        [ 0.70710678,  0.0,  0.70710678],
-        [ 0.70710678,  0.0, -0.70710678],
-        [ 0.0,  0.70710678,  0.70710678],
-        [ 0.0,  0.70710678, -0.70710678],
-        [ 0.57735027,  0.57735027,  0.57735027],
-        [ 0.57735027,  0.57735027, -0.57735027],
-        [ 0.57735027, -0.57735027,  0.57735027],
-        [-0.57735027,  0.57735027,  0.57735027],
-    ], dtype=torch.float32, device=device)
+    
 
     def _apply_proj_subset(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
         """

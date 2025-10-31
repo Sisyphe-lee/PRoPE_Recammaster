@@ -195,8 +195,6 @@ class LightningModelForTrain(pl.LightningModule):
         # Use deterministic generators for reproducibility
         gen_cuda = torch.Generator(device=self.device).manual_seed(self.global_seed + self.global_step)
         noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=gen_cuda)
-        if is_i2v:
-            noise[:, :, 0, ...] = 0
         gen_cpu = torch.Generator(device='cpu').manual_seed(self.global_seed + self.global_step)
         tlen = len(self.pipe.scheduler.timesteps)
         timestep_idx = torch.randint(0, tlen, (1,), generator=gen_cpu)
@@ -220,15 +218,15 @@ class LightningModelForTrain(pl.LightningModule):
             t_highfreq_ratio=self.t_highfreq_ratio,
             frame_downsample_to=self.frame_downsample_to,
             cam_intrinsics=cam_intrinsics,
-            temporal_indices=temporal_indices
+            temporal_indices=temporal_indices,
+            fuse_vae_embedding_in_latents=is_i2v,
         )
 
         # Build per-half indices to match model's internal downsampling (two-halves scheme on target half)
         if is_i2v:
-
             loss = torch.nn.functional.mse_loss(
-                noise_pred[:, :, 1:, ...].float(),
-                training_target[:, :, 1:, ...].float()
+                noise_pred.float(),
+                training_target.float()
             )
         else:
             if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0 and self.frame_downsample_to < tgt_latent_len:
@@ -353,6 +351,7 @@ class LightningModelForTrain(pl.LightningModule):
                 use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
                 t_highfreq_ratio=self.t_highfreq_ratio,
                 frame_downsample_to=self.frame_downsample_to,
+                fuse_vae_embedding_in_latents=is_i2v,
             )
             if is_i2v:
                 latents_gen = self.pipe.scheduler.step(
@@ -369,25 +368,14 @@ class LightningModelForTrain(pl.LightningModule):
                     latents_input[:, :, :tgt_latent_len, ...]
                 )
         
-        # Decode video and calculate PSNR (reuse decode logic)
-        dummy_timestep = torch.tensor([0], device=self.device, dtype=self.pipe.torch_dtype)
-        
-        if is_i2v:
-            noisy_latents = latents_gen
-            origin_latents = target_latents
-        else:
-            noisy_latents = torch.cat([latents_gen, condition_latents], dim=2)
-            origin_latents = torch.cat([target_latents, condition_latents], dim=2)
+        # Decode video并计算 PSNR
         psnr_value, combined_frames, metadata = self.decode_video(
             latents_gen,
-            noisy_latents,
-            tgt_latent_len,
-            origin_latents,
-            dummy_timestep,
+            target_latents,
             batch,
             condition_latents=None if is_i2v else condition_latents,
         )
-        
+
         # Save video with validation naming
         combined_path = self.save_video_with_naming(combined_frames, batch, video_type="val")
 
@@ -515,16 +503,15 @@ class LightningModelForTrain(pl.LightningModule):
         if removed > 0:
             print(f"Stripping {removed} legacy camera-layer parameters from checkpoint.")
         return filtered
-
-
-
-    def decode_video(self, noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch, condition_latents=None):
+    def decode_video(self, pred_latents, gt_target_latents, batch, condition_latents=None):
         """Decode video and calculate PSNR without saving"""
-        # Use VideoDecoder to handle the complex decoding logic
         psnr_value, combined_frames, metadata = self.video_decoder.decode_and_create_combined_video(
-            noise_pred, noisy_latents, tgt_latent_len, origin_latents, timestep, batch, condition_latents=condition_latents
+            pred_latents,
+            gt_target_latents,
+            condition_latents,
+            batch,
         )
-        
+
         return psnr_value, combined_frames, metadata
     
     def _compute_downsample_indices(self, total_frames, frame_downsample, is_i2v):
