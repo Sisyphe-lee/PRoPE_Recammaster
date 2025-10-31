@@ -333,38 +333,15 @@ class  PRoPE_SelfAttention(nn.Module):
         viewmats = viewmats.to(dtype=target_dtype, device=target_device)
         if Ks is not None:
             Ks = Ks.to(dtype=target_dtype, device=target_device)
-        
-        if prpe_meta is None:
-            raise ValueError("prpe_meta must be provided for PRoPE attention.")
-        patches_x = int(prpe_meta.get("patches_x", 0))
-        patches_y = int(prpe_meta.get("patches_y", 0))
-        image_width = prpe_meta.get("image_width")
-        image_height = prpe_meta.get("image_height")
-        if patches_x <= 0 or patches_y <= 0:
-            raise ValueError(f"Invalid patch grid in prpe_meta: ({patches_y}, {patches_x}).")
 
-        if image_width is None or image_height is None:
-            if Ks is None:
-                raise ValueError("Camera intrinsics Ks must be provided for PRoPE attention.")
-            cx_vals = Ks[..., 0, 2].reshape(-1).float()
-            cy_vals = Ks[..., 1, 2].reshape(-1).float()
-            if torch.allclose(cx_vals, torch.zeros_like(cx_vals)) or torch.allclose(cy_vals, torch.zeros_like(cy_vals)):
-                raise ValueError("Unable to infer image size from camera intrinsics; principal point is zero.")
-            image_width = max(1, int(round(float(torch.median(cx_vals) * 2.0))))
-            image_height = max(1, int(round(float(torch.median(cy_vals) * 2.0))))
-        else:
-            image_width = int(image_width)
-            image_height = int(image_height)
-
-        
         apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
             head_dim=self.head_dim,
             viewmats=viewmats,
             Ks=Ks,
-            patches_x=patches_x,
-            patches_y=patches_y,
-            image_width=image_width,
-            image_height=image_height,
+            patches_x=52,
+            patches_y=30,
+            image_width=832,
+            image_height=480,
             num_heads=self.num_heads,
             head_fraction=mask_first_head_fraction,
             t_highfreq_ratio=t_highfreq_ratio,
@@ -702,29 +679,16 @@ class WanModel(torch.nn.Module):
             context = torch.cat([clip_embdding, context], dim=1)
         
         control_camera_latents_input = kwargs.pop("control_camera_latents_input", None)
-        conv_out = self.patchify(x, control_camera_latents_input)
-        if isinstance(conv_out, tuple):
-            x, grid_size = conv_out
+        patchify_out = self.patchify(x, control_camera_latents_input)
+        if isinstance(patchify_out, tuple):
+            x, grid_size = patchify_out
         else:
-            grid_size = conv_out.shape[2:]
-            x = rearrange(conv_out, "b c f h w -> b (f h w) c").contiguous()
+            grid_size = patchify_out.shape[2:]
+            x = rearrange(patchify_out, "b c f h w -> b (f h w) c").contiguous()
         f, h, w = grid_size
 
-        patch_h = self.patch_size[1] if len(self.patch_size) == 3 else self.patch_size[-2]
-        patch_w = self.patch_size[2] if len(self.patch_size) == 3 else self.patch_size[-1]
-        latent_h = patch_h * h
-        latent_w = patch_w * w
-        prpe_meta = {
-            "patches_x": int(w),
-            "patches_y": int(h),
-            "image_width": None,
-            "image_height": None,
-            "patch_size": tuple(int(v) for v in self.patch_size),
-            "latent_hw": (latent_h, latent_w),
-        }
-
-        kwargs_with_prpe = dict(kwargs)
-        kwargs_with_prpe.setdefault("prpe_meta", prpe_meta)
+        kwargs_with_grid = dict(kwargs)
+        kwargs_with_grid.setdefault("grid_size", grid_size)
 
         # Build RoPE freqs with real temporal indices
         if temporal_indices is not None:
@@ -743,7 +707,7 @@ class WanModel(torch.nn.Module):
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
-                return module(*inputs, **dict(kwargs_with_prpe))
+                return module(*inputs, **dict(kwargs_with_grid))
             return custom_forward
 
         # Iterate blocks with OOM reporting per DiT layer
@@ -764,7 +728,7 @@ class WanModel(torch.nn.Module):
                             use_reentrant=False,
                         )
                 else:
-                    x = block(x, context, cam_emb, t_mod, freqs, **dict(kwargs_with_prpe))
+                    x = block(x, context, cam_emb, t_mod, freqs)
             except RuntimeError as e:
                 # Augment CUDA OOM with layer index and rank information
                 msg = str(e)

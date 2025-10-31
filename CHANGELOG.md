@@ -1,4 +1,10 @@
 # Change Log
+## v0.2.14 @codex - 2025-10-31
+
+### 修复
+- `src/lightning_trainer.py`: 调整 `LightningModelForTrain.decode_video` 签名及其验证调用方式，统一透传参数顺序，避免在复用 `VideoDecoder.decode_and_create_combined_video` 时对 `condition_latents` 同时使用位置参数与关键字参数导致验证崩溃。
+- 调整denoise timestep，在i2v下，follow官方代码，给第一帧timestep置0
+
 ## v0.2.13 @codex - 2025-10-30
 
 ### 变更

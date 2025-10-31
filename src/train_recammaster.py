@@ -60,7 +60,7 @@ def parse_args():
         type=str,
         default="v2v",
         choices=["v2v", "i2v"],
-        help="Training mode: 'v2v' (wan2.1 T2V 1.5B) or 'i2v' (Wan2.2 TI2V 5B).",
+        help="Training mode: 'v2v' (wan2.1 T2V 1.5B ) or 'i2v' (Wan2.2 TI2V 5B).",
     )
 
     parser.add_argument(

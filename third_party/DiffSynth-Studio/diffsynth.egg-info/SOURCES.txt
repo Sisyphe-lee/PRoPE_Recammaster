@@ -132,7 +132,7 @@ diffsynth/models/utils.py
 diffsynth/models/wan_video_animate_adapter.py
 diffsynth/models/wan_video_camera_controller.py
 diffsynth/models/wan_video_dit.py
-diffsynth/models/wan_video_dit_ori.py
+diffsynth/models/wan_video_dit_.py
 diffsynth/models/wan_video_dit_s2v.py
 diffsynth/models/wan_video_image_encoder.py
 diffsynth/models/wan_video_motion_controller.py

@@ -56,7 +56,7 @@
 
 ## 验证与测试
 
-- 快速验证 Δ-RoPE：`python delta_prope_tests/test_delta_rope.py`
+
 - I2V 生成质量回归：可对照 DiffSynth 官方脚本 `third_party/DiffSynth-Studio/examples/wanvideo/model_inference/Wan2.2-TI2V-5B.py`
 - 建议在提交前运行必要的 GPU 端到端验证，并将关键可视化保存到 `test_output/`。
 

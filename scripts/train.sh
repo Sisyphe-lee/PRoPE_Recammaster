@@ -37,7 +37,7 @@ OUTPUT_DIR="$(pwd)/models/train"
 RESUME_CHECKPOINT_PATH=""
 WANDB_NAME="Exp07c"
 DATASET_PATH="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train"
-METADATA_PATH="$(pwd)/metadata/metadata_all.csv"
+METADATA_PATH="$(pwd)/metadata/metadata_f18_aperture10.csv"
 GLOBAL_SEED=42
 T_HIGHFREQ_RATIO=0.5
 BATCH_SIZE=1
@@ -206,8 +206,6 @@ CMD=(
   --t_highfreq_ratio "$T_HIGHFREQ_RATIO"
   --frame_downsample_to "$FRAME_DOWNSAMPLE_TO"
   --pipeline_type "$PIPELINE_TYPE"
-  --height 704
-  --width 1280
   --val_guidance_scale "$VAL_GUIDANCE_SCALE"
 )
 
