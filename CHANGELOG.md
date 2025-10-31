@@ -1,4 +1,12 @@
 # Change Log
+## v0.2.15 @codex - 2025-10-31
+
+### 新增
+- 推理脚本：`scripts/inference.sh` 支持通过 `GPU_IDS` 环境变量显式指定 GPU 列表，自动设置 `CUDA_VISIBLE_DEVICES` 并按需选择 `torchrun` 启动方式。
+
+### 变更
+- `src/inference_recammaster.py` 接入 `torch.distributed` 初始化、`DistributedSampler` 与输出目录同步逻辑，配合 `torchrun` 在多卡场景下安全运行推理并避免并发写文件冲突。
+
 ## v0.2.14 @codex - 2025-10-31
 
 ### 修复

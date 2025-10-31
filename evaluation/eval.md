@@ -17,3 +17,9 @@ python /data1/lcy/projects/ReCamMaster/convert_pose_formats.py /data1/lcy/projec
 
 3. 比较两组trajectory
 python3 /data1/lcy/projects/ReCamMaster/evaluate_with_evo.py /data1/lcy/projects/ReCamMaster/eval_data2/videos /data1/lcy/projects/vipe/vipe_results/pose --work-dir ./evo_outputs --per-file | cat
+
+
+## evaluation 
+### v2v
+1. Dataset: PointOdyssey
+2. inference 

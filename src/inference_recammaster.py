@@ -8,6 +8,7 @@ if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
     sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData
 import os, imageio, argparse
 from datetime import datetime
@@ -18,6 +19,7 @@ import torchvision
 from PIL import Image
 import numpy as np
 import json
+from torch.utils.data.distributed import DistributedSampler
 
 class Camera(object):
     def __init__(self, c2w):
@@ -398,16 +400,49 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed and dist.is_available() and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+        )
+    return rank, local_rank, world_size, distributed
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
 if __name__ == '__main__':
     args = parse_args()
 
-    if args.debug:
-        print("Debug mode is enabled.") 
+    rank, local_rank, world_size, distributed = setup_distributed()
+
+    if args.debug and rank == 0:
+        print("Debug mode is enabled.")
         import debugpy
         debugpy.listen(5678)
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device_str = f"cuda:{local_rank}"
+    else:
+        device_str = "cpu"
+
+    if rank == 0:
+        print(f"World size: {world_size}, using device: {device_str}")
 
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
@@ -415,11 +450,13 @@ if __name__ == '__main__':
         "models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
         "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
     ])
-    pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device="cuda")
+    pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device=device_str)
 
-    print(f"Loading checkpoint from: {args.ckpt_path}")
+    if rank == 0:
+        print(f"Loading checkpoint from: {args.ckpt_path}")
     ckpt_type = "wan21" if args.pipeline_type == "v2v" else "wan22"
-    print(f"Checkpoint type: {ckpt_type}")
+    if rank == 0:
+        print(f"Checkpoint type: {ckpt_type}")
 
     if args.pipeline_type != "v2v":
         raise NotImplementedError("Only v2v inference is currently supported.")
@@ -448,28 +485,42 @@ if __name__ == '__main__':
     if cleaned_state:
         state_dict = cleaned_state
 
-    print(f"Loading {ckpt_type} DiT weights...")
+    if rank == 0:
+        print(f"Loading {ckpt_type} DiT weights...")
     pipe.dit.load_state_dict(state_dict, strict=True)
     
-    pipe.to("cuda")
+    pipe.to(device_str)
     pipe.to(dtype=torch.bfloat16)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("./result", timestamp)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if rank == 0 else None
+    if distributed:
+        obj_list = [timestamp]
+        dist.broadcast_object_list(obj_list, src=0)
+        timestamp = obj_list[0]
+    else:
+        timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(args.output_dir) / timestamp
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
 
     dataset = TextVideoCameraDataset(
         args.dataset_path,
         os.path.join(args.dataset_path, "metadata.csv"),
         args,
     )
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) if distributed else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        shuffle=False,
+        shuffle=(sampler is None),
         batch_size=1,
-        num_workers=args.dataloader_num_workers
+        num_workers=args.dataloader_num_workers,
+        sampler=sampler,
     )
+
+    if sampler is not None:
+        sampler.set_epoch(0)
 
     for batch_idx, batch in enumerate(dataloader):
         target_text = batch["text"]
@@ -480,11 +531,10 @@ if __name__ == '__main__':
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
-            # if cam_type_id < 5:
-            #     continue
-            cam_output_dir = os.path.join(output_dir, f"cam_type{cam_type_id}")
-            if not os.path.exists(cam_output_dir):
-                os.makedirs(cam_output_dir) 
+            if cam_type_id < 5:
+                continue
+            cam_output_dir = output_dir / f"cam_type{cam_type_id}"
+            cam_output_dir.mkdir(parents=True, exist_ok=True)
 
             pipe.eval()
             video = pipe(
@@ -494,9 +544,11 @@ if __name__ == '__main__':
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
                 frame_downsample_to=args.frame_downsample_to,
-                num_inference_steps=20,
+                num_inference_steps=10,
                 seed=0, tiled=True,
 
             )
             filename = cam_fname
-            save_video(video, os.path.join(cam_output_dir, filename), fps=30, quality=5)
+            save_video(video, str(cam_output_dir / filename), fps=30, quality=5)
+
+    cleanup_distributed()
