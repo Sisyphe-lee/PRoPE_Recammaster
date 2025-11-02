@@ -19,7 +19,6 @@ import torchvision
 from PIL import Image
 import numpy as np
 import json
-from torch.utils.data.distributed import DistributedSampler
 
 class Camera(object):
     def __init__(self, c2w):
@@ -338,6 +337,77 @@ class TextVideoCameraDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.path)
 
+
+def setup_distributed_environment() -> tuple[bool, int, int, int, torch.device]:
+    """Initialize torch.distributed when multiple GPUs are available."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = dist.is_available() and world_size > 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
+    return distributed, world_size, rank, local_rank, device
+
+
+def broadcast_output_directory(base_dir: str, distributed: bool, rank: int) -> str:
+    """Create a shared timestamped output directory across ranks."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if distributed:
+        payload = [timestamp if rank == 0 else None]
+        dist.broadcast_object_list(payload, src=0)
+        timestamp = payload[0]
+    output_dir = os.path.join(base_dir, timestamp)
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+    if distributed:
+        dist.barrier()
+    return output_dir
+
+
+def cleanup_distributed_environment(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def load_dit_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor], rank: int) -> None:
+    """Safely load DiT weights while guarding against shape mismatches."""
+    model_state = model.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    skipped_for_shape: list[str] = []
+    unexpected_keys: list[str] = []
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            unexpected_keys.append(key)
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_for_shape.append(key)
+            continue
+        compatible_state[key] = value
+
+    load_msg = model.load_state_dict(compatible_state, strict=False)
+    missing_keys, still_unexpected = load_msg
+
+    if rank == 0:
+        if skipped_for_shape:
+            print(f"[warning] skipped {len(skipped_for_shape)} keys with mismatched shapes: {skipped_for_shape[:5]}{'...' if len(skipped_for_shape) > 5 else ''}")
+        if unexpected_keys or still_unexpected:
+            total_unexpected = set(unexpected_keys).union(still_unexpected)
+            if total_unexpected:
+                print(f"[warning] ignored unexpected keys: {list(total_unexpected)[:5]}{'...' if len(total_unexpected) > 5 else ''}")
+        if missing_keys:
+            print(f"[warning] missing {len(missing_keys)} keys when loading weights: {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="ReCamMaster Inference")
     parser.add_argument(
@@ -400,49 +470,20 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-
-def setup_distributed():
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    distributed = world_size > 1
-
-    if distributed and dist.is_available() and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(
-            backend=backend,
-            rank=rank,
-            world_size=world_size,
-        )
-    return rank, local_rank, world_size, distributed
-
-
-def cleanup_distributed():
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
 if __name__ == '__main__':
     args = parse_args()
 
-    rank, local_rank, world_size, distributed = setup_distributed()
+    distributed, world_size, rank, local_rank, device = setup_distributed_environment()
 
     if args.debug and rank == 0:
-        print("Debug mode is enabled.")
+        print("Debug mode is enabled.") 
         import debugpy
         debugpy.listen(5678)
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device_str = f"cuda:{local_rank}"
-    else:
-        device_str = "cpu"
-
-    if rank == 0:
-        print(f"World size: {world_size}, using device: {device_str}")
+    elif args.debug and rank != 0:
+        print(f"[rank {rank}] Debug mode requested but only rank 0 enters debug session.")
 
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
@@ -450,15 +491,18 @@ if __name__ == '__main__':
         "models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
         "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
     ])
+    device_str = device.type if device.type == "cpu" else f"cuda:{device.index}"
     pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device=device_str)
 
     if rank == 0:
+        print(f"Using device: {device_str} | world_size={world_size}")
         print(f"Loading checkpoint from: {args.ckpt_path}")
     ckpt_type = "wan21" if args.pipeline_type == "v2v" else "wan22"
     if rank == 0:
         print(f"Checkpoint type: {ckpt_type}")
 
     if args.pipeline_type != "v2v":
+        cleanup_distributed_environment(distributed)
         raise NotImplementedError("Only v2v inference is currently supported.")
 
     if str(args.ckpt_path).endswith(".safetensors"):
@@ -473,6 +517,7 @@ if __name__ == '__main__':
 
     prefixes_to_remove = ['model.', 'module.', 'pipe.dit.', 'dit.']
     cleaned_state = {}
+    dropped_keys = []
     for k, v in state_dict.items():
         key = k
         for p in prefixes_to_remove:
@@ -480,44 +525,56 @@ if __name__ == '__main__':
                 key = key[len(p):]
                 break
         if '.cam_encoder.' in key or '.projector.' in key:
+            dropped_keys.append(key)
             continue
         cleaned_state[key] = v
     if cleaned_state:
         state_dict = cleaned_state
+    if rank == 0 and dropped_keys:
+        print(f"[info] dropping {len(dropped_keys)} camera/projector keys: {dropped_keys[:5]}{'...' if len(dropped_keys) > 5 else ''}")
 
     if rank == 0:
         print(f"Loading {ckpt_type} DiT weights...")
-    pipe.dit.load_state_dict(state_dict, strict=True)
-    
-    pipe.to(device_str)
-    pipe.to(dtype=torch.bfloat16)
+    load_dit_state_dict(pipe.dit, state_dict, rank)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if rank == 0 else None
-    if distributed:
-        obj_list = [timestamp]
-        dist.broadcast_object_list(obj_list, src=0)
-        timestamp = obj_list[0]
+    pipe.to(device)
+    pipe.to(dtype=torch.bfloat16)
+    pipe.eval()
+
+    base_output_dir = args.output_dir if args.output_dir else "./result"
+    output_dir = broadcast_output_directory(base_output_dir, distributed, rank)
+    if world_size > 1:
+        rank_output_dir = os.path.join(output_dir, f"rank{rank:02d}")
     else:
-        timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) / timestamp
-    if rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    if distributed:
-        dist.barrier()
+        rank_output_dir = output_dir
+    os.makedirs(rank_output_dir, exist_ok=True)
 
     dataset = TextVideoCameraDataset(
         args.dataset_path,
         os.path.join(args.dataset_path, "metadata.csv"),
         args,
     )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) if distributed else None
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        shuffle=(sampler is None),
-        batch_size=1,
-        num_workers=args.dataloader_num_workers,
-        sampler=sampler,
-    )
+    if distributed:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        sampler = None
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "batch_size": 1,
+        "num_workers": args.dataloader_num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if sampler is not None:
+        dataloader_kwargs["sampler"] = sampler
+    else:
+        dataloader_kwargs["shuffle"] = False
+    dataloader = torch.utils.data.DataLoader(**dataloader_kwargs)
 
     if sampler is not None:
         sampler.set_epoch(0)
@@ -529,14 +586,17 @@ if __name__ == '__main__':
         source_path = batch["path"][0]
         cam_fname = os.path.basename(source_path)  # original video filename
 
+        sample_stem = Path(source_path).stem
+        sample_dir = Path(rank_output_dir) / sample_stem
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
-            if cam_type_id < 5:
-                continue
-            cam_output_dir = output_dir / f"cam_type{cam_type_id}"
+            # if cam_type_id < 5:
+            #     continue
+            cam_output_dir = sample_dir / f"cam_type{cam_type_id}"
             cam_output_dir.mkdir(parents=True, exist_ok=True)
 
-            pipe.eval()
             video = pipe(
                 prompt=target_text,
                 negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
@@ -544,11 +604,11 @@ if __name__ == '__main__':
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
                 frame_downsample_to=args.frame_downsample_to,
-                num_inference_steps=10,
+                num_inference_steps=20,
                 seed=0, tiled=True,
 
             )
-            filename = cam_fname
-            save_video(video, str(cam_output_dir / filename), fps=30, quality=5)
+            save_path = cam_output_dir / cam_fname
+            save_video(video, str(save_path), fps=30, quality=5)
 
-    cleanup_distributed()
+    cleanup_distributed_environment(distributed)
