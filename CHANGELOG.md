@@ -1,4 +1,10 @@
 # Change Log
+## v0.2.16 @codex - 2025-10-31
+
+### 修复
+- `src/inference_unified.py`: 统一 `compute_relative_c2w` 逻辑，与训练脚本保持一致，对相对 w2c 结果补充 `invert_se3`，避免推理阶段相机平移幅度异常。
+- `tools/compare_target_pose.py`: 同步更新相对位姿计算，保证对标工具与推理主流程使用一致的坐标系语义。
+
 ## v0.2.15 @codex - 2025-10-31
 
 ### 新增

@@ -68,3 +68,14 @@
 1. 可是给脚本加一个timestamp参数，这个参数默认是没有，如果没有就新建一个当前时间戳的目录，然后重新推理。如果启动时输入了参数timestamp，则先找这个timestamp命名的子目录，在这个子目录下继续推理。
 2. 然后在推理的循环中，先确认目标.mp4（video_path）是否存在，如果存在就continue
 
+## 需求6
++ 这是我之前的推理脚本 src/inference_recammaster.py 。然后我目前实现了一版既能够推理 example data也能够推理pointodyssey 数据集的推理脚本 src/inference_unified.py ，已经能够成功运行。
++ 但是这个新的推理脚本在推理example data的时候的结果和之前推理脚本的结果不一样。请你检查有哪些地方的实施和原始脚本不同。
++ 这是双方的启动命令：
+    1. bash src/inference.sh
+    2. ./scripts/inference_unified.sh example example_test_data example_test_data/target_traj_json wandb/10-16-160559_Exp07j/checkpoints/step1100.ckpt
+
++ 我给你一点检查的思路提示:
+    1. 首先需要确认input 是否一致。已知用的是同样的input video和condition pose。你需要确认target pose是否一致，原始的需要.json文件作为输入，新的推理脚本输入的是一个目录下的.npz文件，这里的.npz是我读取.json然后转换过来的，理论上是一样的，但还是建议你读取文件然后确认是否一致。
+    2. 在输入模型前的数据预处理是否一样，包括对视频裁剪到模型分辨率。对位姿的处理，比如说对齐到原点，计算相对位姿，平移归一化，计算w2c等。
+    3. 已知是load同一个checkpoint，模型因此大概率是一样的。但推理管线pipeline是否一样还需要确认。

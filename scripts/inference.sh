@@ -58,4 +58,5 @@ PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
     --cfg_scale 1.0 \
     --frame_downsample_to 0 \
     --dataloader_num_workers 1 \
-    --camera_extrinsics_filename "camera_extrinsics_ori.json"
+    --camera_extrinsics_filename "camera_extrinsics_ori.json" \
+    --debug

@@ -447,7 +447,7 @@ def parse_args():
     parser.add_argument(
         "--frame_downsample_to",
         type=int,
-        default=5,
+        default=0,
         help="Temporal latent downsample count (0 表示不降采样)"
     )
     parser.add_argument(
@@ -543,11 +543,7 @@ if __name__ == '__main__':
 
     base_output_dir = args.output_dir if args.output_dir else "./result"
     output_dir = broadcast_output_directory(base_output_dir, distributed, rank)
-    if world_size > 1:
-        rank_output_dir = os.path.join(output_dir, f"rank{rank:02d}")
-    else:
-        rank_output_dir = output_dir
-    os.makedirs(rank_output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     dataset = TextVideoCameraDataset(
         args.dataset_path,
@@ -584,18 +580,16 @@ if __name__ == '__main__':
         source_video = batch["video"]
         camera_list = batch["camera"]
         source_path = batch["path"][0]
-        cam_fname = os.path.basename(source_path)  # original video filename
-
-        sample_stem = Path(source_path).stem
-        sample_dir = Path(rank_output_dir) / sample_stem
-        sample_dir.mkdir(parents=True, exist_ok=True)
+        video_name = Path(source_path).stem
+        num_frames = int(source_video.shape[2])
+        cam_inds = np.array(list(range(num_frames))[::4], dtype=np.int64)
 
         for cam_type_id, target_camera in enumerate(camera_list, start=1):
             ## if id < 5, continue
             # if cam_type_id < 5:
             #     continue
-            cam_output_dir = sample_dir / f"cam_type{cam_type_id}"
-            cam_output_dir.mkdir(parents=True, exist_ok=True)
+            output_stem = f"{video_name}_cam{cam_type_id}"
+            video_save_path = Path(output_dir) / f"{output_stem}.mp4"
 
             video = pipe(
                 prompt=target_text,
@@ -604,11 +598,19 @@ if __name__ == '__main__':
                 target_camera=target_camera,
                 cfg_scale=args.cfg_scale,
                 frame_downsample_to=args.frame_downsample_to,
-                num_inference_steps=20,
+                num_inference_steps=10,
                 seed=0, tiled=True,
 
             )
-            save_path = cam_output_dir / cam_fname
-            save_video(video, str(save_path), fps=30, quality=5)
+            save_video(video, str(video_save_path), fps=30, quality=5)
+
+            target_pose_tensor = target_camera.to(dtype=torch.float32)
+            num_target_frames = target_pose_tensor.shape[0] // 2
+            target_pose = target_pose_tensor[:num_target_frames].cpu().numpy().astype(np.float32)
+            np.savez(
+                video_save_path.with_suffix(".npz"),
+                data=target_pose,
+                inds=cam_inds,
+            )
 
     cleanup_distributed_environment(distributed)
