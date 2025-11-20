@@ -18,7 +18,7 @@ image = pipe(
     # Do not modify the following parameters!
     cfg_scale=1, height=512, width=512, num_inference_steps=1, progress_bar_cmd=lambda x:x
 )
-image.save(f"black_car.jpg")
+image.save("black_car.jpg")
 
 # Image to image
 torch.manual_seed(0)
@@ -28,4 +28,4 @@ image = pipe(
     # Do not modify the following parameters!
     cfg_scale=1, height=512, width=512, num_inference_steps=1, progress_bar_cmd=lambda x:x
 )
-image.save(f"black_car_to_red_car.jpg")
+image.save("black_car_to_red_car.jpg")

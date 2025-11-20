@@ -13,7 +13,6 @@ import regex as re
 import torch
 
 # https://stackoverflow.com/q/62691279
-import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 

@@ -30,4 +30,4 @@ image = pipe(
     eligen_entity_prompts=entity_prompts,
     eligen_entity_masks=masks,
 )
-image.save(f"EliGen_lora.png")
+image.save("EliGen_lora.png")

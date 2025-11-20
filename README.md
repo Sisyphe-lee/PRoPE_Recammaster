@@ -23,15 +23,6 @@
 - **PRoPE 实现** (`src/prope.py`)  
   在自注意力的旋转位置编码中注入投影项，替换原 MLP 位姿注入方案。
 
-## 环境与依赖
-
-1. Python ≥ 3.8，CUDA 12.x GPU。
-2. 安装依赖：`pip install -r requirements.txt && pip install -e .`
-3. 设置 PYTHONPATH：  
-   ```bash
-   export PYTHONPATH=$PWD/third_party/DiffSynth-Studio:$PYTHONPATH
-   ```
-4. 大模型权重请提前下载并在 `train.sh` 或 CLI flag 中指定路径。
 
 ## 训练与推理
 
@@ -64,3 +55,9 @@
 
 - 请勿直接修改 `third_party/`，本地补丁需在 `docs/` 中登记。
 - PR 需附带训练/验证命令、W&B 链接或离线指标，并说明所需数据/权重。
+
+### 更新prompt_emb
+ python scripts/update_prompt_emb.py --dataset_path /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train --metadata_path metadata/output_recam.csv --tensor_suffix .wan22.tensors.pth --overwrite --debug
+
+ ### 运行原始diffsynth
+ 

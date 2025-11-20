@@ -20,7 +20,7 @@ pipe = QwenImagePipeline.from_pretrained(
 snapshot_download("DiffSynth-Studio/Qwen-Image-In-Context-Control-Union", local_dir="models/DiffSynth-Studio/Qwen-Image-In-Context-Control-Union", allow_file_pattern="model.safetensors")
 pipe.load_lora(pipe.dit, "models/DiffSynth-Studio/Qwen-Image-In-Context-Control-Union/model.safetensors")
 
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/qwen-image-context-control/image.jpg")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/qwen-image-context-control/image.jpg")
 origin_image = Image.open("data/examples/qwen-image-context-control/image.jpg").resize((1024, 1024))
 annotator_ids = ['openpose', 'canny', 'depth', 'lineart', 'softedge', 'normal']
 for annotator_id in annotator_ids:

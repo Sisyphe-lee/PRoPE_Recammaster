@@ -7,7 +7,8 @@ from ..schedulers import FlowMatchScheduler
 from .base import BasePipeline
 from typing import Optional, Dict, Any, Tuple, List
 from transformers.cache_utils import DynamicCache
-import torch, os
+import torch
+import os
 from tqdm import tqdm
 
 

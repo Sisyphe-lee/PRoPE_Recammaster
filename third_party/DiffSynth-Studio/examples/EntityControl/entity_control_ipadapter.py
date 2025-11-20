@@ -42,5 +42,5 @@ image = pipe(
     ipadapter_images=[reference_img],
     ipadapter_scale=0.7
 )
-image.save(f"styled_entity_control.png")
-visualize_masks(image, masks, entity_prompts, f"styled_entity_control_with_mask.png")
+image.save("styled_entity_control.png")
+visualize_masks(image, masks, entity_prompts, "styled_entity_control_with_mask.png")

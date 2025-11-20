@@ -19,7 +19,7 @@ pipe.enable_vram_management()
 dataset_snapshot_download(
     dataset_id="DiffSynth-Studio/examples_in_diffsynth",
     local_dir="./",
-    allow_file_pattern=f"data/examples/wan/input_image.jpg"
+    allow_file_pattern="data/examples/wan/input_image.jpg"
 )
 image = Image.open("data/examples/wan/input_image.jpg")
 

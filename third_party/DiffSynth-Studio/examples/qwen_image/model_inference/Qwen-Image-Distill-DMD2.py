@@ -1,6 +1,7 @@
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig, load_state_dict
 from modelscope import snapshot_download
-import torch, math
+import torch
+import math
 
 
 pipe = QwenImagePipeline.from_pretrained(

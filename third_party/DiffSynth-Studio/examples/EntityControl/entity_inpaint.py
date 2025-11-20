@@ -41,5 +41,5 @@ image = pipe(
     enable_eligen_on_negative=False,
     enable_eligen_inpaint=True,
 )
-image.save(f"entity_inpaint.png")
-visualize_masks(image, masks, entity_prompts, f"entity_inpaint_with_mask.png")
+image.save("entity_inpaint.png")
+visualize_masks(image, masks, entity_prompts, "entity_inpaint_with_mask.png")

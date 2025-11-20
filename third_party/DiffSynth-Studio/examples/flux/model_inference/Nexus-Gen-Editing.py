@@ -25,7 +25,7 @@ pipe = FluxImagePipeline.from_pretrained(
     nexus_gen_processor_config=ModelConfig(model_id="DiffSynth-Studio/Nexus-GenV2", origin_file_pattern="processor/"),
 )
 
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/nexusgen/cat.jpg")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/nexusgen/cat.jpg")
 ref_image = Image.open("data/examples/nexusgen/cat.jpg").convert("RGB")
 prompt = "Add a crown."
 image = pipe(

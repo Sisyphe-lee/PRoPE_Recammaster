@@ -1,5 +1,4 @@
 from diffsynth import save_video, SDXLImagePipeline, ModelManager, SVDVideoPipeline, download_models
-from diffsynth import ModelManager
 import torch
 
 

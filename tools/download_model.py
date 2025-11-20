@@ -8,7 +8,6 @@ python tools/download_model.py -m Wan-AI/Wan2.2-TI2V-5B -d /nas/datasets/modelsc
 """
 
 import os
-import argparse
 import sys
 from pathlib import Path
 from typing import Optional, List
@@ -200,10 +199,10 @@ def main(model_id, local_dir, source, token, endpoint, include, exclude, force):
             )
     
     if success:
-        print(f"\n🎉 模型下载完成!")
+        print("\n🎉 模型下载完成!")
         print(f"模型位置: {Path(local_dir).absolute()}")
     else:
-        print(f"\n❌ 模型下载失败!")
+        print("\n❌ 模型下载失败!")
         sys.exit(1)
 
 

@@ -2,7 +2,6 @@ import os
 # Set the HF_ENDPOINT environment variable
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com' # before import all hf related pkgs
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import os
 import subprocess
@@ -15,12 +14,7 @@ import decord
 import csv
 from sklearn.metrics.pairwise import cosine_similarity
 from lmdeploy import pipeline, GenerationConfig, TurbomindEngineConfig
-from lmdeploy.vl.constants import IMAGE_TOKEN
-from lmdeploy.vl import load_image
 
-import torchvision.transforms as T
-from torchvision.transforms.functional import InterpolationMode
-from PIL import Image
 
 from transformers import CLIPProcessor, CLIPModel
 

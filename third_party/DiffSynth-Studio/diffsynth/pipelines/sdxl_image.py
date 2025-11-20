@@ -9,7 +9,6 @@ from .dancer import lets_dance_xl
 from typing import List
 import torch
 from tqdm import tqdm
-from einops import repeat
 
 
 

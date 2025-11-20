@@ -1,36 +1,25 @@
-必须用中文回答我
+以后用中文回答
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` holds training (`train_recammaster.py`), inference, dataset, VAE, and logging utilities for PRoPE on ReCamMaster.
-- `scripts/` provides launchers such as `train.sh` for multi-GPU execution and reproducible experiments.
-- `delta_prope_tests/` contains the Triton Δ-RoPE reference implementation and regression tests—treat it as the ground truth when modifying attention code.
-- `third_party/DiffSynth-Studio/` is vendored upstream DiffSynth; touch only when coordinating an upstream sync.
-- `docs/`, `metadata/`, `assets/`, and `test_output/` store experiment notes, CSVs, and qualitative artefacts referenced by the pipelines.
+`src/` hosts all runnable modules: `train_recammaster.py` for Lightning training, `inference_recammaster.py` for evaluation, `dataset.py` for Wan2.1/2.2 loaders, and `prope.py` for camera-aware attention. Automation sits in `scripts/` (`train.sh`, `run_parallel.sh`, `inference*.sh`) so experiments can be re-run verbatim. Use `metadata/`, `evaluation/`, and `assets/` for configs, captions, and metrics, and place generated artifacts under `models/`, `results/`, or `test_output/`. `third_party/DiffSynth-Studio/` mirrors the upstream Wan stack—treat it as read-only and document any patch you must carry.
 
-## Environment Setup & Build
-- Use Python ≥3.8 with CUDA 12.x GPUs; the Triton kernels rely on CUDA-aligned toolchains.
-- Install dependencies inside a fresh environment: `pip install -r requirements.txt && pip install -e .`.
-- Extend `PYTHONPATH` for vendored modules: `export PYTHONPATH=$PWD/third_party/DiffSynth-Studio:$PYTHONPATH`.
-- Keep large checkpoints external and feed their paths through CLI flags (see defaults in `scripts/train.sh`).
-
-## Build, Test, and Development Commands
-- `bash scripts/train.sh --help` lists reproducible training toggles; prefer this wrapper for distributed runs.
-- `python src/train_recammaster.py --dataset_path /data --output_path ./models/train` starts the Lightning trainer with PRoPE rotary injection.
-- `python src/inference_recammaster.py --dataset_path /data --ckpt_path ./models/ReCamMaster/checkpoints/step20000.ckpt` writes evaluation videos to `--output_dir`.
-- `python delta_prope_tests/test_delta_rope.py` or `python delta_prope_tests/custom_fla.py` verifies Δ-RoPE math against the PyTorch baseline.
+## Build, Test & Development Commands
+Create a virtual env (`python -m venv .venv && source .venv/bin/activate`) and install with `pip install -r requirements.txt && pip install -e .`. Export `PYTHONPATH=$PWD/third_party/DiffSynth-Studio:$PYTHONPATH` so DiffSynth modules resolve. Key commands:
+- `python src/train_recammaster.py --dataset_path /data --pipeline_type v2v --output_path models/train`
+- `bash scripts/train.sh --pipeline-type i2v --dataset-path /nas/a,/nas/b`
+- `python src/inference_recammaster.py --ckpt_path models/.../step1100.ckpt --output_dir test_output`
+- `bash scripts/inference.sh --pipeline-type i2v` for distributed smoke tests
+Run `uv run ruff check . --fix` and `uv run pytest -q` (plus `uv run ruff format` if needed) before pushing.
 
 ## Coding Style & Naming Conventions
-- Follow PEP 8: four-space indentation, `snake_case` functions, `CamelCase` classes, and concise module docstrings.
-- Mirror the explicit seeding and CLI patterns in `train_recammaster.py`; expose new flags via both the Python script and `scripts/train.sh`.
-- Avoid editing `third_party/` unless a vendor bump is coordinated; document local patches in `docs/`.
+Use 4-space indentation, type hints, and concise docstrings for non-obvious math. Keep files/functions snake_case (`vis_cam.py`, `collect_camera_stats`), classes PascalCase, and CLI flags kebab-case. Let Ruff handle imports and formatting; only override when conveying intent. Centralize helpers in `src/utils.py` or `wandb_module.py` rather than scattering script-local utilities.
 
 ## Testing Guidelines
-- Place new tests alongside existing ones in `delta_prope_tests/` and name them `test_<feature>.py`.
-- Use `pytest delta_prope_tests/test_delta_rope.py -k <pattern>` for fast iteration; run the full scripts on GPU hardware before submitting PRs.
-- When training changes affect logging or decoding, capture short artefacts in `test_output/` and clean them up inside helper scripts.
+Place fast unit tests under `tests/` mirroring `src/` names (e.g., `tests/test_prope.py`). Prefer fixtures from `example_test_data/`, and gate GPU-heavy assertions with `@pytest.mark.cuda`. For camera or sampler edits, capture a short `scripts/inference.sh --debug` trajectory, drop evidence in `test_output/` with metrics (`pose_metrics.csv`), and rerun at least one v2v plus one i2v inference after touching attention, datasets, or schedulers.
 
 ## Commit & Pull Request Guidelines
-- Follow Conventional Commit prefixes (`feat:`, `fix:`, `docs:`) as shown in `COMMIT_INFO.md`; keep scopes meaningful.
-- Update documentation, metadata, or configs alongside code that depends on them.
-- PRs should include a summary, the exact command(s) executed, links to WANDB runs or metrics, and representative frames/videos; call out dataset or checkpoint requirements explicitly.
+Branches follow `feat/<short-name>`, `fix/<short-name>`, `docs/<short-name>`, etc. Commits use Conventional Commits with bullet bodies for change, impact, and verification. Every PR should explain motivation, list updated commands/configs, attach validation outputs (W&B link, `results/` plots, or hashes), and note any third-party touchpoints. Update `CHANGELOG.md` for user-visible changes and mention required assets so reviewers can replay the run.
+
+## Security & Configuration Tips
+Never commit checkpoints or raw datasets—reference their paths and keep them in `models/` or external storage. Store WANDB tokens, dataset keys, and NCCL overrides in your shell profile, not scripts. When converting camera metadata, use `scripts/convert_camera_json_to_npz.py` or `tools/` so EXIF or pose traces are scrubbed before sharing logs.

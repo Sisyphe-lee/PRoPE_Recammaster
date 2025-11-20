@@ -79,3 +79,74 @@
     1. 首先需要确认input 是否一致。已知用的是同样的input video和condition pose。你需要确认target pose是否一致，原始的需要.json文件作为输入，新的推理脚本输入的是一个目录下的.npz文件，这里的.npz是我读取.json然后转换过来的，理论上是一样的，但还是建议你读取文件然后确认是否一致。
     2. 在输入模型前的数据预处理是否一样，包括对视频裁剪到模型分辨率。对位姿的处理，比如说对齐到原点，计算相对位姿，平移归一化，计算w2c等。
     3. 已知是load同一个checkpoint，模型因此大概率是一样的。但推理管线pipeline是否一样还需要确认。
+
+## 需求7
++ 我的通用推理脚本 src/inference_unified.py 目前已经可以支持多个数据集（example data和pointodyssey）的V2V推理了。目前我想进一步实现 i2v 推理，该脚本有着不错的拓展性，再次基础上实现i2v不算难
++ 我们进一步讨论下实现i2v的细节
+    1. 目前我仅需要你支持example data就行，不需要考虑pointodyssey 
+    2. 这是i2v的训练脚本 src/train_recammaster.py src/dataset.py src/lightning_trainer.py。其中validation_step和inference的情况基本一致，或许能给你很好的参考。
+    3. i2v inference的输入只需要condition image和target trajectory，不需要condition video和condition trajectory。为了进一步增加鲁棒性，如果此时的dataset是video时，你可以取第一帧做condition image。这是example data的路径evaluation/i2v_eval
+    4. 对于推理需要的pipeline和model，你可以查看validation_step是如何load。我建议仔细理解i2v的pipeline：third_party/DiffSynth-Studio/diffsynth/pipelines/wan_video_new.py。重新封装main中如何load 模型的部分，如果是v2v则调用WanVideoReCamMasterPipeline并load wan2.1,如果是i2v则调用WanVideoPipeline并load wan2.2
+    5. 最后如何存推理结果依然复用v2v的逻辑存inference video和pose
++ 实施纲领：
+    1. 尽可能保持代码的可拓展性。比如说要留好以后用i2v来推理其他数据集的接口
+    2. 尽可能保持代码的复用性，如果能利用已有的函数就不要重复造轮子
+    3. 不要过度封装和鲁棒检测，一定要兼顾代码的优雅与可读性
++ 对于实施的细节有什么不清楚的地方，我们先进行讨论。明确后给出一个详细的可执行的方案，经我确认后再修改代码
+
++ 确认细节：
+    1. 仍然是笛卡尔积，一个video需要inference所有pose
+    2. 如果有数据集中有metadata.csv则输入文本，如果没有直接用空字符串。沿用现有NEGATIVE_PROMPT
+    3. 分辨率固定
+
+
+## 需求8
++ 目前的训练脚本src/train_recammaster.py src/lightning_trainer.py src/dataset.py中已经支持v2v和i2v的camera control训练。
++ 目前我想进一步扩展训练时支持的数据集。目前仅能在MultiCam dataset上进行训练，/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset.但是我现在希望能够支持在relestate10k：/nas/datasets/re10k  上训练。
++ 实现原则：
+    1. 尽可能保证少的修改代码，在重复理解已有框架的情况下修改，不要大段造轮子。
+    2. 代码要做到简洁优雅，有着高度可读性。
+    3. 要实现一定的拓展性，以后还会加入其他的数据集
+### 提取vae feature
++ 在训练前的第一步是提取并保存re10k的vae feature。这是我原先的提取vae feature的脚本和启动命令: src/vae_feature.py scripts/extract_vae.sh. 它目前只支持提取MultiCamVideo-Dataset的feature.
++ 具体实施建议:
+    1. 你可以在 src/vae_feature.py 里面新建立一个dataset来适配rel10k数据集。需要你先完整的理解原始数据的文件格式。
+    2. re10k的数据存储比较麻烦，是一系列.torch文件，每个里面有若干段数据；还有一个.json文件，标记哪个数据是属于哪个.torch。因此我希望在提取并存储vae feature的同时，重新整理一下数据集的格式。我新建立了一个文件夹/nas/datasets/relestate10k,里面有train和test子目录。
+        + 在trian或者test的split子目录下我希望这样存每个数据，可以在存vae feature的时候顺便实现：
+            + 以每段数据的序列名建立子目录。然后序列名子目录下有一段.mp4文件，一个intrinsics.npz，一个extrinsics.npz，一个metadata.json来这个数据的其他元信息。最后还有一个.wan22.tensors.pth来存vae feature    
+    3. 加入resume功能（如果当前就有，可以不加），当在提取vae feature被中断时，我们不需要再次重新提取全部feature，而是跳过已经提取的。
+
++ 有什么不清楚的细节可以先问我，我们先讨论出一个合理的方案，我确认后再实施修改。我在一些我认为方便你修改的地方加了##TODO 注释来提醒。
+
+### 实现训练脚本的rel10k支持
++ 目前重新整理过并提取的rel10k数据集路径在这里：/nas/datasets/relestate10k。现在我想实现训练脚本中对rel10k数据集的支持，训练脚本相关的文件：src/dataset.py，src/train_recammaster.py，src/lightning_trainer.py。
++ 目前训练脚本已经支持在i2v和v2v两种模式训练。这两种模式只能支持multicam数据集。我现在希望能够支持rel10k，但实际上v2v不会在rel10k上训练。
+
++ 再次重申实现原则：
+    1. 尽可能保证少的修改代码，在重复理解已有框架的情况下修改，不要大段造轮子。
+    2. 代码要做到简洁优雅，有着高度可读性。
+    3. 要实现高度的拓展性，可以方便的接入未来可能用到的其他数据集
+
++ 具体实现建议，我认为需要修改的地方已经用##TODO:标记出来：
+    1. 我想实现一个wraper，能够在train i2v model的时候，可以在两个数据集里面随机sample，而不是每次训练只能在某一个数据集上进行，具体来说的实现可能需要你给我一些启发。我建议可以调整成有一个i2v的基类dataset，然后给每个数据集都有一个dataset。
+    2. 因为理论上rel10k不会在v2v上训练，因此我觉得 ImageConditionTensorDataset 可以不用继承TensorDataset，而是单独是一个基类或者在init中额外加入处理多数据sample的逻辑。但我不确认有没有必要给每个数据集(multicam,rel10k)都设置一个dataset class来继承ImageConditionTensorDataset（用TODO标出），这个你可以自己把握
+    3. rel 10k的内参是每个场景都不一样的，在每个场景里面的intrinsics.npz
+    4. rel 10k的metadata.csv（里面包含caption）的格式和mulcam的一样，因此理论上只需要在两个metadata.csv里面sample。
+    5. 为了提高代码拓展性，我希望修改尽量限制在 dataset上，训练流程的其他地方尽量不要改变
+
++ 有什么不清楚的细节可以先问我，我们先讨论出一个合理的方案，我确认后再实施修改。
+
+
+## 需求9
+### setting
++ 我在multi recam上进行测试。
++ 先用训练脚本进行测试，查看了在开始训练前第一次validate的结果：exp_by_day/11.8/exp13a:new_caption_i2v.sh。
++ 用在同一个数据上用官方的推理管线测试
+### 结果与疑问
++ 在用我用wan2.2TI2V-5B官方的推理管线时，对图片进行了resize，实现了居中最大面积裁剪的效果，保持图片比例的同时裁剪了最大的面积。third_party/DiffSynth-Studio/examples/wanvideo/model_inference/Wan2.2-TI2V-5B.py
++ 但是我在运行训练脚本的src/lightning_trainer.py：validation_step时，发现decode出来的结果没有实现最大面积的裁剪，只是裁剪了中心区域的一部分，这样很容易无法裁剪到完整的人物动态。
++ 请帮我分析是validation_step是如何resize的，导致只裁剪了中心区域的一部分。
++ 这里有一些可能的地方需要你排查:
+    1. 在提取vae feature时的是如何resize的 src/vae_feature.py，尤其是latents的分辨率。。提示：在multicam上提取vae feature时没有保存latents，并在在validation_step时也只是传递了空的image_emb，用第一帧的latents做img condition
+    2. 在validation_step之前，dataset对latents是否做了处理
+    3. 在validation_step最后decode and combine video是否做了处理

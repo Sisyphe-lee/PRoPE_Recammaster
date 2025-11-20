@@ -1,10 +1,9 @@
-from typing import List, Optional
+from typing import List
 from PIL import Image
 import torch
 from transformers import AutoProcessor, AutoModel
 from safetensors.torch import load_file
-import os
-from typing import Union, List
+from typing import Union
 from .config import MODEL_PATHS
 
 class MLP(torch.nn.Module):

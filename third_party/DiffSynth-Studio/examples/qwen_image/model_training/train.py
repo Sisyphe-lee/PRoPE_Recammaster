@@ -1,5 +1,5 @@
-import torch, os, json
-from diffsynth import load_state_dict
+import torch
+import os
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
 from diffsynth.pipelines.flux_image_new import ControlNetInput
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, qwen_image_parser, launch_training_task, launch_data_process_task

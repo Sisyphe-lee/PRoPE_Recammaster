@@ -5,12 +5,12 @@ import inspect
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import imageio
 import lightning as pl
 import numpy as np
 import torch
-import torch.nn as nn
 from einops import rearrange
 from PIL import Image
 
@@ -19,10 +19,10 @@ THIRD_PARTY_DIFFSYNTH = PROJECT_ROOT / "third_party" / "DiffSynth-Studio"
 if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
     sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
 
-from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
+from diffsynth import WanVideoReCamMasterPipeline, ModelManager
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline
 
-from src.wandb_module import WandBVideoLogger, VideoDecoder
+from src.wandb_module import VideoDecoder
 
 
 class LightningModelForTrain(pl.LightningModule):
@@ -31,6 +31,8 @@ class LightningModelForTrain(pl.LightningModule):
         dit_path,
         vae_path,
         latent_path,
+        text_encoder_path=None,
+        tokenizer_path=None,
         learning_rate=1e-5,
         use_gradient_checkpointing=True, use_gradient_checkpointing_offload=False,
         resume_ckpt_path=None,
@@ -47,6 +49,7 @@ class LightningModelForTrain(pl.LightningModule):
         use_real_temporal_indices=False,
         use_physical_index=False,
         pipeline_type="v2v",
+        val_guidance_scale=None,
     ): 
         super().__init__()
         if resume_ckpt_path in (None, "", "none"):
@@ -60,8 +63,18 @@ class LightningModelForTrain(pl.LightningModule):
         self.use_real_temporal_indices = use_real_temporal_indices
         self.use_physical_index = use_physical_index
         self.pipeline_type = pipeline_type
+        self.text_encoder_path = text_encoder_path
+        inferred_tokenizer_path = self._infer_tokenizer_path(text_encoder_path)
+        self.tokenizer_path = tokenizer_path or inferred_tokenizer_path
+        self.val_guidance_scale = None
+        if pipeline_type == "i2v" and val_guidance_scale is not None and val_guidance_scale > 0:
+            self.val_guidance_scale = float(val_guidance_scale)
+        if pipeline_type == "i2v" and not self.text_encoder_path:
+            raise ValueError("i2v 模式必须提供 text_encoder_path。")
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         models_to_load = [vae_path]
+        if text_encoder_path:
+            models_to_load.append(text_encoder_path)
         if isinstance(dit_path, (list, tuple)):
             shard_paths = list(dit_path)
         else:
@@ -134,37 +147,51 @@ class LightningModelForTrain(pl.LightningModule):
         self.last_decode_step = -1
         self._has_started_training = False
         
-        # Initialize WandB video logger
-        self.wandb_logger = WandBVideoLogger(
-            strategy=wandb_video_strategy,
-            max_videos_per_epoch=wandb_max_videos_per_epoch,
-            quality_threshold=wandb_video_quality_threshold,
-            compress_videos=wandb_compress_videos,
-            video_fps=wandb_video_fps,
-            video_scale=wandb_video_scale,
-            output_dir=os.path.join(latent_path, "wandb_temp")
-        )
-        
         # Initialize video decoder
         self.video_decoder = VideoDecoder(self.pipe, pipeline_type=self.pipeline_type)
+
+        # Prompt dropout configuration (i2v only)
+        self.prompt_dropout_prob = 0.2 if pipeline_type == "i2v" else 0.0
+        self.uncond_prompt_context: Optional[torch.Tensor] = None
+        needs_uncond = (
+            pipeline_type == "i2v"
+            and (
+                self.prompt_dropout_prob > 0
+                or (self.val_guidance_scale is not None and self.val_guidance_scale > 0)
+            )
+        )
+        if needs_uncond:
+            self.uncond_prompt_context = self._build_uncond_prompt_context()
+            self._release_text_encoder()
         
     def training_step(self, batch, batch_idx):
         # Data
         latents = batch["latents"].to(self.device)
-        prompt_emb = batch["prompt_emb"]
-        prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
-        image_emb = batch["image_emb"]
+        prompt_emb = copy.deepcopy(batch.get("prompt_emb", {}))
+        prompt_context = prompt_emb.get("context")
+        if torch.is_tensor(prompt_context):
+            if prompt_context.dim() == 4:
+                prompt_context = prompt_context[:, 0]
+            elif prompt_context.dim() == 2:
+                prompt_context = prompt_context.unsqueeze(0)
+            prompt_context = prompt_context.to(self.device)
+            prompt_emb["context"] = prompt_context
+        image_emb = {}
         
-        if "clip_feature" in image_emb:
-            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
-        if "y" in image_emb:
-            image_emb["y"] = image_emb["y"][0].to(self.device)
+        is_i2v = self.pipeline_type == "i2v"
+
+        if is_i2v and self.prompt_dropout_prob > 0 and torch.is_tensor(prompt_context):
+            if self.uncond_prompt_context is None:
+                raise RuntimeError("i2v 模式的 prompt dropout 需要可用的空 prompt embedding。")
+            drop_flag = torch.rand((), device=self.device) < self.prompt_dropout_prob
+            if drop_flag.item():
+                prompt_context = self._get_uncond_context_for_batch(prompt_context.shape[0])
+                prompt_emb["context"] = prompt_context
 
         cam_emb = batch["camera"].to(self.device)
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
-        is_i2v = self.pipeline_type == "i2v"
         # Optional external frame downsampling
         temporal_indices = None
         if isinstance(self.frame_downsample_to, int) and self.frame_downsample_to > 0:
@@ -249,24 +276,25 @@ class LightningModelForTrain(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        # Store current batch_idx for video naming
-        self._current_batch_idx = batch_idx
-        
         latents = batch["latents"].to(self.device)
-        prompt_emb = batch["prompt_emb"]
-        prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
-        image_emb = batch["image_emb"]
-        if "clip_feature" in image_emb:
-            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
-        if "y" in image_emb:
-            image_emb["y"] = image_emb["y"][0].to(self.device)
+        prompt_emb = copy.deepcopy(batch.get("prompt_emb", {}))
+        context = prompt_emb.get("context")
+        if torch.is_tensor(context):
+            if context.dim() == 4:  # (batch, prompt_type, seq, hidden)
+                context = context[:, 0]
+            elif context.dim() == 2:  # (seq, hidden)
+                context = context.unsqueeze(0)
+            prompt_emb["context"] = context.to(self.device)
+        image_emb =  {}
+        for key, value in list(image_emb.items()):
+            if torch.is_tensor(value):
+                image_emb[key] = value.to(self.device)
         cam_emb = batch["camera"].to(self.device)
         cam_intrinsics = batch.get("intrinsics")
         if cam_intrinsics is not None:
             cam_intrinsics = cam_intrinsics.to(self.device)
 
         self.pipe.device = self.device
-
         is_i2v = self.pipeline_type == "i2v"
         # External frame downsampling (align with training_step)
         frame_downsample_to = getattr(self, 'frame_downsample_to', 0)
@@ -299,8 +327,8 @@ class LightningModelForTrain(pl.LightningModule):
             target_latents = latents[:, :, :tgt_latent_len, ...]
             condition_latents = latents[:, :, tgt_latent_len:, ...]
         
-        # Deterministic seed per step/batch (use downsampled target shape)
-        val_seed = self.global_seed + self.global_step + batch_idx
+        # Deterministic seed shared across validation samples
+        val_seed = self.global_seed
         if "dtype" in self._generate_noise_params:
             noise = self.pipe.generate_noise(
                 target_latents.shape,
@@ -330,6 +358,8 @@ class LightningModelForTrain(pl.LightningModule):
         latents_gen = noise
         if is_i2v:
             latents_gen[:, :, 0, ...] = target_latents[:, :, 0, ...]
+        guidance_scale = self.val_guidance_scale if is_i2v else None
+        use_cfg = guidance_scale is not None and guidance_scale > 0
         for progress_id, timestep in enumerate(self.pipe.scheduler.timesteps):
             timestep = timestep.unsqueeze(0).to(dtype=self.pipe.torch_dtype, device=self.device)
             if is_i2v:
@@ -338,21 +368,55 @@ class LightningModelForTrain(pl.LightningModule):
             else:
                 latents_input = torch.cat([latents_gen, condition_latents], dim=2)
             extra_input = self.pipe.prepare_extra_input(latents_input)
-            noise_pred = self._get_denoising_model()(
-                latents_input,
-                timestep=timestep,
-                cam_emb=cam_emb,
-                cam_intrinsics=cam_intrinsics,
-                temporal_indices=temporal_indices,
-                **prompt_emb,
-                **extra_input,
-                **image_emb,
-                use_gradient_checkpointing=self.use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
-                t_highfreq_ratio=self.t_highfreq_ratio,
-                frame_downsample_to=self.frame_downsample_to,
-                fuse_vae_embedding_in_latents=is_i2v,
-            )
+            if not use_cfg:
+                noise_pred = self._get_denoising_model()(
+                    latents_input,
+                    timestep=timestep,
+                    cam_emb=cam_emb,
+                    cam_intrinsics=cam_intrinsics,
+                    temporal_indices=temporal_indices,
+                    **prompt_emb,
+                    **extra_input,
+                    **image_emb,
+                    use_gradient_checkpointing=self.use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+                    t_highfreq_ratio=self.t_highfreq_ratio,
+                    frame_downsample_to=self.frame_downsample_to,
+                    fuse_vae_embedding_in_latents=is_i2v,
+                )
+            else:
+                batch_size = latents_input.shape[0]
+                prompt_cfg = copy.deepcopy(prompt_emb)
+                if "context" not in prompt_cfg or not torch.is_tensor(prompt_cfg["context"]):
+                    raise RuntimeError("启用 CFG 需要可用的 prompt context。")
+                uncond_context = self._get_uncond_context_for_batch(batch_size)
+                prompt_cfg["context"] = torch.cat(
+                    [prompt_cfg["context"], uncond_context], dim=0
+                )
+                latents_input_cat = torch.cat([latents_input, latents_input], dim=0)
+                cam_emb_cat = torch.cat([cam_emb, cam_emb], dim=0)
+                cam_intrinsics_cat = None
+                if cam_intrinsics is not None:
+                    cam_intrinsics_cat = torch.cat([cam_intrinsics, cam_intrinsics], dim=0)
+                extra_input_cat = self._duplicate_condition_dict(extra_input, batch_size)
+                image_emb_cat = self._duplicate_condition_dict(image_emb, batch_size)
+                noise_pred_cat = self._get_denoising_model()(
+                    latents_input_cat,
+                    timestep=timestep,
+                    cam_emb=cam_emb_cat,
+                    cam_intrinsics=cam_intrinsics_cat,
+                    temporal_indices=temporal_indices,
+                    **prompt_cfg,
+                    **extra_input_cat,
+                    **image_emb_cat,
+                    use_gradient_checkpointing=self.use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
+                    t_highfreq_ratio=self.t_highfreq_ratio,
+                    frame_downsample_to=self.frame_downsample_to,
+                    fuse_vae_embedding_in_latents=is_i2v,
+                )
+                noise_pred_cond, noise_pred_uncond = torch.chunk(noise_pred_cat, 2, dim=0)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             if is_i2v:
                 latents_gen = self.pipe.scheduler.step(
                     noise_pred,
@@ -368,52 +432,42 @@ class LightningModelForTrain(pl.LightningModule):
                     latents_input[:, :, :tgt_latent_len, ...]
                 )
         
-        # Decode video并计算 PSNR
-        psnr_value, combined_frames, metadata = self.decode_video(
+        # Decode整批视频并计算单样本指标
+        sample_results = self.decode_video(
             latents_gen,
             target_latents,
             batch,
             condition_latents=None if is_i2v else condition_latents,
         )
 
-        # Save video with validation naming
-        combined_path = self.save_video_with_naming(combined_frames, batch, video_type="val")
+        batch_psnr_values = []
+        for sample_result in sample_results:
+            psnr_value = float(sample_result.get("psnr", 0.0))
+            video_frames = sample_result.get("combined_frames", [])
+            metadata = dict(sample_result.get("metadata", {}))
+            metadata["batch_idx"] = int(batch_idx)
+            batch_psnr_values.append(psnr_value)
 
-        # Accumulate for epoch-average
-        if not hasattr(self, "_val_psnr_sum"):
-            self._val_psnr_sum = 0.0
-            self._val_count = 0
-        self._val_psnr_sum += float(psnr_value)
-        self._val_count += 1
+            combined_path = os.path.abspath(
+                self.save_video_with_naming(video_frames, metadata, video_type="val")
+            )
 
-        # Queue video for WandB upload (only rank 0)
-        if self.global_rank == 0:
-            try:
-                # Extract metadata from batch
-                scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
-                condition_cam_type = batch.get('condition_cam_type', ['unknown'])[0] if isinstance(batch.get('condition_cam_type'), list) else str(batch.get('condition_cam_type', 'unknown'))
-                target_cam_type = batch.get('target_cam_type', ['unknown'])[0] if isinstance(batch.get('target_cam_type'), list) else str(batch.get('target_cam_type', 'unknown'))
-                
-                metadata = {
-                    'scene_id': scene_id,
-                    'condition_cam_type': condition_cam_type,
-                    'target_cam_type': target_cam_type,
-                    'current_step': self.global_step  # Store current step in metadata
-                }
-                
-                # Queue video using WandB logger
-                self.wandb_logger.queue_video(combined_frames, metadata, psnr_value, batch_idx)
-                
-            except Exception as e:
-                print(f"Failed to queue validation video for WandB: {e}")
-        
-        # Print info for all ranks about saved videos
-        print(f"Rank {self.global_rank}: Saved validation videos for batch {batch_idx} at step {self.global_step}")
+            if not hasattr(self, "_val_psnr_sum"):
+                self._val_psnr_sum = 0.0
+                self._val_count = 0
+            self._val_psnr_sum += psnr_value
+            self._val_count += 1
+
+            sample_idx = metadata.get("sample_idx", 0)
+            print(
+                f"Rank {self.global_rank}: Saved validation video for batch {batch_idx}, sample {sample_idx} at step {self.global_step}: {combined_path}"
+            )
 
         # Restore training timesteps after validation to avoid affecting training_step
         self.pipe.scheduler.set_timesteps(self.train_timesteps, training=True)
 
-        return {"psnr": psnr_value}
+        avg_batch_psnr = float(np.mean(batch_psnr_values)) if batch_psnr_values else 0.0
+        return {"psnr": avg_batch_psnr}
 
 
     def _init_pipeline(self, model_manager, pipeline_type):
@@ -443,6 +497,13 @@ class LightningModelForTrain(pl.LightningModule):
             if getattr(pipe, name, None) is not None:
                 tracked.append(name)
         pipe.model_names = list(dict.fromkeys(existing_names + tracked))
+        if getattr(pipe, "prompter", None) is not None and pipe.text_encoder is not None:
+            pipe.prompter.fetch_models(pipe.text_encoder)
+            tokenizer_path = self.tokenizer_path
+            if not tokenizer_path:
+                tokenizer_path = self._infer_tokenizer_path(self.text_encoder_path)
+            if tokenizer_path:
+                pipe.prompter.fetch_tokenizer(tokenizer_path)
         return pipe
 
 
@@ -484,6 +545,66 @@ class LightningModelForTrain(pl.LightningModule):
             raise AttributeError("Unable to locate denoising model for the current pipeline.")
         return model
 
+    def _build_uncond_prompt_context(self) -> torch.Tensor:
+        prompter = getattr(self.pipe, "prompter", None)
+        text_encoder = getattr(self.pipe, "text_encoder", None)
+        if prompter is None or text_encoder is None:
+            raise RuntimeError("i2v 训练需要可用的 text encoder 来生成空 prompt embedding。")
+        if getattr(prompter, "text_encoder", None) is None:
+            prompter.fetch_models(text_encoder)
+        empty_prompt = prompter.encode_prompt("", positive=True, device="cpu")
+        if not torch.is_tensor(empty_prompt):
+            raise TypeError("encode_prompt 应返回 Tensor。")
+        if empty_prompt.dim() == 3 and empty_prompt.shape[0] == 1:
+            empty_prompt = empty_prompt[0]
+        elif empty_prompt.dim() != 2:
+            raise ValueError(f"空 prompt embedding 形状异常: {empty_prompt.shape}")
+        return empty_prompt.to(dtype=self.pipe.torch_dtype)
+
+    def _release_text_encoder(self) -> None:
+        """释放 text encoder 引用，避免占用 GPU 显存。"""
+        text_encoder = getattr(self.pipe, "text_encoder", None)
+        if text_encoder is None:
+            return
+        prompter = getattr(self.pipe, "prompter", None)
+        if prompter is not None and getattr(prompter, "text_encoder", None) is text_encoder:
+            prompter.text_encoder = None
+        self.pipe.text_encoder = None
+        del text_encoder
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _get_uncond_context_for_batch(self, batch_size: int) -> torch.Tensor:
+        if self.uncond_prompt_context is None:
+            raise RuntimeError("启用 CFG 需要在初始化阶段构建空 prompt embedding。")
+        context = self.uncond_prompt_context.to(self.device)
+        if context.dim() == 2:
+            context = context.unsqueeze(0)
+        if context.shape[0] == batch_size:
+            return context
+        if context.shape[0] == 1 and batch_size > 1:
+            return context.expand(batch_size, -1, -1).contiguous()
+        repeats = (batch_size + context.shape[0] - 1) // context.shape[0]
+        return context.repeat(repeats, 1, 1)[:batch_size]
+
+    def _duplicate_condition_dict(self, data, batch_size: int):
+        if not isinstance(data, dict) or not data:
+            return {} if data is None else copy.deepcopy(data)
+        duplicated = copy.deepcopy(data)
+        for key, value in duplicated.items():
+            if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == batch_size:
+                duplicated[key] = torch.cat([value, value], dim=0)
+        return duplicated
+
+    @staticmethod
+    def _infer_tokenizer_path(text_encoder_path: Optional[str]) -> Optional[str]:
+        if not text_encoder_path:
+            return None
+        candidate = Path(text_encoder_path).resolve().parent / "google" / "umt5-xxl"
+        if candidate.exists():
+            return str(candidate)
+        return None
+
 
     def freeze_parameters(self):
         # Freeze parameters
@@ -504,15 +625,13 @@ class LightningModelForTrain(pl.LightningModule):
             print(f"Stripping {removed} legacy camera-layer parameters from checkpoint.")
         return filtered
     def decode_video(self, pred_latents, gt_target_latents, batch, condition_latents=None):
-        """Decode video and calculate PSNR without saving"""
-        psnr_value, combined_frames, metadata = self.video_decoder.decode_and_create_combined_video(
+        """Decode整个 batch，并返回每个样本的可视化与指标。"""
+        return self.video_decoder.decode_and_create_combined_videos(
             pred_latents,
             gt_target_latents,
             condition_latents,
             batch,
         )
-
-        return psnr_value, combined_frames, metadata
     
     def _compute_downsample_indices(self, total_frames, frame_downsample, is_i2v):
         if frame_downsample >= total_frames:
@@ -555,42 +674,40 @@ class LightningModelForTrain(pl.LightningModule):
 
         return latents, cam_emb, cam_intrinsics, indices
     
-    def save_video_with_naming(self, combined_frames, batch, video_type="val"):
-        """Save video with appropriate naming based on type"""
-        # Extract metadata for file naming
-        try:
-            scene_id = batch.get('scene_id', ['unknown'])[0] if isinstance(batch.get('scene_id'), list) else str(batch.get('scene_id', 'unknown'))
-            condition_cam_type = batch.get('condition_cam_type', ['unknown'])[0] if isinstance(batch.get('condition_cam_type'), list) else str(batch.get('condition_cam_type', 'unknown'))
-            target_cam_type = batch.get('target_cam_type', ['unknown'])[0] if isinstance(batch.get('target_cam_type'), list) else str(batch.get('target_cam_type', 'unknown'))
-        except Exception as e:
-            print(f"Error extracting metadata from batch: {e}")
-            scene_id = "unknown"
-            condition_cam_type = "unknown"
-            target_cam_type = "unknown"
-        
-        # Create output path based on video type
+    def save_video_with_naming(self, video_frames, metadata, video_type="val"):
+        """Save video locally using metadata-aware naming."""
+        scene_id = str(metadata.get("scene_id", "unknown"))
+        condition_cam_type = str(metadata.get("condition_cam_type", "unknown"))
+        target_cam_type = str(metadata.get("target_cam_type", "unknown"))
+        batch_idx = metadata.get("batch_idx")
+        sample_idx = metadata.get("sample_idx")
+
         os.makedirs(self.latent_path, exist_ok=True)
         if video_type == "val":
-            video_path = os.path.join(
-                self.latent_path, 
-                f"step{self.global_step}_Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}.mp4"
-            )
+            suffix_parts = [f"step{self.global_step}"]
+            if batch_idx is not None:
+                suffix_parts.append(f"B{batch_idx}")
+            if sample_idx is not None:
+                suffix_parts.append(f"Idx{sample_idx}")
+            suffix_parts.append(f"Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}")
+            video_name = "_".join(suffix_parts) + ".mp4"
+            video_path = os.path.join(self.latent_path, video_name)
         elif video_type == "test":
             video_path = os.path.join(
-                self.latent_path, 
-                f"test_epoch{self.current_epoch}_Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}.mp4"
+                self.latent_path,
+                f"test_epoch{self.current_epoch}_Scene{scene_id}_S{condition_cam_type}_T{target_cam_type}.mp4",
             )
         else:
             raise ValueError(f"Unknown video_type: {video_type}")
         
         # Compress frames for local storage (optimized for storage)
-        local_scale = 0.5   # 1/2 resolution
+        local_scale = 1.0   # 保持四宫格完整尺寸
         frame_skip = 2      # Skip every other frame (1/2 frames)
         local_fps = 4       # Reduced FPS from 8 to 4
         local_quality = 4   # Lower quality for smaller file size
         
         compressed_combined_frames = []
-        for i, frame in enumerate(combined_frames):
+        for i, frame in enumerate(video_frames):
             # Skip frames for further compression
             if i % frame_skip != 0:
                 continue
@@ -604,51 +721,52 @@ class LightningModelForTrain(pl.LightningModule):
             compressed_combined_frames.append(compressed_frame)
         
         # Save compressed video
-        imageio.mimsave(video_path, compressed_combined_frames, fps=local_fps, quality=local_quality)
+        imageio.mimsave(
+            video_path,
+            compressed_combined_frames,
+            fps=local_fps,
+            format="FFMPEG",
+            codec="libx264",
+            macro_block_size=None,
+            output_params=["-movflags", "faststart"],
+            quality=local_quality,
+        )
         print(f"Saved {video_type} video: {video_path}")
         
         return video_path
-        
-    
 
     def on_validation_epoch_start(self):
         # Reset accumulators
         self._val_psnr_sum = 0.0
         self._val_count = 0
         
-        # Reset WandB video tracking for new epoch
-        if self.global_rank == 0:
-            self.wandb_logger.reset_epoch()
-            print(f"Rank {self.global_rank}: Starting validation epoch. WandB strategy: {self.wandb_logger.strategy}, max videos: {self.wandb_logger.max_videos_per_epoch}")
-        
-        # Save checkpoint during validation (except for the initial validation before training)
-        if hasattr(self, '_has_started_training') and self._has_started_training and self.global_rank == 0:
-            self.save_validation_checkpoint()
-
     def on_validation_epoch_end(self):
         # Log average PSNR across the validation set
         if getattr(self, "_val_count", 0) > 0:
             avg_psnr = self._val_psnr_sum / self._val_count
             self.log("val/psnr", avg_psnr, on_step=False, on_epoch=True, prog_bar=True, logger=True, rank_zero_only=True, batch_size=self._val_count)
         
-        # Upload all queued videos to WandB at epoch end (only rank 0)
-        if self.global_rank == 0 and hasattr(self.logger, "experiment") and self.logger is not None:
-            self.wandb_logger.upload_videos(self.logger, self.global_step)
+        # Persist a lightweight checkpoint for inspection (rank 0 only)
+        if getattr(self, "_has_started_training", False) and self.global_rank == 0:
+            self.save_validation_checkpoint()
 
     def save_validation_checkpoint(self):
-        """Save checkpoint during validation"""
+        """Save current denoiser weights after validation."""
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if not checkpoint_dir:
+            # Default to training_log/<run>/checkpoints alongside video_debug
+            latent_root = Path(self.latent_path).resolve()
+            checkpoint_dir = latent_root.parent / "checkpoints"
         try:
-            checkpoint_dir = self.trainer.checkpoint_callback.dirpath if self.trainer.checkpoint_callback else "./checkpoints"
             os.makedirs(checkpoint_dir, exist_ok=True)
-            
-            current_step = self.global_step
+            current_step = int(self.global_step)
             state_dict = self._get_denoising_model().state_dict()
-            
-            checkpoint_path = os.path.join(checkpoint_dir, f"validation_step{current_step}.ckpt")
+            checkpoint_path = os.path.join(str(checkpoint_dir), f"validation_step{current_step}.ckpt")
             torch.save(state_dict, checkpoint_path)
-            print(f"Saved validation checkpoint at step {current_step}: {checkpoint_path}")
-        except Exception as e:
-            print(f"Failed to save validation checkpoint: {e}")
+            print(f"[validation] Saved checkpoint at step {current_step}: {checkpoint_path}")
+        except Exception as exc:
+            print(f"[validation] Failed to save checkpoint: {exc}")
 
     def on_train_start(self):
         """Called when training starts"""

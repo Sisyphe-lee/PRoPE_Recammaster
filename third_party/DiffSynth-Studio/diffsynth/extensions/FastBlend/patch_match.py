@@ -1,7 +1,6 @@
 from .cupy_kernels import remapping_kernel, patch_error_kernel, pairwise_patch_error_kernel
 import numpy as np
 import cupy as cp
-import cv2
 import torch
 import torch.nn.functional as F
 

@@ -26,7 +26,7 @@ image = pipe(
     num_inference_steps=50,
     cfg_scale=4,
 )
-image.save(f"image_1024.jpg")
+image.save("image_1024.jpg")
 
 image = pipe(
     prompt=prompt,

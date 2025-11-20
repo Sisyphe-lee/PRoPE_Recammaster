@@ -3,7 +3,6 @@ from PIL import Image
 import torch
 from .open_clip import create_model_and_transforms, get_tokenizer
 from safetensors.torch import load_file
-import os
 from .config import MODEL_PATHS
 
 class HPScore_v2(torch.nn.Module):

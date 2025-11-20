@@ -51,7 +51,6 @@
 #    o_src = F.scaled_dot_product_attention(q_src, k_tgt, v_tgt, **kwargs)
 #    o_src = attn_src._apply_to_o(o_src)
 
-from functools import partial
 from typing import Callable, Optional, Tuple, List
 
 import torch

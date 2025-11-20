@@ -1,4 +1,25 @@
 # Change Log
+## v0.2.17 @cyli - 2025-11-20
+
+### 新增
+- 训练管线引入 `DatasetSpec`、`--dataset_type/--dataset_weights` 等配置，支持在 i2v 模式下按权重混采 MultiCam 与 RealEstate10k，并为前者补齐 `MulticamImageConditionDataset`、`RelEstate10kImageConditionDataset`、`MixedImageConditionDataset` 等数据集实现（`src/dataset.py`, `src/train_recammaster.py`）。
+- `src/vae_feature.py` 扩展出 RealEstate10k 处理链（索引解析、内参重标定、视频与 tensor 写回），并新增 `--dataset_type`、`--re10k-output/--re10k-index`、`--no-resume` 等开关配合同步改造的 `scripts/extract_vae.sh`。
+- 推理入口升级为统一加载 Wan2.1/2.2 权重：`ExampleI2VDataset`、`I2VPipelineHandler`、CFG 推理循环以及 `--pipeline_kind i2v` 选项串联 `scripts/inference_unified.sh` 与 `src/inference_unified.py`，便于直接复现 Wan2.2 I2V 动画。
+
+### 变更
+- Lightning 训练器新增 text encoder/tokenizer 注入、i2v prompt dropout、验证阶段 CFG、批量视频解码与 `training_log` 输出路径，CLI (`src/train_recammaster.py`) 同步暴露相关参数；`src/wandb_module.py` 收敛为纯解码帮助。
+- `src/dataset.py` 重写基础抽样逻辑（路径权重、prompt 归一化、intrinsics 缓存、多数据源切分），i2v 数据集统一产出 `camera` 与 `intrinsics` 张量并提供混合采样器，`create_datasets` 自动生成验证子集。
+- `scripts/train.sh` 默认推断 Wan2.1/2.2 权重、按 pipeline 自动拼装数据集/元数据/权重组合，同时收紧调试 batch/worker、NCCL 环境及 `steps_per_epoch` 等训练默认值。
+
+### 修复
+- 规范 prompt/context 张量维度与 camera/intrinsics dtype，避免在 i2v 条件或多帧 Latent 拼接时出现维度错配；验证噪声种子固定为 `global_seed`，保证多卡可复现。
+
+### 构建与工具链
+- `scripts/inference_unified.sh` 支持选择 pipeline_kind 与统一步数配置；`scripts/extract_vae.sh`/`src/vae_feature.py` 在 i2v 模式下自动回落到 Wan2.2 Text Encoder + tokenizer 并补齐 VAE-only encode fallback。
+
+### 其他
+- 清理旧版 `delta_prope_tests/`、`evaluation/target_traj/*.npz` 等过期资产，避免干扰新版数据流程。
+
 ## v0.2.16 @codex - 2025-10-31
 
 ### 修复

@@ -1,7 +1,6 @@
 import torch
 from PIL import Image
 from typing import Union
-from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
 import numpy as np

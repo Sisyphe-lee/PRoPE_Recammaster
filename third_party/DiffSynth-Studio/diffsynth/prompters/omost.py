@@ -309,7 +309,7 @@ class OmostPromter(torch.nn.Module):
             
         canvas_output["masks"] = masks
         prompt_dict.update(canvas_output)
-        print(f"Your prompt is extended by Omost:\n")
+        print("Your prompt is extended by Omost:\n")
         cnt = 0
         for component,pmt in zip(canvas_output["bag_of_conditions"],prompts):
             loc = component["location"]

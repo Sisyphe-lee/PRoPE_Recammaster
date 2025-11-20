@@ -2,7 +2,8 @@ from .base_prompter import BasePrompter, tokenize_long_prompt
 from ..models.utils import load_state_dict, search_for_embeddings
 from ..models import SDTextEncoder
 from transformers import CLIPTokenizer
-import torch, os
+import torch
+import os
 
 
 

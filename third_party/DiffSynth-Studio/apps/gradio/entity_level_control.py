@@ -9,7 +9,7 @@ from diffsynth import ModelManager, FluxImagePipeline, download_customized_model
 from modelscope import dataset_snapshot_download
 
 
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/eligen/entity_control/*")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/eligen/entity_control/*")
 example_json = 'data/examples/eligen/entity_control/ui_examples.json'
 with open(example_json, 'r') as f:
     examples = json.load(f)['examples']
@@ -81,7 +81,7 @@ def save_mask_prompts(masks, mask_prompts, global_prompt, seed=0, random_dir='00
         "mask_prompts": mask_prompts,
         "seed": seed,
     }
-    with open(os.path.join(save_dir, f"prompts.json"), 'w') as f:
+    with open(os.path.join(save_dir, "prompts.json"), 'w') as f:
         json.dump(sample, f, indent=4)
 
 def visualize_masks(image, masks, mask_prompts, font_size=35, use_random_colors=False):

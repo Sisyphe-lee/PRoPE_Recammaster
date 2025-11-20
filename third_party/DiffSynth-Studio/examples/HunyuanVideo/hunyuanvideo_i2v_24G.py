@@ -34,7 +34,7 @@ pipe = HunyuanVideoPipeline.from_model_manager(model_manager,
 
 dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth",
                           local_dir="./",
-                          allow_file_pattern=f"data/examples/hunyuanvideo/*")
+                          allow_file_pattern="data/examples/hunyuanvideo/*")
 
 i2v_resolution = "720p"
 prompt = "An Asian man with short hair in black tactical uniform and white clothes waves a firework stick."

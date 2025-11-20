@@ -118,7 +118,7 @@ class TimmModel(nn.Module):
     def set_grad_checkpointing(self, enable=True):
         try:
             self.trunk.set_grad_checkpointing(enable)
-        except Exception as e:
+        except Exception:
             logging.warning('grad checkpointing not supported for this timm image tower, continuing without...')
 
     def forward(self, x):

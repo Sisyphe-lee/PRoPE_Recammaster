@@ -1,6 +1,6 @@
-import torch, os, json
-from diffsynth import load_state_dict
-from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
+import torch
+import os
+from diffsynth.pipelines.wan_video_new import WanVideoPipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageCropAndResize, ToAbsolutePath
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

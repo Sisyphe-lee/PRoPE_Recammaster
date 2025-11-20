@@ -1,6 +1,7 @@
 import lightning as pl
 from peft import LoraConfig, inject_adapter_in_model
-import torch, os
+import torch
+import os
 from ..data.simple_text_image import TextImageDataset
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict

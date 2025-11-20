@@ -6,7 +6,6 @@ import transformers
 transformers.logging.set_verbosity_error()
 
 from torch import nn
-import os
 from .med import BertConfig, BertModel
 from .blip import create_vit, init_tokenizer
 

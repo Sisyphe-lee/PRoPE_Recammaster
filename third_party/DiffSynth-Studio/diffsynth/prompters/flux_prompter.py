@@ -2,7 +2,8 @@ from .base_prompter import BasePrompter
 from ..models.flux_text_encoder import FluxTextEncoder2
 from ..models.sd3_text_encoder import SD3TextEncoder1
 from transformers import CLIPTokenizer, T5TokenizerFast
-import os, torch
+import os
+import torch
 
 
 class FluxPrompter(BasePrompter):

@@ -1,6 +1,7 @@
 from diffsynth import ModelManager, save_video, VideoData, download_models, CogVideoPipeline
 from diffsynth.extensions.RIFE import RIFEInterpolater
-import torch, os
+import torch
+import os
 os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
 

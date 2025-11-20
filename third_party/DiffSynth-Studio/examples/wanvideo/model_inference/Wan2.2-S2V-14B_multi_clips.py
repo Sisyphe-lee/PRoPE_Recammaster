@@ -82,7 +82,7 @@ pipe = WanVideoPipeline.from_pretrained(
 dataset_snapshot_download(
     dataset_id="DiffSynth-Studio/example_video_dataset",
     local_dir="./data/example_video_dataset",
-    allow_file_pattern=f"wans2v/*",
+    allow_file_pattern="wans2v/*",
 )
 
 infer_frames = 80  # 4n

@@ -2,7 +2,8 @@ from .base_prompter import BasePrompter
 from ..models.sd3_text_encoder import SD3TextEncoder1
 from ..models.hunyuan_video_text_encoder import HunyuanVideoLLMEncoder, HunyuanVideoMLLMEncoder
 from transformers import CLIPTokenizer, LlamaTokenizerFast, CLIPImageProcessor
-import os, torch
+import os
+import torch
 from typing import Union
 
 PROMPT_TEMPLATE_ENCODE = (

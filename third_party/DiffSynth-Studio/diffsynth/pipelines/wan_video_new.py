@@ -1,15 +1,11 @@
-import torch, warnings, glob, os, types
+import torch
+import types
 import numpy as np
 from PIL import Image
-from einops import repeat, reduce
+from einops import repeat
 from typing import Optional, Union
-from dataclasses import dataclass
-from modelscope import snapshot_download
 from einops import rearrange
-import numpy as np
-from PIL import Image
 from tqdm import tqdm
-from typing import Optional
 from typing_extensions import Literal
 
 from ..utils import BasePipeline, ModelConfig, PipelineUnit, PipelineUnitRunner
@@ -517,7 +513,7 @@ class WanVideoPipeline(BasePipeline):
         models = {name: getattr(self, name) for name in self.in_iteration_models}
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             # Switch DiT if necessary
-            if timestep.item() < switch_DiT_boundary * self.scheduler.num_train_timesteps and self.dit2 is not None and not models["dit"] is self.dit2:
+            if timestep.item() < switch_DiT_boundary * self.scheduler.num_train_timesteps and self.dit2 is not None and models["dit"] is not self.dit2:
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
                 models["vace"] = self.vace2

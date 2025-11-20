@@ -1,6 +1,7 @@
 import gradio as gr
 from diffsynth import ModelManager, SDImagePipeline, SDXLImagePipeline, SD3ImagePipeline, HunyuanDiTImagePipeline, FluxImagePipeline
-import os, torch
+import os
+import torch
 from PIL import Image
 import numpy as np
 

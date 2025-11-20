@@ -27,10 +27,8 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
 # TODO: move to src
-try:
-    from src.prope import _prepare_apply_fns
-except ModuleNotFoundError:
-    raise ModuleNotFoundError("prope module not found, please install it with `pip install prope`")
+from .prope import _prepare_apply_fns
+
 
 DEFAULT_IMAGE_WIDTH = 832.0
 DEFAULT_IMAGE_HEIGHT = 480.0
@@ -308,7 +306,7 @@ class  PRoPE_SelfAttention(nn.Module):
         Ks=None,
         *,
         mask_first_head_fraction: float = 1,
-        t_highfreq_ratio: float = 0.5,
+        t_highfreq_ratio: float = 0.0,
         prpe_meta=None,
         **kwargs,
     ):

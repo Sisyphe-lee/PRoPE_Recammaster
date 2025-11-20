@@ -6,13 +6,14 @@ import os
 import random
 import sys
 from datetime import datetime
+from typing import List, Optional
 
 import lightning as pl
 import numpy as np
 import torch
 import torch.distributed as dist
 
-from src.dataset import create_datasets
+from src.dataset import DatasetSpec, create_datasets
 from src.lightning_trainer import LightningModelForTrain
 
 
@@ -47,7 +48,7 @@ def parse_args():
         type=str,
         default=None,
         required=True,
-        help="The path of the Dataset.",
+        help="The path of the Dataset. 可使用逗号分隔以匹配多个 dataset_type。",
     )
     parser.add_argument(
         "--output_path",
@@ -62,6 +63,18 @@ def parse_args():
         choices=["v2v", "i2v"],
         help="Training mode: 'v2v' (wan2.1 T2V 1.5B ) or 'i2v' (Wan2.2 TI2V 5B).",
     )
+    parser.add_argument(
+        "--dataset_type",
+        type=str,
+        default="multicam",
+        help="数据集类型，可用逗号分隔（例如 multicam,re10k）。",
+    )
+    parser.add_argument(
+        "--dataset_weights",
+        type=str,
+        default=None,
+        help="逗号分隔的采样权重，需与 dataset_type 数量一致（默认等权）。",
+    )
 
     parser.add_argument(
         "--vae_path",
@@ -75,7 +88,18 @@ def parse_args():
         default=None,
         help="Path of DiT.",
     )
-
+    parser.add_argument(
+        "--text_encoder_path",
+        type=str,
+        default=None,
+        help="Path of text_encoder.",
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Path to Wan tokenizer directory. Defaults to <text_encoder_dir>/google/umt5-xxl when omitted.",
+    )
     parser.add_argument(
         "--steps_per_epoch",
         type=int,
@@ -165,8 +189,9 @@ def parse_args():
     parser.add_argument(
         "--metadata_path",
         type=str,
-        required=True,
-        help="Absolute path to the metadata CSV file.",
+        required=False,
+        default=None,
+        help="Absolute path to the metadata CSV file (multicam 模式必填，re10k 可为空).",
     )
     parser.add_argument(
         "--val_size",
@@ -250,6 +275,51 @@ def parse_args():
     return args
 
 
+def _parse_dataset_types_arg(raw: str) -> List[str]:
+    if not raw:
+        return ["multicam"]
+    types = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return types or ["multicam"]
+
+
+def _expand_argument(value: Optional[str], count: int, arg_name: str, allow_empty: bool = False) -> List[Optional[str]]:
+    if value is None:
+        if allow_empty:
+            return [None] * count
+        if count == 1:
+            raise ValueError(f"{arg_name} 必须提供。")
+        raise ValueError(f"{arg_name} 需要提供 {count} 个值，用逗号分隔。")
+    parts = [item.strip() for item in value.split(",")]
+    if len(parts) == 1 and count > 1:
+        parts = parts * count
+    if len(parts) != count:
+        raise ValueError(f"{arg_name} 的数量 ({len(parts)}) 与 dataset_type ({count}) 不一致。")
+    results = []
+    for part in parts:
+        if allow_empty and part.lower() in {"", "none", "null"}:
+            results.append(None)
+        else:
+            results.append(part)
+    return results
+
+
+def _parse_weights(value: Optional[str], count: int) -> List[float]:
+    if not value:
+        return [1.0] * count
+    parts = [item.strip() for item in value.split(",")]
+    if len(parts) == 1 and count > 1:
+        parts = parts * count
+    if len(parts) != count:
+        raise ValueError(f"--dataset_weights 的数量 ({len(parts)}) 与 dataset_type ({count}) 不一致。")
+    weights = []
+    for part in parts:
+        try:
+            weights.append(max(float(part), 0.0))
+        except ValueError as exc:
+            raise ValueError(f"无法解析 dataset weight '{part}'") from exc
+    return weights
+
+
 def train(args):
     # Set global seed for reproducibility
     set_global_seed(args.global_seed)
@@ -262,14 +332,31 @@ def train(args):
         print("Waiting for debugger attach")
         debugpy.wait_for_client()
         print('Attached, continue...')
-    # Create datasets using the new create_datasets function
+    dataset_types = _parse_dataset_types_arg(args.dataset_type)
+    dataset_paths = _expand_argument(args.dataset_path, len(dataset_types), "--dataset_path")
+    metadata_paths = _expand_argument(args.metadata_path, len(dataset_types), "--metadata_path", allow_empty=True)
+    dataset_weights = _parse_weights(args.dataset_weights, len(dataset_types))
+
+    dataset_specs: List[DatasetSpec] = []
+    for dtype, root, meta, weight in zip(dataset_types, dataset_paths, metadata_paths, dataset_weights):
+        if dtype == "multicam" and not meta:
+            raise ValueError("MultiCam 数据集需要提供对应的 metadata CSV。")
+        if root is None:
+            raise ValueError(f"数据集 '{dtype}' 需要提供有效的 --dataset_path。")
+        dataset_specs.append(
+            DatasetSpec(
+                name=dtype,
+                root=root,
+                metadata_path=meta,
+                weight=weight,
+            )
+        )
 
     train_dataset, val_dataset = create_datasets(
-        metadata_path=args.metadata_path,
+        dataset_specs=dataset_specs,
         val_size=args.val_size,
         steps_per_epoch=args.steps_per_epoch,
         seed=args.global_seed,
-        dataset_root=args.dataset_path,
         image_size=(args.width, args.height),
         pipeline_type=args.pipeline_type,
     )
@@ -301,12 +388,14 @@ def train(args):
 
     time_str = os.environ.get("RUN_TIMESTAMP", datetime.now().strftime('%m-%d-%H%M%S'))
     folder_name = f"{time_str}_{args.wandb_name}"
-    latent_path = os.path.join("./wandb", folder_name, "video_debug")
+    latent_path = os.path.join("./training_log", folder_name, "video_debug")
     if os.environ.get("LOCAL_RANK", "0") == "0":
         os.makedirs(latent_path, exist_ok=True)
     model = LightningModelForTrain(
         dit_path=args.dit_path,
         vae_path=args.vae_path,
+        text_encoder_path=args.text_encoder_path,
+        tokenizer_path=args.tokenizer_path,
         latent_path=latent_path,
         learning_rate=args.learning_rate,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
@@ -319,12 +408,13 @@ def train(args):
         use_real_temporal_indices=getattr(args, 'use_real_temporal_indices', False),
         use_physical_index=getattr(args, 'use_physical_index', False),
         pipeline_type=getattr(args, 'pipeline_type', 'v2v'),
+        val_guidance_scale=getattr(args, 'val_guidance_scale', None),
     )
     
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
         wandb_name = f"{time_str}_{args.wandb_name}"
-        run_dir = os.path.join("./wandb", wandb_name)
+        run_dir = os.path.join("./training_log", wandb_name)
         if os.environ.get("LOCAL_RANK", "0") == "0":
             os.makedirs(run_dir, exist_ok=True)
         wandb_logger = WandbLogger(
@@ -365,7 +455,7 @@ def train(args):
         gradient_clip_val=0.05,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    trainer.validate(model, val_dataloader)
+    # trainer.validate(model, val_dataloader)
     
     # Fit the model
     trainer.fit(model, dataloader, val_dataloader)

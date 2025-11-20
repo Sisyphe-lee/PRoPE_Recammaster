@@ -39,6 +39,11 @@ if str(THIRD_PARTY_DIFFSYNTH) not in sys.path:
     sys.path.insert(0, str(THIRD_PARTY_DIFFSYNTH))
 
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video  # noqa: E402
+from diffsynth.pipelines.wan_video_new import WanVideoPipeline  # noqa: E402
+
+WAN_MODEL_ROOT = PROJECT_ROOT / "models" / "Wan-AI"
+WAN21_MODEL_DIR = WAN_MODEL_ROOT / "Wan2.1-T2V-1.3B"
+WAN22_MODEL_DIR = WAN_MODEL_ROOT / "Wan2.2-TI2V-5B"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +219,87 @@ class ExampleDataset(BaseInferenceDataset):
             },
         )
         return sample
+
+
+@register_dataset("example_i2v")
+class ExampleI2VDataset(BaseInferenceDataset):
+    """Image-conditioned dataset for Wan2.2 example data."""
+
+    SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def __init__(self, *, dataset_path: Path, options: Dict[str, Any]) -> None:
+        super().__init__(dataset_path=dataset_path, options=options)
+
+        image_dir = self.dataset_path / options.get("image_dir", "images")
+        if not image_dir.exists():
+            raise FileNotFoundError(f"Condition image directory not found: {image_dir}")
+        self.image_paths = sorted(
+            p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTS
+        )
+        if not self.image_paths:
+            raise RuntimeError(f"No supported images found under {image_dir}")
+
+        metadata_path = self.dataset_path / options.get("metadata_filename", "metadata.csv")
+        self.text_map: Dict[str, str] = {}
+        if metadata_path.exists():
+            metadata = pd.read_csv(metadata_path)
+            for _, row in metadata.iterrows():
+                file_name = str(row.get("file_name", "")).strip()
+                if not file_name:
+                    continue
+                stem = Path(file_name).stem
+                raw_text = row.get("text", "")
+                text = "" if pd.isna(raw_text) else str(raw_text)
+                self.text_map[stem] = text
+
+        self.num_frames = int(options.get("num_frames", 81))
+        self.height = int(options.get("height", 480))
+        self.width = int(options.get("width", 832))
+        self.cam_interval = int(options.get("camera_interval", 4))
+        self.cam_indices = np.arange(self.num_frames, dtype=np.int64)[:: self.cam_interval]
+        if self.cam_indices.size == 0:
+            raise ValueError("camera_interval produced empty cam_indices")
+
+        self.preprocess = v2.Compose(
+            [
+                v2.CenterCrop(size=(self.height, self.width)),
+                v2.Resize(size=(self.height, self.width), antialias=True),
+                v2.ToTensor(),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def _process_image(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as img:
+            frame = preprocess_video_frame(img.convert("RGB"), self.height, self.width)
+        tensor = self.preprocess(frame)  # (C, H, W)
+        video = tensor.unsqueeze(1).repeat(1, self.num_frames, 1, 1)
+        return video.to(torch.float32)
+
+    def __getitem__(self, index: int) -> InferenceSample:
+        image_path = self.image_paths[index]
+        video_tensor = self._process_image(image_path)
+        stem = image_path.stem
+        text = self.text_map.get(stem, "")
+
+        return InferenceSample(
+            video=video_tensor,
+            text=text,
+            cond_data={
+                "condition_image_path": str(image_path),
+                "num_frames": self.num_frames,
+                "height": self.height,
+                "width": self.width,
+                "cam_indices": self.cam_indices.copy(),
+            },
+            metadata={
+                "source_path": str(image_path),
+                "stem": stem,
+            },
+        )
 
 
 @register_dataset("pointodyssey")
@@ -566,6 +652,16 @@ class BasePipelineHandler(abc.ABC):
     ) -> PreparedInference:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def run_inference(
+        self,
+        pipe: Any,
+        prepared: PreparedInference,
+        prompt_text: str,
+        pipe_kwargs: Dict[str, Any],
+    ) -> Any:
+        """Default inference simply forwards to the pipeline callable."""
+        return pipe(**pipe_kwargs)
+
 PIPELINE_REGISTRY: Dict[str, type[BasePipelineHandler]] = {}
 
 
@@ -580,10 +676,130 @@ def register_pipeline(name: str) -> Callable[[type[BasePipelineHandler]], type[B
 
 
 NEGATIVE_PROMPT = (
+    "人物肢体不完整，动作诡异，肢体模糊，"
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
     "JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，"
     "手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
+
+
+def _first_existing_path(candidates: Sequence[Path]) -> Path | None:
+    for path in candidates:
+        if path is not None and path.exists():
+            return path
+    return None
+
+
+def _load_v2v_pipeline(device_str: str) -> WanVideoReCamMasterPipeline:
+    model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
+    model_manager.load_models(
+        [
+            str(WAN21_MODEL_DIR / "diffusion_pytorch_model.safetensors"),
+            str(WAN21_MODEL_DIR / "models_t5_umt5-xxl-enc-bf16.pth"),
+            str(WAN21_MODEL_DIR / "Wan2.1_VAE.pth"),
+        ]
+    )
+    return WanVideoReCamMasterPipeline.from_model_manager(model_manager, device=device_str)
+
+
+def _load_i2v_pipeline(device_str: str) -> WanVideoPipeline:
+    model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
+    text_encoder_path = _first_existing_path(
+        [
+            WAN22_MODEL_DIR / "models_t5_umt5-xxl-enc-bf16.pth",
+            WAN21_MODEL_DIR / "models_t5_umt5-xxl-enc-bf16.pth",
+        ]
+    )
+    if text_encoder_path is None:
+        raise FileNotFoundError("Cannot locate Wan text encoder weights under Wan2.1/2.2 directories.")
+
+    vae_path = WAN22_MODEL_DIR / "Wan2.2_VAE.pth"
+    if not vae_path.exists():
+        raise FileNotFoundError(f"Missing Wan2.2 VAE weights: {vae_path}")
+
+    diffusion_paths = sorted(WAN22_MODEL_DIR.glob("diffusion_pytorch_model-*.safetensors"))
+    if not diffusion_paths:
+        fallback = WAN22_MODEL_DIR / "diffusion_pytorch_model.safetensors"
+        if fallback.exists():
+            diffusion_paths = [fallback]
+        else:
+            raise FileNotFoundError(f"Missing Wan2.2 diffusion weights under {WAN22_MODEL_DIR}")
+
+    models_to_load: List[Any] = [str(text_encoder_path), str(vae_path)]
+    if len(diffusion_paths) == 1:
+        models_to_load.append(str(diffusion_paths[0]))
+    else:
+        models_to_load.append([str(p) for p in diffusion_paths])
+    model_manager.load_models(models_to_load)
+
+    pipe = WanVideoPipeline(device=device_str, torch_dtype=torch.bfloat16)
+    available_names = set(model_manager.model_name)
+    if "wan_video_text_encoder" in available_names:
+        pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
+    if "wan_video_image_encoder" in available_names:
+        pipe.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
+    if "wan_video_dit" in available_names:
+        pipe.dit = model_manager.fetch_model("wan_video_dit")
+    if "wan_video_dit2" in available_names:
+        pipe.dit2 = model_manager.fetch_model("wan_video_dit2")
+    if "wan_video_vae" in available_names:
+        pipe.vae = model_manager.fetch_model("wan_video_vae")
+    if "wan_video_motion_controller" in available_names:
+        pipe.motion_controller = model_manager.fetch_model("wan_video_motion_controller")
+    if "wan_video_vace" in available_names:
+        pipe.vace = model_manager.fetch_model("wan_video_vace")
+    if "wan_video_animate_adapter" in available_names:
+        pipe.animate_adapter = model_manager.fetch_model("wan_video_animate_adapter")
+
+    tokenizer_path = _first_existing_path(
+        [
+            WAN22_MODEL_DIR / "google" / "umt5-xxl",
+            WAN21_MODEL_DIR / "google" / "umt5-xxl",
+        ]
+    )
+    if pipe.text_encoder is not None:
+        pipe.prompter.fetch_models(pipe.text_encoder)
+    if tokenizer_path is None:
+        raise FileNotFoundError("Cannot locate Wan tokenizer directory under Wan2.1/2.2 models.")
+    pipe.prompter.fetch_tokenizer(str(tokenizer_path))
+
+    existing_names = list(getattr(pipe, "model_names", []))
+    tracked = []
+    for name in ["text_encoder", "image_encoder", "dit", "dit2", "vae", "motion_controller", "vace", "animate_adapter"]:
+        if getattr(pipe, name, None) is not None:
+            tracked.append(name)
+    pipe.model_names = list(dict.fromkeys(existing_names + tracked))
+    return pipe
+
+
+def initialize_inference_pipeline(pipeline_kind: str, device_str: str) -> Any:
+    if pipeline_kind == "v2v":
+        return _load_v2v_pipeline(device_str)
+    if pipeline_kind == "i2v":
+        return _load_i2v_pipeline(device_str)
+    raise ValueError(f"Unsupported pipeline_kind='{pipeline_kind}'")
+
+
+def load_checkpoint_file(path: str | Path) -> Dict[str, torch.Tensor]:
+    path = Path(path)
+    path_str = str(path)
+    if path_str.endswith(".safetensors"):
+        from safetensors.torch import load_file  # type: ignore
+
+        return load_file(path_str)
+    try:
+
+        return torch.load(path_str, map_location="cpu")
+    except RuntimeError as err:
+        if "PytorchStreamReader" not in str(err):
+            raise
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+        if magic == b"SAFE":
+            from safetensors.torch import load_file  # type: ignore
+
+            return load_file(path_str)
+        raise
 
 
 @register_pipeline("v2v")
@@ -630,6 +846,217 @@ class V2VPipelineHandler(BasePipelineHandler):
         )
 
 
+@register_pipeline("i2v")
+class I2VPipelineHandler(BasePipelineHandler):
+    """Custom inference loop that mirrors the training/validation i2v flow."""
+
+    def build_inputs(
+        self,
+        sample: InferenceSample,
+        target: TargetSpec,
+        *,
+        source_video: torch.Tensor,
+    ) -> PreparedInference:
+        cond_info = sample.cond_data
+        cam_indices = np.asarray(cond_info["cam_indices"], dtype=np.int64)
+        target_w2cs_sel, matched_inds = select_pose_sequence(target.raw_pose, target.raw_inds, cam_indices)
+
+        target_c2ws = target_w2cs_sel.transpose(0, 2, 1)
+
+        target_c2ws = convert_c2w_convention(target_c2ws)
+        target_c2ws = center_trajectory(target_c2ws)
+        ref_w2c = invert_se3(target_c2ws[0])
+        tgt_rel_c2w = compute_relative_c2w(ref_w2c, target_c2ws)
+        _, tgt_norm = normalize_joint_translation(tgt_rel_c2w, tgt_rel_c2w)
+        tgt_rel_w2c = c2w_to_w2c(tgt_norm)
+        camera_tensor = torch.from_numpy(tgt_rel_w2c).unsqueeze(0).to(dtype=self.dtype)
+
+        return PreparedInference(
+            pipe_kwargs={
+                "camera_embedding": camera_tensor,
+                "condition_image_path": cond_info["condition_image_path"],
+                "num_frames": int(cond_info["num_frames"]),
+                "height": int(cond_info["height"]),
+                "width": int(cond_info["width"]),
+            },
+            target_rel_w2c=tgt_rel_w2c,
+            cam_indices=cam_indices,
+            metadata={
+                "target_name": target.name,
+                "matched_inds": matched_inds,
+            },
+        )
+
+    def _load_condition_image(self, path: str, height: int, width: int) -> Image.Image:
+        with Image.open(path) as img:
+            processed = preprocess_video_frame(img.convert("RGB"), height, width)
+        return processed
+
+    def _encode_condition_embeddings(
+        self,
+        pipe: WanVideoPipeline,
+        image: Image.Image,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+        tiled: bool,
+        tile_size: Tuple[int, int],
+        tile_stride: Tuple[int, int],
+    ) -> Dict[str, torch.Tensor]:
+        device = pipe.device
+        dtype = pipe.torch_dtype
+
+        image_tensor = pipe.preprocess_image(image.resize((width, height))).to(device)
+        clip_feature = None
+        if pipe.image_encoder is not None:
+            clip_feature = pipe.image_encoder.encode_image([image_tensor]).to(dtype=dtype, device=device)
+
+        zeros_tail = torch.zeros(
+            image_tensor.shape[1],
+            max(num_frames - 1, 0),
+            height,
+            width,
+            device=device,
+            dtype=image_tensor.dtype,
+        )
+        vae_input = torch.cat([image_tensor.transpose(0, 1), zeros_tail], dim=1).unsqueeze(0)
+        vae_latents = pipe.vae.encode(
+            vae_input.to(dtype=dtype),
+            device=device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )[0].to(dtype=dtype, device=device)
+        latent_h = height // pipe.vae.upsampling_factor
+        latent_w = width // pipe.vae.upsampling_factor
+        msk = torch.ones(1, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+        if num_frames > 1:
+            msk[:, 1:] = 0
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, latent_h, latent_w)
+        msk = msk.transpose(1, 2)[0]
+        y = torch.concat([msk, vae_latents], dim=0).unsqueeze(0)
+
+        single_video = pipe.preprocess_video([image]).to(device)
+        first_latents = pipe.vae.encode(
+            single_video.to(dtype=dtype),
+            device=device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        ).to(dtype=dtype, device=device)
+
+        return {
+            "clip_feature": clip_feature,
+            "y": y.to(dtype=dtype, device=device),
+            "first_latents": first_latents,
+        }
+
+    def run_inference(
+        self,
+        pipe: WanVideoPipeline,
+        prepared: PreparedInference,
+        prompt_text: str,
+        pipe_kwargs: Dict[str, Any],
+    ) -> Sequence[Image.Image]:
+        cfg_scale = float(pipe_kwargs.get("cfg_scale", self.global_opts.get("cfg_scale", 5.0)))
+        num_steps = int(pipe_kwargs.get("num_inference_steps", 25))
+        seed = int(pipe_kwargs.get("seed", 0))
+        negative_prompt = pipe_kwargs.get("negative_prompt", NEGATIVE_PROMPT)
+        tiled = bool(pipe_kwargs.get("tiled", True))
+        tile_size = pipe_kwargs.get("tile_size", (34, 34))
+        tile_stride = pipe_kwargs.get("tile_stride", (18, 16))
+
+        camera_embedding = pipe_kwargs["camera_embedding"].to(device=pipe.device, dtype=pipe.torch_dtype)
+        condition_path = pipe_kwargs["condition_image_path"]
+        num_frames = int(pipe_kwargs["num_frames"])
+        height = int(pipe_kwargs["height"])
+        width = int(pipe_kwargs["width"])
+
+        condition_image = self._load_condition_image(condition_path, height, width)
+        embeddings = self._encode_condition_embeddings(
+            pipe,
+            condition_image,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        clip_feature = embeddings["clip_feature"]
+        y = embeddings["y"]
+        first_latents = embeddings["first_latents"]
+
+        latent_frames = camera_embedding.shape[1]
+        latent_shape = (
+            1,
+            first_latents.shape[1],
+            latent_frames,
+            first_latents.shape[-2],
+            first_latents.shape[-1],
+        )
+        latents_gen = pipe.generate_noise(latent_shape, seed=seed, rand_device="cpu")
+        latents_gen = latents_gen.to(dtype=pipe.torch_dtype, device=pipe.device)
+        latents_gen[:, :, 0:1] = first_latents
+
+        positive_prompt = prompt_text or ""
+        context_pos = pipe.prompter.encode_prompt(positive_prompt, positive=True, device=pipe.device).to(dtype=pipe.torch_dtype)
+        context_neg = pipe.prompter.encode_prompt(negative_prompt or "", positive=False, device=pipe.device).to(dtype=pipe.torch_dtype)
+        pipe.scheduler.set_timesteps(num_steps, shift=pipe.scheduler.shift, denoising_strength=1.0)
+        for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
+            timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+            latents_input = latents_gen.clone()
+            latents_input[:, :, 0:1] = first_latents
+            prepare_extra_input = getattr(pipe, "prepare_extra_input", lambda latents=None: {})
+            extra_input = prepare_extra_input(latents_input)
+            dit_kwargs = dict(
+                cam_emb=camera_embedding,
+                clip_feature=clip_feature,
+                y=y,
+                temporal_indices=None,
+                use_gradient_checkpointing=False,
+                use_gradient_checkpointing_offload=False,
+                fuse_vae_embedding_in_latents=True,
+                **extra_input,
+            )
+            noise_pred_pos = pipe.dit(
+                latents_input,
+                timestep=timestep,
+                context=context_pos,
+                **dit_kwargs,
+            )
+            if cfg_scale != 1.0:
+                noise_pred_neg = pipe.dit(
+                    latents_input,
+                    timestep=timestep,
+                    context=context_neg,
+                    **dit_kwargs,
+                )
+                noise_pred = noise_pred_neg + cfg_scale * (noise_pred_pos - noise_pred_neg)
+            else:
+                noise_pred = noise_pred_pos
+
+            latents_gen = pipe.scheduler.step(
+                noise_pred,
+                pipe.scheduler.timesteps[progress_id],
+                latents_input,
+            )
+            latents_gen[:, :, 0:1] = first_latents
+
+        decoded = pipe.vae.decode(
+            latents_gen,
+            device=pipe.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        if decoded.dim() == 4:
+            decoded = decoded.unsqueeze(0)
+        frames = pipe.vae_output_to_video(decoded)
+        return frames
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -646,14 +1073,14 @@ def parse_kv_options(options: List[str]) -> Dict[str, Any]:
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified ReCamMaster inference")
-    parser.add_argument("--dataset_kind", type=str, required=True, choices=["example", "pointodyssey"])
+    parser.add_argument("--dataset_kind", type=str, required=True, choices=["example", "example_i2v", "pointodyssey"])
     parser.add_argument("--dataset_path", type=str, required=True, help="Dataset root path")
     parser.add_argument("--dataset_option", action="append", default=[], help="Additional dataset options (key=value)")
     parser.add_argument("--target_pose_dir", type=str, required=True, help="Directory containing target pose .npz files")
-    parser.add_argument("--pipeline_kind", type=str, default="v2v", choices=["v2v"], help="Inference pipeline mode")
+    parser.add_argument("--pipeline_kind", type=str, default="v2v", choices=["v2v", "i2v"], help="Inference pipeline mode")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Checkpoint to load")
     parser.add_argument("--output_dir", type=str, default="evaluation/example_eval", help="Directory to save outputs")
-    parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--cfg_scale", type=float, default=5.0)
     parser.add_argument("--frame_downsample_to", type=int, default=0)
     parser.add_argument("--num_inference_steps", type=int, default=10)
     parser.add_argument("--dataloader_num_workers", type=int, default=1)
@@ -730,31 +1157,18 @@ def main(argv: List[str] | None = None) -> None:
     if sampler is not None:
         sampler.set_epoch(0)
 
-    model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-    model_manager.load_models(
-        [
-            "models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
-            "models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-            "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
-        ]
-    )
     device_str = device.type if device.type == "cpu" else f"cuda:{device.index}"
-    pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device=device_str)
+    pipe = initialize_inference_pipeline(args.pipeline_kind, device_str)
 
     if rank == 0:
         print(f"Using device: {device_str} | world_size={world_size}")
         print(f"Loading checkpoint from: {args.ckpt_path}")
 
-    if str(args.ckpt_path).endswith(".safetensors"):
-        from safetensors.torch import load_file  # type: ignore
-
-        state_dict = load_file(args.ckpt_path)
-    else:
-        state_dict = torch.load(args.ckpt_path, map_location="cpu")
-        if isinstance(state_dict, dict) and "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-        if isinstance(state_dict, dict) and "module" in state_dict:
-            state_dict = state_dict["module"]
+    state_dict = load_checkpoint_file(args.ckpt_path)
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    if isinstance(state_dict, dict) and "module" in state_dict:
+        state_dict = state_dict["module"]
 
     prefixes_to_remove = ["model.", "module.", "pipe.dit.", "dit."]
     cleaned_state: Dict[str, torch.Tensor] = {}
@@ -780,7 +1194,7 @@ def main(argv: List[str] | None = None) -> None:
 
     handler_cls = PIPELINE_REGISTRY.get(args.pipeline_kind)
     if handler_cls is None:
-        raise ValueError(f"Unknown pipeline_kind={args.pipeline_kind}")
+        raise ValueError(f"No inference handler registered for pipeline_kind={args.pipeline_kind}")
     handler = handler_cls(device=device, dtype=torch.bfloat16, global_opts={"cfg_scale": args.cfg_scale, "debug_pose": args.debug})
 
     base_output_dir = Path(args.output_dir)
@@ -798,6 +1212,9 @@ def main(argv: List[str] | None = None) -> None:
             output_stem = f"{sample_stem}_{target.name}"
             video_path = output_dir / f"{output_stem}.mp4"
             pose_path = video_path.with_suffix(".npz")
+            
+            # if target.name != 'cam01':
+            #     continue
 
             if video_path.exists():
                 if rank == 0:
@@ -818,7 +1235,7 @@ def main(argv: List[str] | None = None) -> None:
             pipe_kwargs.update(prepared.pipe_kwargs)
 
             with torch.no_grad():
-                video = pipe(**pipe_kwargs)
+                video = handler.run_inference(pipe, prepared, prompt_text, pipe_kwargs)
 
             save_video(video, str(video_path), fps=30, quality=5)
             np.savez(

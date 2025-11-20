@@ -20,3 +20,7 @@ metadata_all.csv
 wandb/
 .venv/
 clean_empty_experiments.py
+
+training_log
+evaluation/example_eval/
+evaluation/v2v_eval/

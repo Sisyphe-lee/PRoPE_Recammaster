@@ -33,7 +33,7 @@ pipe = FluxImagePipeline.from_model_manager(
         )
     ]
 )
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/infiniteyou/*")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/infiniteyou/*")
 
 prompt = "A man, portrait, cinematic"
 id_image = "data/examples/infiniteyou/man.jpg"

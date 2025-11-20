@@ -13,7 +13,7 @@ from modelscope import dataset_snapshot_download, snapshot_download
 
 snapshot_download("DiffSynth-Studio/Qwen-Image-EliGen", local_dir="models/DiffSynth-Studio/Qwen-Image-EliGen", allow_file_pattern="model.safetensors")
 
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/eligen/qwen-image/*")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/eligen/qwen-image/*")
 example_json = 'data/examples/eligen/qwen-image/ui_examples.json'
 with open(example_json, 'r') as f:
     examples = json.load(f)['examples']
@@ -85,7 +85,7 @@ def save_mask_prompts(masks, mask_prompts, global_prompt, seed=0, random_dir='00
         "mask_prompts": mask_prompts,
         "seed": seed,
     }
-    with open(os.path.join(save_dir, f"prompts.json"), 'w', encoding='utf-8') as f:
+    with open(os.path.join(save_dir, "prompts.json"), 'w', encoding='utf-8') as f:
         json.dump(sample, f, ensure_ascii=False, indent=4)
 
 def visualize_masks(image, masks, mask_prompts, font_size=35, use_random_colors=False):

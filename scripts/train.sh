@@ -1,43 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Train ReCamMaster With PRoPE Attention $(which python), 当前目录: $(pwd)"
-
 usage() {
   cat <<'EOF'
 用法: scripts/train.sh [选项]
-  -c, --cuda-devices LIST        设置 CUDA_VISIBLE_DEVICES (默认: 2,3,4,5,6,7)
-  -d, --debug                    启用调试模式 (batch=1, workers=0)
-  -o, --output-dir PATH          训练输出目录 (默认: ./models/train)
-  -R, --resume-checkpoint PATH   Lightning checkpoint 路径 (可选)
-  -w, --wandb-name NAME          WandB 实验名称 (默认: Exp07c)
-  -s, --dataset-path PATH        数据集路径 (默认: /nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train)
-  -m, --metadata-path PATH       元数据 CSV (默认: ./metadata/metadata_all.csv)
-  -g, --global-seed SEED         全局随机种子 (默认: 42)
-  -t, --t-highfreq-ratio VALUE   自注意高频屏蔽比例 (默认: 0.5)
-  -b, --batch-size VALUE         每卡 batch size (默认: 1)
-  -F, --frame-downsample-to N    每半段采样帧数 (默认: 0 = 不降采样)
-  -T, --use-real-temporal-indices 使用真实帧索引计算 RoPE
-  -P, --use-physical-index       物理索引模式
-  -y, --pipeline-type TYPE       训练管线类型 v2v / i2v (默认: v2v)
-  -M, --model-base-path PATH     基础权重根目录 (默认按 pipeline 推断)
-  -v, --val-size N               验证集 batch 数 (默认: 12)
-  -i, --val-check-interval-batches N  每多少个 batch 运行一次验证 (默认: 50)
-  -h, --help                     显示帮助
+常用参数：
+  -y, --pipeline-type        训练模式 v2v / i2v
+  -s, --dataset-path         逗号分隔的数据集路径
+  -m, --metadata-path        逗号分隔的 metadata CSV（无则填 none）
+  -S, --dataset-type         逗号分隔的数据集类型（multicam, rel10k ...）
+      --dataset-weights      采样权重，与 dataset-type 数量一致
+  其余参数参见脚本内默认值。
 EOF
   exit 1
 }
 
-export RUN_TIMESTAMP=$(date +'%m-%d-%H%M%S')
+# -------- 默认值 --------
+export RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +'%m-%d-%H%M%S')}
+export TOKENIZERS_PARALLELISM=false
+DEFAULT_MULTICAM="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train"
+DEFAULT_REL10K="/nas/datasets/relestate10k"
+DEFAULT_METADATA="$(pwd)/metadata/metadata_all.csv"
 
-# 默认参数
-CUDA_VISIBLE_DEVICES="2,3,4,5,6,7"
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"2,3,4,5,6,7"}
 DEBUG_MODE=false
 OUTPUT_DIR="$(pwd)/models/train"
 RESUME_CHECKPOINT_PATH=""
 WANDB_NAME="Exp07c"
-DATASET_PATH="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train"
-METADATA_PATH="$(pwd)/metadata/metadata_all.csv"
+DATASET_PATH="$DEFAULT_MULTICAM"
+METADATA_PATH="$DEFAULT_METADATA"
+DATASET_TYPE="multicam"
+DATASET_WEIGHTS=""
 GLOBAL_SEED=42
 T_HIGHFREQ_RATIO=0.5
 BATCH_SIZE=1
@@ -45,93 +38,45 @@ FRAME_DOWNSAMPLE_TO=0
 USE_REAL_TEMPORAL_INDICES=false
 USE_PHYSICAL_INDEX=false
 PIPELINE_TYPE="v2v"
-DATALOADER_WORKERS_DEFAULT=36
 MODEL_BASE_PATH=""
 VAL_SIZE=12
 VAL_CHECK_INTERVAL_BATCHES=100
-VAL_STEPS=10
+VAL_STEPS=50
+VAL_GUIDANCE_SCALE=""
 
+DATASET_PATH_SET=false
+METADATA_PATH_SET=false
+DATASET_TYPE_SET=false
+DATASET_WEIGHTS_SET=false
+
+# -------- 解析参数 --------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -c|--cuda-devices)
-      CUDA_VISIBLE_DEVICES="$2"; shift 2 ;;
-    --cuda-devices=*)
-      CUDA_VISIBLE_DEVICES="${1#*=}"; shift ;;
-    -d|--debug)
-      DEBUG_MODE=true; shift ;;
-    -o|--output-dir)
-      OUTPUT_DIR="$2"; shift 2 ;;
-    --output-dir=*)
-      OUTPUT_DIR="${1#*=}"; shift ;;
-    -R|--resume-checkpoint)
-      RESUME_CHECKPOINT_PATH="$2"; shift 2 ;;
-    --resume-checkpoint=*)
-      RESUME_CHECKPOINT_PATH="${1#*=}"; shift ;;
-    -w|--wandb-name)
-      WANDB_NAME="$2"; shift 2 ;;
-    --wandb-name=*)
-      WANDB_NAME="${1#*=}"; shift ;;
-    -s|--dataset-path)
-      DATASET_PATH="$2"; shift 2 ;;
-    --dataset-path=*)
-      DATASET_PATH="${1#*=}"; shift ;;
-    -m|--metadata-path)
-      METADATA_PATH="$2"; shift 2 ;;
-    --metadata-path=*)
-      METADATA_PATH="${1#*=}"; shift ;;
-    -g|--global-seed)
-      GLOBAL_SEED="$2"; shift 2 ;;
-    --global-seed=*)
-      GLOBAL_SEED="${1#*=}"; shift ;;
-    -t|--t-highfreq-ratio)
-      T_HIGHFREQ_RATIO="$2"; shift 2 ;;
-    --t-highfreq-ratio=*)
-      T_HIGHFREQ_RATIO="${1#*=}"; shift ;;
-    -b|--batch-size)
-      BATCH_SIZE="$2"; shift 2 ;;
-    --batch-size=*)
-      BATCH_SIZE="${1#*=}"; shift ;;
-    -F|--frame-downsample-to)
-      FRAME_DOWNSAMPLE_TO="$2"; shift 2 ;;
-    --frame-downsample-to=*)
-      FRAME_DOWNSAMPLE_TO="${1#*=}"; shift ;;
-    -T|--use-real-temporal-indices)
-      USE_REAL_TEMPORAL_INDICES=true; shift ;;
-    --use-real-temporal-indices=*)
-      USE_REAL_TEMPORAL_INDICES="${1#*=}"; shift ;;
-    -P|--use-physical-index)
-      USE_PHYSICAL_INDEX=true; shift ;;
-    --use-physical-index=*)
-      USE_PHYSICAL_INDEX="${1#*=}"; shift ;;
-    -y|--pipeline-type)
-      PIPELINE_TYPE="$2"; shift 2 ;;
-    --pipeline-type=*)
-      PIPELINE_TYPE="${1#*=}"; shift ;;
-    -M|--model-base-path)
-      MODEL_BASE_PATH="$2"; shift 2 ;;
-    --model-base-path=*)
-      MODEL_BASE_PATH="${1#*=}"; shift ;;
-    -v|--val-size)
-      VAL_SIZE="$2"; shift 2 ;;
-    -v=*)
-      VAL_SIZE="${1#*=}"; shift ;;
-    --val-size=*)
-      VAL_SIZE="${1#*=}"; shift ;;
-    -i|--val-check-interval-batches)
-      VAL_CHECK_INTERVAL_BATCHES="$2"; shift 2 ;;
-    -i=*)
-      VAL_CHECK_INTERVAL_BATCHES="${1#*=}"; shift ;;
-    --val-check-interval-batches=*)
-      VAL_CHECK_INTERVAL_BATCHES="${1#*=}"; shift ;;
-
-    -h|--help)
-      usage ;;
-    *)
-      echo "未知参数: $1" >&2
-      usage ;;
+    -c|--cuda-devices) CUDA_VISIBLE_DEVICES="$2"; shift 2 ;;
+    -d|--debug) DEBUG_MODE=true; shift ;;
+    -o|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    -R|--resume-checkpoint) RESUME_CHECKPOINT_PATH="$2"; shift 2 ;;
+    -w|--wandb-name) WANDB_NAME="$2"; shift 2 ;;
+    -s|--dataset-path) DATASET_PATH="$2"; DATASET_PATH_SET=true; shift 2 ;;
+    -m|--metadata-path) METADATA_PATH="$2"; METADATA_PATH_SET=true; shift 2 ;;
+    -S|--dataset-type) DATASET_TYPE="$2"; DATASET_TYPE_SET=true; shift 2 ;;
+    --dataset-weights) DATASET_WEIGHTS="$2"; DATASET_WEIGHTS_SET=true; shift 2 ;;
+    -g|--global-seed) GLOBAL_SEED="$2"; shift 2 ;;
+    -t|--t-highfreq-ratio) T_HIGHFREQ_RATIO="$2"; shift 2 ;;
+    -b|--batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    -F|--frame-downsample-to) FRAME_DOWNSAMPLE_TO="$2"; shift 2 ;;
+    -T|--use-real-temporal-indices) USE_REAL_TEMPORAL_INDICES=true; shift ;;
+    -P|--use-physical-index) USE_PHYSICAL_INDEX=true; shift ;;
+    -y|--pipeline-type) PIPELINE_TYPE="$2"; shift 2 ;;
+    -M|--model-base-path) MODEL_BASE_PATH="$2"; shift 2 ;;
+    -v|--val-size) VAL_SIZE="$2"; shift 2 ;;
+    -i|--val-check-interval-batches) VAL_CHECK_INTERVAL_BATCHES="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "未知参数: $1" >&2; usage ;;
   esac
 done
 
+# -------- 启动命令 --------
 if [[ -z "$MODEL_BASE_PATH" ]]; then
   if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
     MODEL_BASE_PATH="models/Wan-AI/Wan2.2-TI2V-5B"
@@ -143,6 +88,15 @@ if [[ -z "$MODEL_BASE_PATH" ]]; then
   fi
 fi
 
+if [[ "$PIPELINE_TYPE" == "i2v" && "$DATASET_TYPE_SET" == false && "$DATASET_PATH_SET" == false ]]; then
+  DATASET_TYPE="multicam,rel10k"
+  DATASET_PATH="$DEFAULT_MULTICAM,$DEFAULT_REL10K"
+  [[ "$METADATA_PATH_SET" == false ]] && METADATA_PATH="$DEFAULT_METADATA,none"
+  if [[ "$DATASET_WEIGHTS_SET" == false || -z "$DATASET_WEIGHTS" ]]; then
+    DATASET_WEIGHTS="0.7,0.3"
+  fi
+fi
+
 shopt -s nullglob
 diffusion_files=("$MODEL_BASE_PATH"/diffusion_pytorch_model*.safetensors)
 shopt -u nullglob
@@ -150,7 +104,6 @@ if [[ ${#diffusion_files[@]} -eq 0 ]]; then
   echo "未找到扩散模型权重: $MODEL_BASE_PATH" >&2
   exit 1
 fi
-
 if [[ -f "$MODEL_BASE_PATH/diffusion_pytorch_model.safetensors" ]]; then
   DIT_PATH="$MODEL_BASE_PATH/diffusion_pytorch_model.safetensors"
 else
@@ -166,20 +119,35 @@ else
   exit 1
 fi
 
-mkdir -p "$OUTPUT_DIR"
-
-if [[ "$DEBUG_MODE" == true ]]; then
-  set -x
-  EFFECTIVE_BATCH_SIZE=1
-  EFFECTIVE_DATALOADER_WORKERS=0
-else
-  EFFECTIVE_BATCH_SIZE="$BATCH_SIZE"
-  EFFECTIVE_DATALOADER_WORKERS="$DATALOADER_WORKERS_DEFAULT"
+TEXT_ENCODER_PATH=""
+TOKENIZER_PATH=""
+if [[ -f "$MODEL_BASE_PATH/models_t5_umt5-xxl-enc-bf16.pth" ]]; then
+  TEXT_ENCODER_PATH="$MODEL_BASE_PATH/models_t5_umt5-xxl-enc-bf16.pth"
+fi
+if [[ -d "$MODEL_BASE_PATH/google/umt5-xxl" ]]; then
+  TOKENIZER_PATH="$MODEL_BASE_PATH/google/umt5-xxl"
+fi
+if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
+  if [[ -z "$TEXT_ENCODER_PATH" ]]; then
+    echo "i2v 模式需要 text encoder 权重 (models_t5_umt5-xxl-enc-bf16.pth)" >&2
+    exit 1
+  fi
+  if [[ -z "$TOKENIZER_PATH" ]]; then
+    echo "i2v 模式需要 tokenizer 目录 (google/umt5-xxl)" >&2
+    exit 1
+  fi
 fi
 
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_BLOCKING_WAIT=1
-export NCCL_DEBUG=${NCCL_DEBUG:-ERROR}
+
+mkdir -p "$OUTPUT_DIR"
+if [[ "$DEBUG_MODE" == true ]]; then
+  set -x
+  EFFECTIVE_BATCH_SIZE=2
+  EFFECTIVE_DATALOADER_WORKERS=1
+else
+  EFFECTIVE_BATCH_SIZE="$BATCH_SIZE"
+  EFFECTIVE_DATALOADER_WORKERS=16
+fi
 
 CMD=(
   python -u -m src.train_recammaster
@@ -188,7 +156,7 @@ CMD=(
   --output_path "$OUTPUT_DIR"
   --dit_path "$DIT_PATH"
   --vae_path "$VAE_PATH"
-  --steps_per_epoch 10000
+  --steps_per_epoch 40000
   --max_epochs 100
   --learning_rate 1e-4
   --accumulate_grad_batches 1
@@ -198,7 +166,6 @@ CMD=(
   --global_seed "$GLOBAL_SEED"
   --val_steps "$VAL_STEPS"
   --val_size "$VAL_SIZE"
-  --metadata_path "$METADATA_PATH"
   --wandb_name "$WANDB_NAME"
   --val_check_interval_batches "$VAL_CHECK_INTERVAL_BATCHES"
   --training_strategy deepspeed_stage_2
@@ -207,22 +174,21 @@ CMD=(
   --frame_downsample_to "$FRAME_DOWNSAMPLE_TO"
   --pipeline_type "$PIPELINE_TYPE"
   --val_guidance_scale "$VAL_GUIDANCE_SCALE"
+  --dataset_type "$DATASET_TYPE"
 )
-
-if [[ -n "$RESUME_CHECKPOINT_PATH" ]]; then
-  CMD+=(--resume_ckpt_path "$RESUME_CHECKPOINT_PATH")
-fi
-if [[ "$USE_REAL_TEMPORAL_INDICES" == true ]]; then
-  CMD+=(--use_real_temporal_indices)
-fi
-if [[ "$USE_PHYSICAL_INDEX" == true ]]; then
-  CMD+=(--use_physical_index)
-fi
-if [[ "$DEBUG_MODE" == true ]]; then
-  CMD+=(--debug)
-fi
+[[ -n "$TEXT_ENCODER_PATH" ]] && CMD+=(--text_encoder_path "$TEXT_ENCODER_PATH")
+[[ -n "$TOKENIZER_PATH" ]] && CMD+=(--tokenizer_path "$TOKENIZER_PATH")
+[[ -n "$METADATA_PATH" ]] && CMD+=(--metadata_path "$METADATA_PATH")
+[[ -n "$DATASET_WEIGHTS" ]] && CMD+=(--dataset_weights "$DATASET_WEIGHTS")
+[[ -n "$RESUME_CHECKPOINT_PATH" ]] && CMD+=(--resume_ckpt_path "$RESUME_CHECKPOINT_PATH")
+[[ "$USE_REAL_TEMPORAL_INDICES" == true ]] && CMD+=(--use_real_temporal_indices)
+[[ "$USE_PHYSICAL_INDEX" == true ]] && CMD+=(--use_physical_index)
+[[ "$DEBUG_MODE" == true ]] && CMD+=(--debug)
 
 PYTHONPATH="$(pwd):${PYTHONPATH:-}" \
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+NCCL_ASYNC_ERROR_HANDLING=1 \
+NCCL_BLOCKING_WAIT=1 \
+NCCL_DEBUG=${NCCL_DEBUG:-ERROR} \
 PYTHONUNBUFFERED=1 \
 "${CMD[@]}"

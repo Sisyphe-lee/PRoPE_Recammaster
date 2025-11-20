@@ -2,7 +2,6 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModel
 from typing import List, Union
-import os
 from .config import MODEL_PATHS
 
 class PickScore(torch.nn.Module):

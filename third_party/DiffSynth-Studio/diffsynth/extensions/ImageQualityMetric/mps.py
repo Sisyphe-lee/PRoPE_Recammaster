@@ -1,27 +1,14 @@
-import numpy as np
 import torch
 from PIL import Image
-from io import BytesIO
-from tqdm.auto import tqdm
-from transformers import CLIPFeatureExtractor, CLIPImageProcessor
-from transformers import CLIPConfig
-from dataclasses import dataclass
-from transformers import CLIPModel as HFCLIPModel
+from transformers import CLIPImageProcessor
 from safetensors.torch import load_file
-from torch import nn, einsum
+from torch import einsum
 
-from .trainer.models.base_model import BaseModelConfig
 
-from transformers import CLIPConfig
-from transformers import AutoProcessor, AutoModel, AutoTokenizer
-from typing import Any, Optional, Tuple, Union, List
-import torch
+from transformers import AutoTokenizer
+from typing import Union, List
 
-from .trainer.models.cross_modeling import Cross_model
 from .trainer.models import clip_model
-import torch.nn.functional as F
-import gc
-import json
 from .config import MODEL_PATHS
 
 class MPScore(torch.nn.Module):

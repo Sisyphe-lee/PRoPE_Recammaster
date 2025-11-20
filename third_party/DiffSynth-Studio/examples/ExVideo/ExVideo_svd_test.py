@@ -1,6 +1,6 @@
 from diffsynth import save_video, ModelManager, SVDVideoPipeline, HunyuanDiTImagePipeline, download_models
-from diffsynth import ModelManager
-import torch, os
+import torch
+import os
 
 # The models will be downloaded automatically.
 # You can also use the following urls to download them manually.

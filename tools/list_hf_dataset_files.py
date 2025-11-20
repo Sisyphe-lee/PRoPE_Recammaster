@@ -141,7 +141,7 @@ def save_files_to_file(files, output_file, file_types):
     """保存文件列表到文件"""
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(f"数据集文件列表\n")
+            f.write("数据集文件列表\n")
             f.write(f"总文件数: {len(files)}\n")
             f.write(f"生成时间: {os.popen('date').read().strip()}\n")
             f.write("=" * 60 + "\n\n")

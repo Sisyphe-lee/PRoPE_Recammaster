@@ -1,4 +1,6 @@
-import torch, os, torchvision
+import torch
+import os
+import torchvision
 from torchvision import transforms
 import pandas as pd
 from PIL import Image

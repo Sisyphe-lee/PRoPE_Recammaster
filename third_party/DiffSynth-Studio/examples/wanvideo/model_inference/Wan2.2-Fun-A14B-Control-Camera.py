@@ -1,5 +1,5 @@
 import torch
-from diffsynth import save_video,VideoData
+from diffsynth import save_video
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from PIL import Image
 from modelscope import dataset_snapshot_download
@@ -20,7 +20,7 @@ pipe.enable_vram_management()
 dataset_snapshot_download(
     dataset_id="DiffSynth-Studio/examples_in_diffsynth",
     local_dir="./",
-    allow_file_pattern=f"data/examples/wan/input_image.jpg"
+    allow_file_pattern="data/examples/wan/input_image.jpg"
 )
 input_image = Image.open("data/examples/wan/input_image.jpg")
 

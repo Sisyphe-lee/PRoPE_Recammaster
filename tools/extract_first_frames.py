@@ -5,7 +5,6 @@ Extract the first frame from each video in a directory.
 
 import argparse
 import logging
-import os
 from pathlib import Path
 from typing import Iterable, List
 

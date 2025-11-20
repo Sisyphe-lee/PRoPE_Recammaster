@@ -25,11 +25,11 @@ image = pipe_omost(
     prompt=prompt,
     num_inference_steps=30, embedded_guidance=3.5
 )
-image.save(f"image_omost.jpg")
+image.save("image_omost.jpg")
 
 torch.manual_seed(seed)
 image2= pipe(
     prompt=prompt,
     num_inference_steps=30, embedded_guidance=3.5
 )
-image2.save(f"image.jpg")
+image2.save("image.jpg")

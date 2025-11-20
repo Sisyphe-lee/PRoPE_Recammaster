@@ -1,4 +1,5 @@
-import multiprocessing, os
+import multiprocessing
+import os
 
 
 def run_task(scripts, thread_id, thread_num):

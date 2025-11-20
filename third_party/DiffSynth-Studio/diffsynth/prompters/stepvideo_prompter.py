@@ -2,7 +2,8 @@ from .base_prompter import BasePrompter
 from ..models.hunyuan_dit_text_encoder import HunyuanDiTCLIPTextEncoder
 from ..models.stepvideo_text_encoder import STEP1TextEncoder
 from transformers import BertTokenizer
-import os, torch
+import os
+import torch
 
 
 class StepVideoPrompter(BasePrompter):

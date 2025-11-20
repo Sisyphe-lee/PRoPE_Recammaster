@@ -173,7 +173,7 @@ def generate_readme(model_card: dict, model_name: str):
     if 'description' in model_card:
         readme_text += f"\n{model_card['description']}\n"
     if 'details' in model_card:
-        readme_text += f"\n## Model Details\n"
+        readme_text += "\n## Model Details\n"
         for k, v in model_card['details'].items():
             if isinstance(v, (list, tuple)):
                 readme_text += f"- **{k}:**\n"
@@ -186,17 +186,17 @@ def generate_readme(model_card: dict, model_name: str):
             else:
                 readme_text += f"- **{k}:** {v}\n"
     if 'usage' in model_card:
-        readme_text += f"\n## Model Usage\n"
+        readme_text += "\n## Model Usage\n"
         readme_text += model_card['usage']
         readme_text += '\n'
 
     if 'comparison' in model_card:
-        readme_text += f"\n## Model Comparison\n"
+        readme_text += "\n## Model Comparison\n"
         readme_text += model_card['comparison']
         readme_text += '\n'
 
     if 'citation' in model_card:
-        readme_text += f"\n## Citation\n"
+        readme_text += "\n## Citation\n"
         if not isinstance(model_card['citation'], (list, tuple)):
             citations = [model_card['citation']]
         else:

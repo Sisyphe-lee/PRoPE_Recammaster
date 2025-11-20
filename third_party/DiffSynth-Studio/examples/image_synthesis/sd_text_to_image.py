@@ -23,12 +23,12 @@ pipe = SDImagePipeline.from_model_manager(
     [
         ControlNetConfigUnit(
             processor_id="tile",
-            model_path=rf"models/ControlNet/control_v11f1e_sd15_tile.pth",
+            model_path=r"models/ControlNet/control_v11f1e_sd15_tile.pth",
             scale=0.5
         ),
         ControlNetConfigUnit(
             processor_id="lineart",
-            model_path=rf"models/ControlNet/control_v11p_sd15_lineart.pth",
+            model_path=r"models/ControlNet/control_v11p_sd15_lineart.pth",
             scale=0.7
         ),
     ]

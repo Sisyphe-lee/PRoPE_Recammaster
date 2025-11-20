@@ -1,5 +1,6 @@
 from ..patch_match import PyramidPatchMatcher
-import functools, os
+import functools
+import os
 import numpy as np
 from PIL import Image
 from tqdm import tqdm

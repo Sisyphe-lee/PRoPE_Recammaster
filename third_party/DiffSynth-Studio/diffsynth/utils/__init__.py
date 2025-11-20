@@ -1,13 +1,13 @@
-import torch, warnings, glob, os
+import torch
+import warnings
+import glob
+import os
 import numpy as np
 from PIL import Image
 from einops import repeat, reduce
 from typing import Optional, Union
 from dataclasses import dataclass
 from modelscope import snapshot_download
-import numpy as np
-from PIL import Image
-from typing import Optional
 
 
 class BasePipeline(torch.nn.Module):
@@ -170,7 +170,7 @@ class ModelConfig:
         if self.path is None:
             # Check model_id and origin_file_pattern
             if self.model_id is None:
-                raise ValueError(f"""No valid model files. Please use `ModelConfig(path="xxx")` or `ModelConfig(model_id="xxx/yyy", origin_file_pattern="zzz")`.""")
+                raise ValueError("""No valid model files. Please use `ModelConfig(path="xxx")` or `ModelConfig(model_id="xxx/yyy", origin_file_pattern="zzz")`.""")
             
             # Skip if not in rank 0
             if use_usp:

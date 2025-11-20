@@ -1,8 +1,8 @@
 from .base_prompter import BasePrompter
-from ..models.model_manager import ModelManager
 from ..models import HunyuanDiTCLIPTextEncoder, HunyuanDiTT5TextEncoder
 from transformers import BertTokenizer, AutoTokenizer
-import warnings, os
+import warnings
+import os
 
 
 class HunyuanDiTPrompter(BasePrompter):

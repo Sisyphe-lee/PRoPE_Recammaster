@@ -8,7 +8,8 @@ from ..models.wan_video_vace import VaceWanModel
 from ..schedulers.flow_match import FlowMatchScheduler
 from .base import BasePipeline
 from ..prompters import WanPrompter
-import torch, os
+import torch
+import os
 from einops import rearrange
 import numpy as np
 from PIL import Image

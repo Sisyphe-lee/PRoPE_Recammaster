@@ -7,7 +7,6 @@ import argparse
 import os
 
 import numpy as np
-import plotly.graph_objects as go
 
 from trajectory_viz_utils import (
     add_origin_and_arcs,

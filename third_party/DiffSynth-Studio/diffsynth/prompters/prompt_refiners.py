@@ -1,7 +1,6 @@
 from transformers import AutoTokenizer
 from ..models.model_manager import ModelManager
 import torch
-from .omost import OmostPromter
 
 class BeautifulPrompt(torch.nn.Module):
     def __init__(self, tokenizer_path=None, model=None, template=""):

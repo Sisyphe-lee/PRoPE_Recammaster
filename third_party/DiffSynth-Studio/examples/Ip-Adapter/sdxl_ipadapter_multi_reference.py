@@ -1,5 +1,6 @@
 from diffsynth import ModelManager, SDXLImagePipeline, download_models
-import torch, requests
+import torch
+import requests
 from PIL import Image
 
 
@@ -31,4 +32,4 @@ image = pipe(
     height=1024, width=1024, num_inference_steps=50,
     ipadapter_images=[image_1, image_2], ipadapter_use_instant_style=False, ipadapter_scale=0.7
 )
-image.save(f"Pikazard.jpg")
+image.save("Pikazard.jpg")

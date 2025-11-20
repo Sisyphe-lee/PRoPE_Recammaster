@@ -1,11 +1,10 @@
 import warnings
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as F
-from functools import partial
 from torchvision.transforms import Normalize, Compose, RandomResizedCrop, InterpolationMode, ToTensor, Resize, \
     CenterCrop
 

@@ -31,12 +31,12 @@ pipe = SDVideoPipeline.from_model_manager(
     [
         ControlNetConfigUnit(
             processor_id="depth",
-            model_path=rf"models/ControlNet/control_v11f1p_sd15_depth.pth",
+            model_path=r"models/ControlNet/control_v11f1p_sd15_depth.pth",
             scale=0.5
         ),
         ControlNetConfigUnit(
             processor_id="softedge",
-            model_path=rf"models/ControlNet/control_v11p_sd15_softedge.pth",
+            model_path=r"models/ControlNet/control_v11p_sd15_softedge.pth",
             scale=0.5
         )
     ]

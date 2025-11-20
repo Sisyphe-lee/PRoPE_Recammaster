@@ -1,6 +1,7 @@
 from .base_prompter import BasePrompter
-from ..models.model_manager import ModelManager
-import json, os, re
+import json
+import os
+import re
 from typing import List, Optional, Union, Dict
 from sentencepiece import SentencePieceProcessor
 from transformers import PreTrainedTokenizer

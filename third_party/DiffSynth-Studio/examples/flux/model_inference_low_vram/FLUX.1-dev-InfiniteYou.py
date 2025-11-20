@@ -28,7 +28,7 @@ pipe.enable_vram_management()
 dataset_snapshot_download(
     dataset_id="DiffSynth-Studio/examples_in_diffsynth",
     local_dir="./",
-    allow_file_pattern=f"data/examples/infiniteyou/*",
+    allow_file_pattern="data/examples/infiniteyou/*",
 )
 
 height, width = 1024, 1024

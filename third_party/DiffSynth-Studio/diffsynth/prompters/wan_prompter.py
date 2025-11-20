@@ -1,7 +1,6 @@
 from .base_prompter import BasePrompter
 from ..models.wan_video_text_encoder import WanTextEncoder
 from transformers import AutoTokenizer
-import os, torch
 import ftfy
 import html
 import string

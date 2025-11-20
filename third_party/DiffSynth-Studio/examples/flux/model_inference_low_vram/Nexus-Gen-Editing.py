@@ -26,7 +26,7 @@ pipe = FluxImagePipeline.from_pretrained(
 )
 pipe.enable_vram_management()
 
-dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern=f"data/examples/nexusgen/cat.jpg")
+dataset_snapshot_download(dataset_id="DiffSynth-Studio/examples_in_diffsynth", local_dir="./", allow_file_pattern="data/examples/nexusgen/cat.jpg")
 ref_image = Image.open("data/examples/nexusgen/cat.jpg").convert("RGB")
 prompt = "Add a crown."
 image = pipe(
