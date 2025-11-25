@@ -1,3 +1,4 @@
+import os
 import torch
 from PIL import Image
 from diffsynth import save_video
@@ -6,6 +7,18 @@ import imageio
 
 LOCAL_MODELS_ROOT = "./models"
 WAN22_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B"
+# 强制使用本地缓存，避免访问外网
+os.environ.setdefault("MODELSCOPE_CACHE", LOCAL_MODELS_ROOT)
+os.environ.setdefault("MODELSCOPE_OFFLINE", "1")
+
+if False:
+        print("Debug mode is enabled.")
+        import debugpy  # type: ignore
+
+        debugpy.listen(5678)
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
+        print("Attached, continue...")
 
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
@@ -34,6 +47,9 @@ pipe = WanVideoPipeline.from_pretrained(
         ),
     ],
     redirect_common_files=False,
+    tokenizer_config=ModelConfig(
+        path=os.path.join(LOCAL_MODELS_ROOT, "Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl")
+    ),
 )
 pipe.enable_vram_management()
 
@@ -59,35 +75,37 @@ TARGET_WIDTH = 832
 
 ### input_image is the first frame of the video:/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10/scene999/videos/cam10.mp4
 #### load video 
-video = imageio.get_reader("/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f18_aperture10/scene999/videos/cam10.mp4")
-input_image = Image.fromarray(video.get_data(0))
+
+input_image = Image.open("evaluation/i2v_eval/example_test/images/1.jpg").resize((TARGET_WIDTH,TARGET_HEIGHT))
 
 
-def resize_and_center_crop(image: Image.Image, target_width: int, target_height: int) -> Image.Image:
-    """Resize while keeping aspect ratio, then center-crop to the target canvas."""
-    src_w, src_h = image.size
-    scale = max(target_width / src_w, target_height / src_h)
-    resized_w = max(1, int(round(src_w * scale)))
-    resized_h = max(1, int(round(src_h * scale)))
-    resized = image.resize((resized_w, resized_h), Image.BICUBIC)
+# def resize_and_center_crop(image: Image.Image, target_width: int, target_height: int) -> Image.Image:
+#     """Resize while keeping aspect ratio, then center-crop to the target canvas."""
+#     src_w, src_h = image.size
+#     scale = max(target_width / src_w, target_height / src_h)
+#     resized_w = max(1, int(round(src_w * scale)))
+#     resized_h = max(1, int(round(src_h * scale)))
+#     resized = image.resize((resized_w, resized_h), Image.BICUBIC)
 
-    left = max(0, (resized_w - target_width) // 2)
-    top = max(0, (resized_h - target_height) // 2)
-    right = left + target_width
-    bottom = top + target_height
-    return resized.crop((left, top, right, bottom))
+#     left = max(0, (resized_w - target_width) // 2)
+#     top = max(0, (resized_h - target_height) // 2)
+#     right = left + target_width
+#     bottom = top + target_height
+#     return resized.crop((left, top, right, bottom))
 
 
-input_image = resize_and_center_crop(input_image, TARGET_WIDTH, TARGET_HEIGHT)
+# input_image = resize_and_center_crop(input_image, TARGET_WIDTH, TARGET_HEIGHT)
+
 
 video = pipe(
-    prompt="A man in a yellow shirt and dark pants stands confidently, shifting weight slightly while facing forward. His posture relaxes as he subtly adjusts his stance, hands resting at his sides. The luxurious room remains static—only his minor movements animate the scene.",
+    prompt="Twilight city romance style, a man in a white shirt and tie and a woman in a bright yellow dress dance together on an empty hilltop road. The gradient sky shifts from pink to deep blue above distant city lights. Their movements are playful and synchronized, captured in a smooth medium-wide tracking shot that emphasizes atmosphere and chemistry.",
     negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
     seed=0, tiled=True,
     height=TARGET_HEIGHT, width=TARGET_WIDTH,
     input_image=input_image,
     num_frames=121,
     num_inference_steps=10,
+    # seed=42,
     
 )
 save_video(video, "video2.mp4", fps=15, quality=5)

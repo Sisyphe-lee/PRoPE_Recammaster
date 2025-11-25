@@ -518,7 +518,20 @@ class BaseImageConditionDataset(BaseCameraDataset):
             try:
                 data_id = self._sample_path_index(index)
                 sample_path = self.path[data_id]
+                # TODO: 将样本统一切换为 cam10 版本以便做对比实验
+                sample_path = re.sub(r"cam\d{2}", "cam10", sample_path)
+                ##  TODO:load raw22 from .wan22.tensors.pth raw21 from .tensors.pth
+                
                 raw = torch.load(sample_path, weights_only=True, map_location="cpu")
+                ## TODO: prompt_raw from raw22, others from raw21
+                prompt_raw = raw.get("prompt_emb")
+                wan22_path = re.sub(r"(?:\\.wan22)?\\.tensors\\.pth$", ".wan22.tensors.pth", sample_path)
+                if os.path.exists(wan22_path):
+                    try:
+                        raw22 = torch.load(wan22_path, weights_only=True, map_location="cpu")
+                        prompt_raw = raw22.get("prompt_emb", prompt_raw)
+                    except Exception as exc:
+                        print(f"[warn] 加载 wan22 prompt 失败 {wan22_path}: {exc}")
 
                 latents = raw["latents"]
                 if isinstance(latents, (list, tuple)):
@@ -533,8 +546,9 @@ class BaseImageConditionDataset(BaseCameraDataset):
 
                 data = {
                     "latents": latents,
-                    "prompt_emb": _ensure_prompt_context(raw.get("prompt_emb")),
-                    "image_emb": raw.get("image_emb", {}),
+                    "prompt_emb": _ensure_prompt_context(prompt_raw),
+                    # 训练/验证不依赖 image_emb；始终返回空字典以避免不同样本键不一致导致 collate 报错
+                    "image_emb": {},
                     "path": sample_path,
                     "camera": camera_tensor,
                     "intrinsics": intrinsics,
@@ -809,6 +823,7 @@ def create_datasets(
     image_size: Tuple[float, float] = (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
     sensor_size_mm: Tuple[float, float] = (DEFAULT_SENSOR_WIDTH_MM, DEFAULT_SENSOR_HEIGHT_MM),
     pipeline_type: str = "v2v",
+    tensor_suffix: Optional[str] = None,
 ):
     """
     Create training and validation datasets for ReCamMaster.
@@ -819,11 +834,15 @@ def create_datasets(
         steps_per_epoch: 训练阶段的步数。
         seed: 全局随机种子。
         pipeline_type: 'v2v' 或 'i2v'。
+        tensor_suffix: 可选，覆盖默认的 latent 后缀（例如 '.tensors.pth' 或 '.wan22.tensors.pth'）。
     """
     if not dataset_specs:
         raise ValueError("create_datasets 需要至少一个 dataset_spec。")
 
-    tensor_suffixes = (".wan22.tensors.pth",) if pipeline_type == "i2v" else (".tensors.pth",)
+    if tensor_suffix:
+        tensor_suffixes = (tensor_suffix,)
+    else:
+        tensor_suffixes = (".wan22.tensors.pth",) if pipeline_type == "i2v" else (".tensors.pth",)
 
     if pipeline_type == "v2v":
         if len(dataset_specs) != 1:

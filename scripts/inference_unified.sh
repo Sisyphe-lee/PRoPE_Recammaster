@@ -43,7 +43,7 @@ BASE_ARGS=(
   --dataset_kind "${DATASET_KIND}"
   --dataset_path "${DATASET_PATH}"
   --target_pose_dir "${TARGET_POSE_DIR}"
-  --ckpt_path "${CKPT_PATH}"
+  # --ckpt_path "${CKPT_PATH}"
   --pipeline_kind "${PIPELINE_KIND}"
   --num_inference_steps 10
   # --debug

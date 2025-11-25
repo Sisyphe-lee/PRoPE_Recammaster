@@ -455,7 +455,7 @@ def model_fn_wan_video(
     else:
         # blocks
         for block in dit.blocks:
-            x = block(x, context, cam_emb, t_mod, freqs, temporal_indices=temporal_indices, cam_intrinsics=cam_intrinsics, **kwargs)
+            x = block(x, context, t_mod, freqs, temporal_indices=temporal_indices, cam_emb=cam_emb, cam_intrinsics=cam_intrinsics, **kwargs)
         if tea_cache is not None:
             tea_cache.store(x)
 

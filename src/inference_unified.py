@@ -676,10 +676,7 @@ def register_pipeline(name: str) -> Callable[[type[BasePipelineHandler]], type[B
 
 
 NEGATIVE_PROMPT = (
-    "人物肢体不完整，动作诡异，肢体模糊，"
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
-    "JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，"
-    "手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 
 
@@ -1078,13 +1075,18 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset_option", action="append", default=[], help="Additional dataset options (key=value)")
     parser.add_argument("--target_pose_dir", type=str, required=True, help="Directory containing target pose .npz files")
     parser.add_argument("--pipeline_kind", type=str, default="v2v", choices=["v2v", "i2v"], help="Inference pipeline mode")
-    parser.add_argument("--ckpt_path", type=str, required=True, help="Checkpoint to load")
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default=None,
+        help="Optional checkpoint that overrides the base pipeline weights",
+    )
     parser.add_argument("--output_dir", type=str, default="evaluation/example_eval", help="Directory to save outputs")
     parser.add_argument("--cfg_scale", type=float, default=5.0)
     parser.add_argument("--frame_downsample_to", type=int, default=0)
     parser.add_argument("--num_inference_steps", type=int, default=10)
     parser.add_argument("--dataloader_num_workers", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1, help="Samples per batch (currently only 1 supported)")
     return parser.parse_args(argv)
@@ -1162,31 +1164,43 @@ def main(argv: List[str] | None = None) -> None:
 
     if rank == 0:
         print(f"Using device: {device_str} | world_size={world_size}")
-        print(f"Loading checkpoint from: {args.ckpt_path}")
 
-    state_dict = load_checkpoint_file(args.ckpt_path)
-    if isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-    if isinstance(state_dict, dict) and "module" in state_dict:
-        state_dict = state_dict["module"]
+    ckpt_state: Dict[str, torch.Tensor] | None = None
+    if args.ckpt_path:
+        ckpt_path = Path(args.ckpt_path)
+        if ckpt_path.is_file():
+            if rank == 0:
+                print(f"Loading checkpoint from: {ckpt_path}")
+            ckpt_state = load_checkpoint_file(ckpt_path)
+        elif ckpt_path.is_dir():
+            if rank == 0:
+                print(f"[info] Provided ckpt_path='{ckpt_path}' is a directory; skip overriding base weights.")
+        else:
+            raise FileNotFoundError(f"Checkpoint path not found: {ckpt_path}")
 
-    prefixes_to_remove = ["model.", "module.", "pipe.dit.", "dit."]
-    cleaned_state: Dict[str, torch.Tensor] = {}
-    dropped_keys: List[str] = []
-    for key, value in state_dict.items():
-        new_key = key
-        for prefix in prefixes_to_remove:
-            if new_key.startswith(prefix):
-                new_key = new_key[len(prefix) :]
-                break
-        if ".cam_encoder." in new_key or ".projector." in new_key:
-            dropped_keys.append(new_key)
-            continue
-        cleaned_state[new_key] = value
-    if rank == 0 and dropped_keys:
-        print(f"[info] dropping {len(dropped_keys)} camera/projector keys: {dropped_keys[:5]}{'...' if len(dropped_keys) > 5 else ''}")
+    if ckpt_state is not None:
+        if isinstance(ckpt_state, dict) and "state_dict" in ckpt_state:
+            ckpt_state = ckpt_state["state_dict"]
+        if isinstance(ckpt_state, dict) and "module" in ckpt_state:
+            ckpt_state = ckpt_state["module"]
 
-    load_dit_state_dict(pipe.dit, cleaned_state, rank)
+        prefixes_to_remove = ["model.", "module.", "pipe.dit.", "dit."]
+        cleaned_state: Dict[str, torch.Tensor] = {}
+        dropped_keys: List[str] = []
+        for key, value in ckpt_state.items():
+            new_key = key
+            for prefix in prefixes_to_remove:
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix) :]
+                    break
+            if ".cam_encoder." in new_key or ".projector." in new_key:
+                dropped_keys.append(new_key)
+                continue 
+            cleaned_state[new_key] = value
+        if rank == 0 and dropped_keys:
+            print(f"[info] dropping {len(dropped_keys)} camera/projector keys: {dropped_keys[:5]}{'...' if len(dropped_keys) > 5 else ''}")
+
+        load_dit_state_dict(pipe.dit, cleaned_state, rank)
 
     pipe.to(device)
     pipe.to(dtype=torch.bfloat16)

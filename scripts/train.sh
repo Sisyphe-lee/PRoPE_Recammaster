@@ -21,6 +21,7 @@ export TOKENIZERS_PARALLELISM=false
 DEFAULT_MULTICAM="/nas/datasets/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train"
 DEFAULT_REL10K="/nas/datasets/relestate10k"
 DEFAULT_METADATA="$(pwd)/metadata/metadata_all.csv"
+I2V_CKPT_TYPE="wan21"
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"2,3,4,5,6,7"}
 DEBUG_MODE=false
@@ -43,6 +44,7 @@ VAL_SIZE=12
 VAL_CHECK_INTERVAL_BATCHES=100
 VAL_STEPS=50
 VAL_GUIDANCE_SCALE=""
+TENSOR_SUFFIX=""
 
 DATASET_PATH_SET=false
 METADATA_PATH_SET=false
@@ -71,7 +73,9 @@ while [[ $# -gt 0 ]]; do
     -M|--model-base-path) MODEL_BASE_PATH="$2"; shift 2 ;;
     -v|--val-size) VAL_SIZE="$2"; shift 2 ;;
     -i|--val-check-interval-batches) VAL_CHECK_INTERVAL_BATCHES="$2"; shift 2 ;;
+    -u|--ckpt_type) I2V_CKPT_TYPE="$2"; shift 2 ;;
     -h|--help) usage ;;
+    
     *) echo "未知参数: $1" >&2; usage ;;
   esac
 done
@@ -79,9 +83,13 @@ done
 # -------- 启动命令 --------
 if [[ -z "$MODEL_BASE_PATH" ]]; then
   if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
-    MODEL_BASE_PATH="models/Wan-AI/Wan2.2-TI2V-5B"
+    if [[ "$I2V_CKPT_TYPE" == "wan21" ]]; then
+      MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
+    else
+      MODEL_BASE_PATH="models/Wan-AI/Wan2.2-TI2V-5B"
+    fi
     VAL_GUIDANCE_SCALE="${VAL_GUIDANCE_SCALE:-5.0}"
-    VAL_STEPS=40
+    VAL_STEPS=10
   else
     MODEL_BASE_PATH="models/Wan-AI/Wan2.1-T2V-1.3B"
     VAL_GUIDANCE_SCALE="${VAL_GUIDANCE_SCALE:-1.0}"
@@ -176,6 +184,13 @@ CMD=(
   --val_guidance_scale "$VAL_GUIDANCE_SCALE"
   --dataset_type "$DATASET_TYPE"
 )
+if [[ "$PIPELINE_TYPE" == "i2v" ]]; then
+  CMD+=(--i2v_ckpt_type "$I2V_CKPT_TYPE")
+  if [[ "$I2V_CKPT_TYPE" == "wan21" ]]; then
+    TENSOR_SUFFIX=".tensors.pth"
+  fi
+fi
+[[ -n "$TENSOR_SUFFIX" ]] && CMD+=(--tensor_suffix "$TENSOR_SUFFIX")
 [[ -n "$TEXT_ENCODER_PATH" ]] && CMD+=(--text_encoder_path "$TEXT_ENCODER_PATH")
 [[ -n "$TOKENIZER_PATH" ]] && CMD+=(--tokenizer_path "$TOKENIZER_PATH")
 [[ -n "$METADATA_PATH" ]] && CMD+=(--metadata_path "$METADATA_PATH")

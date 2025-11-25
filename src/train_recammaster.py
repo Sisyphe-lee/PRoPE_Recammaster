@@ -64,6 +64,13 @@ def parse_args():
         help="Training mode: 'v2v' (wan2.1 T2V 1.5B ) or 'i2v' (Wan2.2 TI2V 5B).",
     )
     parser.add_argument(
+        "--i2v_ckpt_type",
+        type=str,
+        default="wan22",
+        choices=["wan21", "wan22"],
+        help="当 pipeline_type=i2v 时选择加载 wan21 或 wan22 模型/权重，默认为 wan22。",
+    )
+    parser.add_argument(
         "--dataset_type",
         type=str,
         default="multicam",
@@ -192,6 +199,12 @@ def parse_args():
         required=False,
         default=None,
         help="Absolute path to the metadata CSV file (multicam 模式必填，re10k 可为空).",
+    )
+    parser.add_argument(
+        "--tensor_suffix",
+        type=str,
+        default=None,
+        help="可选，覆盖训练时读取的 latent 后缀（例如 .tensors.pth 或 .wan22.tensors.pth）。",
     )
     parser.add_argument(
         "--val_size",
@@ -337,6 +350,17 @@ def train(args):
     metadata_paths = _expand_argument(args.metadata_path, len(dataset_types), "--metadata_path", allow_empty=True)
     dataset_weights = _parse_weights(args.dataset_weights, len(dataset_types))
 
+    # 解析 ckpt 类型与默认的 latent 后缀
+    ckpt_type = "wan21" if args.pipeline_type == "v2v" else args.i2v_ckpt_type
+    if args.tensor_suffix:
+        tensor_suffix = args.tensor_suffix
+    elif args.pipeline_type == "i2v" and ckpt_type == "wan21":
+        tensor_suffix = ".tensors.pth"
+    elif args.pipeline_type == "i2v":
+        tensor_suffix = ".wan22.tensors.pth"
+    else:
+        tensor_suffix = ".tensors.pth"
+
     dataset_specs: List[DatasetSpec] = []
     for dtype, root, meta, weight in zip(dataset_types, dataset_paths, metadata_paths, dataset_weights):
         if dtype == "multicam" and not meta:
@@ -359,6 +383,7 @@ def train(args):
         seed=args.global_seed,
         image_size=(args.width, args.height),
         pipeline_type=args.pipeline_type,
+        tensor_suffix=tensor_suffix,
     )
 
     def worker_init_fn(worker_id):
@@ -409,6 +434,7 @@ def train(args):
         use_physical_index=getattr(args, 'use_physical_index', False),
         pipeline_type=getattr(args, 'pipeline_type', 'v2v'),
         val_guidance_scale=getattr(args, 'val_guidance_scale', None),
+        ckpt_type=ckpt_type,
     )
     
     if args.use_wandb:

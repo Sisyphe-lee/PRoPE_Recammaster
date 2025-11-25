@@ -302,7 +302,7 @@ class  PRoPE_SelfAttention(nn.Module):
         self,
         x,
         freqs,
-        viewmats,
+        viewmats=None,
         Ks=None,
         *,
         mask_first_head_fraction: float = 1,
@@ -323,39 +323,41 @@ class  PRoPE_SelfAttention(nn.Module):
         k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
         
-        # Ensure data type consistency for PRoPE operations
-        target_dtype = q.dtype
-        target_device = q.device
-        
-        # Convert viewmats and Ks to match input tensor dtype and device
-        viewmats = viewmats.to(dtype=target_dtype, device=target_device)
-        if Ks is not None:
-            Ks = Ks.to(dtype=target_dtype, device=target_device)
+        use_prpe = (viewmats is not None) and (t_highfreq_ratio > 0)
 
-        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
-            head_dim=self.head_dim,
-            viewmats=viewmats,
-            Ks=Ks,
-            patches_x=52,
-            patches_y=30,
-            image_width=832,
-            image_height=480,
-            num_heads=self.num_heads,
-            head_fraction=mask_first_head_fraction,
-            t_highfreq_ratio=t_highfreq_ratio,
+        if use_prpe:
+            # Ensure data type consistency for PRoPE operations
+            target_dtype = q.dtype
+            target_device = q.device
+            viewmats = viewmats.to(dtype=target_dtype, device=target_device)
+            if Ks is not None:
+                Ks = Ks.to(dtype=target_dtype, device=target_device)
+
+            apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
+                head_dim=self.head_dim,
+                viewmats=viewmats,
+                Ks=Ks,
+                patches_x=52,
+                patches_y=30,
+                image_width=832,
+                image_height=480,
+                num_heads=self.num_heads,
+                head_fraction=mask_first_head_fraction,
+                t_highfreq_ratio=t_highfreq_ratio,
+                
+            )
             
-        )
-        
-        # Apply PRoPE transforms
-        q = apply_fn_q(q)
-        k = apply_fn_kv(k)
-        # v = apply_fn_kv(v)
+            # Apply PRoPE transforms
+            q = apply_fn_q(q)
+            k = apply_fn_kv(k)
+            # v = apply_fn_kv(v)
 
         # Apply attention (inputs are already in multi-head format)
         x = self.attn(q, k, v)
         
         # Apply output transform
-        # x = apply_fn_o(x)
+        # if use_prpe:
+        #     x = apply_fn_o(x)
         
         # Rearrange back to original format: (batch, num_heads, seqlen, head_dim) -> (batch, seqlen, dim)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
@@ -431,7 +433,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, cam_emb, t_mod, freqs, temporal_indices=None, **_kwargs):
+    def forward(self, x, context, t_mod, freqs, temporal_indices=None, cam_emb=None, **_kwargs):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -444,31 +446,35 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
 
-        # cam_emb can be either (B, N, 12) as flattened 3x4, or (B, N, 4, 4) absolute w2c matrices.
-        if cam_emb.dim() == 3 and cam_emb.shape[-1] == 12:
-            B, N, _ = cam_emb.shape
-            reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
-            bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
-            bottom_row = bottom_row.view(1,1,1,4).expand(B, N, 1, 4)
-            viewmats = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
-        elif cam_emb.dim() == 4 and cam_emb.shape[-2:] == (4, 4):
-            B, N = cam_emb.shape[:2]
-            viewmats = cam_emb
-        else:
-            raise ValueError(f"Unexpected cam_emb shape: {cam_emb.shape}. Expected (B,N,12) or (B,N,4,4).")
-        
-        N = viewmats.shape[1]
-        
-        cam_intrinsics = _kwargs.get("cam_intrinsics", None)
-        Ks = _normalize_cam_intrinsics(cam_intrinsics, B, N, input_x.dtype, input_x.device)
-        prpe_meta = _kwargs.get("prpe_meta")
-        
         # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
-        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
+        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.0)
+        use_prpe = (cam_emb is not None) and (t_highfreq_ratio > 0)
+
+        if use_prpe:
+            # cam_emb can be either (B, N, 12) as flattened 3x4, or (B, N, 4, 4) absolute w2c matrices.
+            if cam_emb.dim() == 3 and cam_emb.shape[-1] == 12:
+                B, N, _ = cam_emb.shape
+                reshaped_cam_emb = cam_emb.view(B, N, 3, 4)
+                bottom_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=reshaped_cam_emb.device, dtype=reshaped_cam_emb.dtype)
+                bottom_row = bottom_row.view(1,1,1,4).expand(B, N, 1, 4)
+                viewmats = torch.cat([reshaped_cam_emb, bottom_row], dim=2)
+            elif cam_emb.dim() == 4 and cam_emb.shape[-2:] == (4, 4):
+                B, N = cam_emb.shape[:2]
+                viewmats = cam_emb
+            else:
+                raise ValueError(f"Unexpected cam_emb shape: {cam_emb.shape}. Expected (B,N,12) or (B,N,4,4).")
+            
+            cam_intrinsics = _kwargs.get("cam_intrinsics", None)
+            Ks = _normalize_cam_intrinsics(cam_intrinsics, B, N, input_x.dtype, input_x.device)
+        else:
+            viewmats = None
+            Ks = None
+
+        prpe_meta = _kwargs.get("prpe_meta")
 
         try:
             attn_out = self.self_attn(
-                input_x, freqs, cam_emb, Ks,
+                input_x, freqs, viewmats, Ks,
                 t_highfreq_ratio=t_highfreq_ratio,
                 prpe_meta=prpe_meta,
             )
@@ -624,13 +630,13 @@ class WanModel(torch.nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
-                cam_emb: torch.Tensor,
                 context: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 temporal_indices: Optional[torch.Tensor] = None,
+                cam_emb: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
         fuse_vae_embedding = kwargs.get("fuse_vae_embedding_in_latents", False)
@@ -687,6 +693,7 @@ class WanModel(torch.nn.Module):
 
         kwargs_with_grid = dict(kwargs)
         kwargs_with_grid.setdefault("grid_size", grid_size)
+        kwargs_with_grid.setdefault("cam_emb", cam_emb)
 
         # Build RoPE freqs with real temporal indices
         if temporal_indices is not None:
@@ -716,17 +723,17 @@ class WanModel(torch.nn.Module):
                         with torch.autograd.graph.save_on_cpu():
                             x = torch.utils.checkpoint.checkpoint(
                                 create_custom_forward(block),
-                                x, context, cam_emb, t_mod, freqs,
+                                x, context, t_mod, freqs,
                                 use_reentrant=False,
                             )
                     else:
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, cam_emb, t_mod, freqs,
+                            x, context, t_mod, freqs,
                             use_reentrant=False,
                         )
                 else:
-                    x = block(x, context, cam_emb, t_mod, freqs)
+                    x = block(x, context, t_mod, freqs, cam_emb=cam_emb)
             except RuntimeError as e:
                 # Augment CUDA OOM with layer index and rank information
                 msg = str(e)
