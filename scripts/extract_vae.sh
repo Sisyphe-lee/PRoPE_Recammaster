@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${CUDA_VISIBLE_DEVICES:=2,3,4,5,6,7}"
+: "${CUDA_VISIBLE_DEVICES:=0,1}"
 
 usage() {
   cat <<'EOF'
@@ -107,7 +107,7 @@ CMD=(
   --num_frames 81
   --height 480
   --width 832
-  --dataloader_num_workers 2
+  --dataloader_num_workers 24
   --pipeline_type "${PIPELINE_TYPE}"
   --tensor_suffix "${TENSOR_SUFFIX}"
   --dataset_type "${DATASET_TYPE}"

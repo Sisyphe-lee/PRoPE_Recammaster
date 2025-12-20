@@ -331,7 +331,12 @@ def _parse_weights(value: Optional[str], count: int) -> List[float]:
         except ValueError as exc:
             raise ValueError(f"无法解析 dataset weight '{part}'") from exc
     return weights
-
+def worker_init_fn(worker_id):
+    """Initialize worker with deterministic seed"""
+    worker_seed = args.global_seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 def train(args):
     # Set global seed for reproducibility
@@ -386,12 +391,7 @@ def train(args):
         tensor_suffix=tensor_suffix,
     )
 
-    def worker_init_fn(worker_id):
-        """Initialize worker with deterministic seed"""
-        worker_seed = args.global_seed + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+    
     
     dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -434,6 +434,7 @@ def train(args):
         use_physical_index=getattr(args, 'use_physical_index', False),
         pipeline_type=getattr(args, 'pipeline_type', 'v2v'),
         val_guidance_scale=getattr(args, 'val_guidance_scale', None),
+        val_save_limit=args.val_size,
         ckpt_type=ckpt_type,
     )
     
@@ -481,7 +482,7 @@ def train(args):
         gradient_clip_val=0.05,
     )
     # Run an initial validation at step 0 for debugging/baseline
-    # trainer.validate(model, val_dataloader)
+    trainer.validate(model, val_dataloader)
     
     # Fit the model
     trainer.fit(model, dataloader, val_dataloader)

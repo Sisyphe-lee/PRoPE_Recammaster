@@ -1,4 +1,38 @@
 # Change Log
+## v0.2.19 @codex - 2025-12-20
+
+### 新增
+- 统一推理拆成 registry（`base_handler.py`/`pipeline_loader.py`/`v2v_handler.py`/`i2v_handler.py`），新增 SDG I2V 数据集、可选 `--i2v_ckpt_type`，`inference_unified.py`/`scripts/inference_unified.sh` 支持 dataset_option 透传、默认 25 步并按时间戳落盘。
+- VAE 抽取管线支持跳过已缓存样本与 `--no_resume` 重新生成，`TextVideoDataset` 会返回 skip 标记且 Lightning 数据处理器提前退出；`scripts/extract_vae.sh` 默认更多 dataloader worker 并调整 GPU 预设。
+- 姿态评估脚本补充时间戳容差、静态序列可只算旋转误差、Top-K 误差 CSV 与视频拷贝（`evaluation/evaluate_with_evo.py`、`evaluation/top30error`），使用示例同步更新。
+- 新增 JSON→NPZ 相机转换脚本移至 `tools/convert_camera_json_to_npz.py`，`tools/visualize/visualize.md`、`tools/viser_check.py` 增补示例与可视化开关。
+
+### 变更
+- i2v/多机位数据集允许覆盖 prompt embedding 读取，c2w 轴重排补全符号翻转并按目标分辨率缩放 K，metadata 收集可跳过磁盘存在性检查以避免大规模 SDG/Rel10K 误报缺失。
+- Lightning 验证仅在 rank0 保存且受 `val_save_limit` 控制，`train_recammaster.py` 默认首轮执行验证；`scripts/train.sh` 将验证间隔缩短至 20 步并在 debug 模式关闭 dataloader worker。
+- PRoPE 默认 `t_highfreq_ratio=0.5`，并随实际 patch/grid 尺寸与分辨率下发参数，避免固定 52×30 假设导致相机嵌入错位。
+
+### 修复
+- `evaluation/evaluate_with_evo.py` 对齐 GT/预测时支持排序匹配与零点平移，避免“不重叠”或平移过短序列产生 NaN；`inference_unified.py` 默认 seed=42 且在 handler 内加载 checkpoint，减轻权重键名错配带来的遗漏。
+
+## v0.2.18 @codex - 2025-11-25
+
+### 新增
+- 训练入口为 i2v 增加 `--i2v_ckpt_type` 与 `--tensor_suffix`，`scripts/train.sh` 同步 `-u/--ckpt_type` 与后缀推导，`create_datasets` 支持显式覆盖 latent 后缀，便于在 wan21/wan22 间切换并匹配对应张量格式。
+- 补充 `src/old_dataset.py`、`src/old_trainer.py` 作为旧版数据管线与训练器快照，方便回归对比。
+
+### 变更
+- `BaseImageConditionDataset` i2v 样本统一回落到 `cam10` 视角，并在存在 `.wan22.tensors.pth` 时优先读取新版 prompt embedding，同时始终返回空 `image_emb` 避免 collate 键不一致。
+- Lightning 训练器引入 `ckpt_type`，对 DiT patch_embedding 与 latent 通道做显式校验，i2v prompt dropout 调整为逐样本 0.1 概率并支持非默认 wan21 latent；训练损失与验证均跳过首通道确保与条件帧对齐。
+- 推理入口 `src/inference_unified.py` 允许可选 checkpoint、默认 seed 设为 42，负向提示词精简；`scripts/inference_unified.sh` 取消强制透传 ckpt 以使用基础权重。
+- PRoPE/DiT 前向在 `third_party/DiffSynth-Studio` 中改为可选相机输入，确保缺失 cam_emb 时仍能运行；Wan2.2 示例脚本强制离线加载、本地 tokenizer，并更新输入图与提示词以便快速验收。
+
+### 修复
+- 训练/验证阶段在发现 latent 通道数与所选 wan21/wan22 模型不匹配时立即报错，避免静默错配；数据集返回空 `image_emb` 解决不同样本键集导致的 collate 异常。
+
+### 其他
+- 新增实验与示例资产（`exp_by_day/11.*`、`i2v_input.JPG`、`video2.mp4`），供对照与复现。
+
 ## v0.2.17 @cyli - 2025-11-20
 
 ### 新增

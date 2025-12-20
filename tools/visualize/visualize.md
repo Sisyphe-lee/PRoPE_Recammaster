@@ -14,8 +14,8 @@
 
 ### 单轨迹示例
 ```bash
-python visualize_single_trajectory.py \
-    --input eval_data/cameras/camera_extrinsics.json \
+python tools/visualize/visualize_single_trajectory.py \
+    --input tools/visualize/debug2 \
     --align-centroid \
     --normalize-01 \
     --cam-every 6
@@ -23,13 +23,13 @@ python visualize_single_trajectory.py \
 
 ### 轨迹对比示例
 ```bash
-python visualize_compare_trajectories.py \
-    --input eval_data/cameras/camera_extrinsics.json \
-    --input2 example_test_data/cameras/camera_extrinsics_ori.json \
+python tools/visualize/visualize_compare_trajectories.py \
+    --input tools/visualize/debug \
+    --input2 tools/visualize/debug2 \
     --align-centers \
     --normalize-01 \
     --match \
     --cam-every 6
 ```
-
+ 
 > 输入支持 JSON、单个 NPZ 或包含多个 NPZ 的目录；矩阵需为 c2w（单位厘米），加载时会自动转换为 PyTorch3D 约定并换算成米。

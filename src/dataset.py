@@ -20,6 +20,7 @@ DATASET_ALIASES = {
     "multicam": "multicam",
     "multi_cam": "multicam",
     "multi": "multicam",
+    "sdg": "sdg",
     "rel10k": "rel10k",
     "re10k": "rel10k",
     "relestate10k": "rel10k",
@@ -305,35 +306,7 @@ def compute_relative_c2w(cam_params, ref_cam: Camera, get_relative_pose_fn) -> n
     return np.stack(rel_c2w_list, axis=0)
 
 
-def normalize_translation_baseline(cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-3):
-    """
-    Normalize only the translation components of relative c2w trajectories using a shared baseline.
-    Baseline strategy:
-      1) Use L2 norm of cond last frame translation relative to ref.
-      2) If invalid or too small, use median of cond translation norms across frames.
-      3) If still invalid, fall back to 1.0.
-    Operates on copies and returns (cond_rel_c2w_norm, tgt_rel_c2w_norm, baseline).
-    """
-    cond_rel = cond_rel_c2w.copy()
-    tgt_rel = tgt_rel_c2w.copy()
-
-    baseline = float(np.linalg.norm(cond_rel[-1][:3, 3], ord=2))
-    if not np.isfinite(baseline):
-        baseline = 0.0
-    if baseline <= eps:
-        cond_dists = np.linalg.norm(cond_rel[:, :3, 3], axis=1)
-        valid = cond_dists > eps
-        if np.any(valid):
-            baseline = float(np.median(cond_dists[valid]))
-        else:
-            baseline = 1.0
-
-    cond_rel[:, :3, 3] = cond_rel[:, :3, 3] / baseline
-    tgt_rel[:, :3, 3] = tgt_rel[:, :3, 3] / baseline
-    return cond_rel, tgt_rel, baseline
-
-
-def normalize_translation(cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1e-2):
+def normalize_translation(cond_rel_c2w: np.ndarray, tgt_rel_c2w: np.ndarray, eps: float = 1):
     """
     Normalize translations by the maximum L2 norm across BOTH cond and tgt relative trajectories.
     - Compute max_norm = max(||t_i||) over all frames i from both cond_rel_c2w and tgt_rel_c2w.
@@ -468,7 +441,7 @@ class TensorDataset(BaseCameraDataset):
                 cond_rel_w2c = np.stack([invert_SE3_np(T) for T in cond_rel_c2w], axis=0)
 
                 # Concatenate tgt first then cond to align with latents
-                all_w2c = np.concatenate([tgt_rel_w2c, tgt_rel_w2c], axis=0)
+                all_w2c = np.concatenate([tgt_rel_w2c, cond_rel_w2c], axis=0)
                 camera_tensor = torch.from_numpy(all_w2c).to(torch.float32)
                 data['camera'] = camera_tensor
                 data['intrinsics'] = self._get_intrinsics_tensor(path_tgt, repeat=camera_tensor.shape[0])
@@ -489,6 +462,10 @@ class BaseImageConditionDataset(BaseCameraDataset):
     """Shared logic for Wan2.2 image-conditioned datasets."""
 
     dataset_name = "base_i2v"
+
+    def _load_prompt_embedding(self, sample_path: str, prompt_raw: Optional[object]):
+        """子类可覆盖以添加额外的 prompt 读取逻辑。"""
+        return prompt_raw
 
     def _load_camera_sequence(self, sample_path: str, num_frames: int) -> np.ndarray:
         raise NotImplementedError
@@ -518,21 +495,10 @@ class BaseImageConditionDataset(BaseCameraDataset):
             try:
                 data_id = self._sample_path_index(index)
                 sample_path = self.path[data_id]
-                # TODO: 将样本统一切换为 cam10 版本以便做对比实验
-                sample_path = re.sub(r"cam\d{2}", "cam10", sample_path)
-                ##  TODO:load raw22 from .wan22.tensors.pth raw21 from .tensors.pth
                 
                 raw = torch.load(sample_path, weights_only=True, map_location="cpu")
-                ## TODO: prompt_raw from raw22, others from raw21
-                prompt_raw = raw.get("prompt_emb")
-                wan22_path = re.sub(r"(?:\\.wan22)?\\.tensors\\.pth$", ".wan22.tensors.pth", sample_path)
-                if os.path.exists(wan22_path):
-                    try:
-                        raw22 = torch.load(wan22_path, weights_only=True, map_location="cpu")
-                        prompt_raw = raw22.get("prompt_emb", prompt_raw)
-                    except Exception as exc:
-                        print(f"[warn] 加载 wan22 prompt 失败 {wan22_path}: {exc}")
-
+                prompt_raw = self._load_prompt_embedding(sample_path, raw.get("prompt_emb"))
+                
                 latents = raw["latents"]
                 if isinstance(latents, (list, tuple)):
                     latents = latents[0]
@@ -582,12 +548,33 @@ class MulticamImageConditionDataset(BaseImageConditionDataset):
                 self._camera_json_cache[camera_path] = json.load(file)
         return self._camera_json_cache[camera_path]
 
+    def _load_prompt_embedding(self, sample_path: str, prompt_raw: Optional[object]):
+        # wan22 prompt_emb 存在 .wan22.tensors.pth 里；若当前样本是 wan21，则尝试旁路文件。
+        if sample_path.endswith(".wan22.tensors.pth"):
+            return prompt_raw
+        if sample_path.endswith(".tensors.pth"):
+            wan22_path = sample_path[: -len(".tensors.pth")] + ".wan22.tensors.pth"
+        else:
+            wan22_path = sample_path + ".wan22.tensors.pth"
+        if os.path.exists(wan22_path):
+            try:
+                raw22 = torch.load(wan22_path, weights_only=True, map_location="cpu")
+                return raw22.get("prompt_emb", prompt_raw)
+            except Exception as exc:
+                print(f"[warn] 加载 wan22 prompt 失败 {wan22_path}: {exc}")
+        return prompt_raw
+
     @staticmethod
     def _reorder_c2w_axes(c2w: np.ndarray) -> np.ndarray:
-        adjusted = c2w.transpose(1, 0)
-        adjusted = adjusted[:, [1, 2, 0, 3]]
-        adjusted[:3, 1] *= -1.0
-        return adjusted
+        """Remap axes: X_new=Y_old, Y_new=Z_old, Z_new=X_old; keep translation aligned."""
+        c2w = c2w.transpose(1, 0)
+        c2w = c2w[:, [1, 2, 0, 3]]
+        ## align
+        c2w = c2w[ [1, 2, 0, 3], :]
+        c2w[:3, 1] *= -1.0
+        c2w[1, :3] *= -1.0
+        c2w[1, 3] *= -1.0
+        return c2w
 
     def _load_camera_sequence(self, sample_path: str, num_frames: int) -> np.ndarray:
         scene_dir = Path(sample_path).parent.parent
@@ -607,11 +594,12 @@ class MulticamImageConditionDataset(BaseImageConditionDataset):
             if cam_key not in frame_entry:
                 raise KeyError(f"{camera_path} 中缺少 {cam_key} 数据")
             c2w = self.parse_matrix(frame_entry[cam_key])
-            frames.append(self._reorder_c2w_axes(np.asarray(c2w, dtype=np.float32)))
+            frames.append(np.asarray(c2w, dtype=np.float32))
         if not frames:
             raise ValueError(f"{camera_path} 不包含任何帧数据。")
         indices = _select_temporal_indices(len(frames), num_frames)
         selected = [frames[idx] for idx in indices]
+        selected = [self._reorder_c2w_axes(i) for i in selected]
         return np.stack(selected, axis=0)
 
     def _resolve_ids(self, sample_path: str) -> Tuple[str, str, str]:
@@ -660,6 +648,85 @@ class RelEstate10kImageConditionDataset(BaseImageConditionDataset):
 
     def _resolve_ids(self, sample_path: str) -> Tuple[str, str, str]:
         scene_id = self._sequence_dir(sample_path).name
+        return scene_id, "cam00_img", "cam00"
+
+
+class SdgImageConditionDataset(BaseImageConditionDataset):
+    """
+    Wan2.1/wan2.2 单视角 SDG（vipe 输出）数据集。
+    """
+
+    dataset_name = "sdg"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pose_cache: Dict[str, np.ndarray] = {}
+        self._intr_cache: Dict[str, np.ndarray] = {}
+
+    @staticmethod
+    def _base_id(sample_path: str) -> str:
+        name = Path(sample_path).name
+        # 兼容 .mp4.tensors.pth / .wan22.tensors.pth
+        return re.sub(r"\.mp4.*$", "", name)
+
+
+    def _load_camera_sequence(self, sample_path: str, num_frames: int) -> np.ndarray:
+        base_id = self._base_id(sample_path)
+        pose_path = Path(sample_path).parent.parent / "pose" / f"{base_id}.npz"
+        pose_key = pose_path.as_posix()
+        if pose_key not in self._pose_cache:
+            if not pose_path.exists():
+                raise FileNotFoundError(f"缺少 pose 文件: {pose_path}")
+            pose_npz = np.load(pose_path)
+            poses = pose_npz.get("data")
+            if poses is None:
+                raise KeyError(f"{pose_path} 中未找到 'data' 键。")
+            if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+                raise ValueError(f"pose 形状异常，期望 [N,4,4]，得到 {poses.shape} ({pose_path})")
+            self._pose_cache[pose_key] = poses.astype(np.float32)
+        poses = self._pose_cache[pose_key]
+        indices = _select_temporal_indices(len(poses), num_frames)
+        selected = [poses[idx] for idx in indices]
+        return np.stack(selected, axis=0)
+
+
+    def _load_intrinsics_for_sample(self, sample_path: str, num_frames: int) -> torch.Tensor:
+        base_id = self._base_id(sample_path)
+        intr_path = Path(sample_path).parent.parent / "intrinsics" / f"{base_id}.npz"
+        intr_key = intr_path.as_posix()
+        if intr_key not in self._intr_cache:
+            if not intr_path.exists():
+                raise FileNotFoundError(f"缺少 intrinsics 文件: {intr_path}")
+            intr_npz = np.load(intr_path)
+            intr = intr_npz.get("data")
+            if intr is None:
+                raise KeyError(f"{intr_path} 中未找到 'data' 键。")
+            if intr.ndim != 2 or intr.shape[1] != 4:
+                raise ValueError(f"intrinsics 形状异常，期望 [N,4]，得到 {intr.shape} ({intr_path})")
+            self._intr_cache[intr_key] = intr.astype(np.float32)
+        intr = self._intr_cache[intr_key]
+        indices = _select_temporal_indices(len(intr), num_frames)
+        selected = intr[indices]
+        # 将原始 1280x720 (cx≈640, cy≈360) 标定值缩放到目标分辨率 (self.image_size)
+        target_w, target_h = self.image_size
+        base_cx, base_cy = float(selected[0, 2]), float(selected[0, 3])
+        orig_w = max(base_cx * 2.0, 1e-6)
+        orig_h = max(base_cy * 2.0, 1e-6)
+        scale_x = float(target_w) / orig_w
+        scale_y = float(target_h) / orig_h
+        Ks = []
+        for fx, fy, cx, cy in selected:
+            Ks.append(
+                [
+                    [fx * scale_x, 0.0, cx * scale_x],
+                    [0.0, fy * scale_y, cy * scale_y],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+        return torch.from_numpy(np.stack(Ks, axis=0)).to(torch.float32)
+
+    def _resolve_ids(self, sample_path: str) -> Tuple[str, str, str]:
+        scene_id = self._base_id(sample_path)
         return scene_id, "cam00_img", "cam00"
 
 
@@ -740,6 +807,7 @@ def _collect_paths_from_metadata(
     metadata_path: str,
     tensor_suffixes: Tuple[str, ...],
     dataset_root: Optional[str] = None,
+    skip_exists_check: bool = False,
 ) -> List[str]:
     metadata = pd.read_csv(metadata_path)
     if "video_absolute_path" not in metadata.columns:
@@ -748,13 +816,19 @@ def _collect_paths_from_metadata(
     missing = []
     for p in metadata["video_absolute_path"]:
         tp = resolve_tensor_path(p, dataset_root=dataset_root, tensor_suffixes=tensor_suffixes)
-        if tp and os.path.exists(tp):
+        if not tp:
+            missing.append(tp or p)
+            continue
+        if skip_exists_check:
+            all_paths.append(tp)
+            continue
+        if os.path.exists(tp):
             all_paths.append(tp)
         else:
             if len(missing) < 20:
                 print(f"Warning: missing tensor file: {tp or p}")
             missing.append(tp or p)
-    if missing:
+    if missing and not skip_exists_check:
         print(f"Warning: {len(missing)} tensor files listed in {metadata_path} were not found on disk.")
     return sorted(all_paths)
 
@@ -787,14 +861,37 @@ def _collect_rel10k_paths_from_fs(root: str, tensor_suffixes: Tuple[str, ...]) -
     return sorted(tensor_files)
 
 
-def _gather_paths_for_spec(spec: DatasetSpec, tensor_suffixes: Tuple[str, ...]) -> List[str]:
+def _gather_paths_for_spec(
+    spec: DatasetSpec,
+    tensor_suffixes: Tuple[str, ...],
+    skip_exists_check: bool = False,
+) -> List[str]:
     if spec.name == "multicam":
         if not spec.metadata_path:
             raise ValueError("MultiCam 数据集需要提供对应的 metadata CSV。")
-        return _collect_paths_from_metadata(spec.metadata_path, tensor_suffixes, dataset_root=spec.root)
+        return _collect_paths_from_metadata(
+            spec.metadata_path,
+            tensor_suffixes,
+            dataset_root=spec.root,
+            skip_exists_check=skip_exists_check,
+        )
+    if spec.name == "sdg":
+        if not spec.metadata_path:
+            raise ValueError("SDG 数据集需要提供对应的 metadata CSV。")
+        return _collect_paths_from_metadata(
+            spec.metadata_path,
+            tensor_suffixes,
+            dataset_root=spec.root,
+            skip_exists_check=skip_exists_check,
+        )
     if spec.name == "rel10k":
         if spec.metadata_path:
-            return _collect_paths_from_metadata(spec.metadata_path, tensor_suffixes, dataset_root=spec.root)
+            return _collect_paths_from_metadata(
+                spec.metadata_path,
+                tensor_suffixes,
+                dataset_root=spec.root,
+                skip_exists_check=skip_exists_check,
+            )
         return _collect_rel10k_paths_from_fs(spec.root, tensor_suffixes)
     raise ValueError(f"Unsupported dataset type '{spec.name}'.")
 
@@ -878,6 +975,7 @@ def create_datasets(
     dataset_registry = {
         "multicam": MulticamImageConditionDataset,
         "rel10k": RelEstate10kImageConditionDataset,
+        "sdg": SdgImageConditionDataset,
     }
     train_subsets: List[BaseImageConditionDataset] = []
     val_subsets: List[BaseImageConditionDataset] = []

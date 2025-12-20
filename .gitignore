@@ -20,7 +20,10 @@ metadata_all.csv
 wandb/
 .venv/
 clean_empty_experiments.py
-
+data_check/
+debug_coord/
 training_log
 evaluation/example_eval/
 evaluation/v2v_eval/
+evaluation/i2v_eval/
+evaluation/top30error/

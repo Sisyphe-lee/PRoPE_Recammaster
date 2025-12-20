@@ -1,0 +1,13 @@
+bash scripts/train.sh \
+  -y i2v \
+  -S sdg \
+  -s /nas/datasets/vipe_wild_sdg_1m \
+  -m metadata/output_sdg.csv \
+  -u wan21 \
+  -w exp13e \
+  -b 4 \
+  -c "2,3,4,5,6,7" \
+  -g 92 \
+  -v 12 \
+  -i 200 \
+  -t 0.0

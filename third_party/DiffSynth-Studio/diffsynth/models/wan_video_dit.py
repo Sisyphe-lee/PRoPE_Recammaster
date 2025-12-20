@@ -307,7 +307,6 @@ class  PRoPE_SelfAttention(nn.Module):
         *,
         mask_first_head_fraction: float = 1,
         t_highfreq_ratio: float = 0.0,
-        prpe_meta=None,
         **kwargs,
     ):
         q = self.norm_q(self.q(x))
@@ -333,21 +332,24 @@ class  PRoPE_SelfAttention(nn.Module):
             if Ks is not None:
                 Ks = Ks.to(dtype=target_dtype, device=target_device)
 
+            patches_x = kwargs.get("patches_x", 52)
+            patches_y = kwargs.get("patches_y", 30)
+
             apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
                 head_dim=self.head_dim,
                 viewmats=viewmats,
                 Ks=Ks,
-                patches_x=52,
-                patches_y=30,
-                image_width=832,
-                image_height=480,
+                patches_x=patches_x,
+                patches_y=patches_y,
+                image_width=int(DEFAULT_IMAGE_WIDTH),
+                image_height=int(DEFAULT_IMAGE_HEIGHT),
                 num_heads=self.num_heads,
                 head_fraction=mask_first_head_fraction,
                 t_highfreq_ratio=t_highfreq_ratio,
                 
             )
             
-            # Apply PRoPE transforms
+            # Apply PRoPE transforms    
             q = apply_fn_q(q)
             k = apply_fn_kv(k)
             # v = apply_fn_kv(v)
@@ -447,7 +449,9 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
 
         # Extract per-forward overrides from kwargs (e.g., t_highfreq_ratio)
-        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.0)
+        t_highfreq_ratio = _kwargs.get("t_highfreq_ratio", 0.5)
+        if isinstance(t_highfreq_ratio, (tuple, list)):
+            t_highfreq_ratio = float(t_highfreq_ratio[0]) if len(t_highfreq_ratio) > 0 else 0.0
         use_prpe = (cam_emb is not None) and (t_highfreq_ratio > 0)
 
         if use_prpe:
@@ -477,6 +481,10 @@ class DiTBlock(nn.Module):
                 input_x, freqs, viewmats, Ks,
                 t_highfreq_ratio=t_highfreq_ratio,
                 prpe_meta=prpe_meta,
+                patches_x=_kwargs.get("patches_x"),
+                patches_y=_kwargs.get("patches_y"),
+                image_width=_kwargs.get("image_width"),
+                image_height=_kwargs.get("image_height"),
             )
             x = self.gate(x, gate_msa, attn_out)
         except RuntimeError as e:
@@ -694,6 +702,11 @@ class WanModel(torch.nn.Module):
         kwargs_with_grid = dict(kwargs)
         kwargs_with_grid.setdefault("grid_size", grid_size)
         kwargs_with_grid.setdefault("cam_emb", cam_emb)
+        # PRoPE 需要基于 patch 网格的尺寸；默认 patch_size=(1,2,2) 时 h,w 即 30x52。
+        kwargs_with_grid.setdefault("patches_y", h)
+        kwargs_with_grid.setdefault("patches_x", w)
+        kwargs_with_grid.setdefault("image_height", kwargs.get("image_height", DEFAULT_IMAGE_HEIGHT))
+        kwargs_with_grid.setdefault("image_width", kwargs.get("image_width", DEFAULT_IMAGE_WIDTH))
 
         # Build RoPE freqs with real temporal indices
         if temporal_indices is not None:
@@ -733,7 +746,7 @@ class WanModel(torch.nn.Module):
                             use_reentrant=False,
                         )
                 else:
-                    x = block(x, context, t_mod, freqs, cam_emb=cam_emb)
+                    x = block(x, context, t_mod, freqs, **kwargs_with_grid)
             except RuntimeError as e:
                 # Augment CUDA OOM with layer index and rank information
                 msg = str(e)

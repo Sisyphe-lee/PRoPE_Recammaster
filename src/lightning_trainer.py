@@ -50,6 +50,7 @@ class LightningModelForTrain(pl.LightningModule):
         use_physical_index=False,
         pipeline_type="v2v",
         val_guidance_scale=None,
+        val_save_limit: Optional[int] = None,
         ckpt_type: Optional[str] = None,
     ): 
         super().__init__()
@@ -63,6 +64,7 @@ class LightningModelForTrain(pl.LightningModule):
         self.frame_downsample_to = frame_downsample_to
         self.use_real_temporal_indices = use_real_temporal_indices
         self.use_physical_index = use_physical_index
+        self.val_save_limit = int(val_save_limit) if val_save_limit and val_save_limit > 0 else None
         self.pipeline_type = pipeline_type
         self.text_encoder_path = text_encoder_path
         inferred_tokenizer_path = self._infer_tokenizer_path(text_encoder_path)
@@ -458,22 +460,31 @@ class LightningModelForTrain(pl.LightningModule):
         )
 
         batch_psnr_values = []
-        for sample_result in sample_results:
+        should_save = bool(getattr(self.trainer, "is_global_zero", self.global_rank == 0))
+        for sample_idx, sample_result in enumerate(sample_results):
             psnr_value = float(sample_result.get("psnr", 0.0))
             video_frames = sample_result.get("combined_frames", [])
             metadata = dict(sample_result.get("metadata", {}))
             metadata["batch_idx"] = int(batch_idx)
-            batch_psnr_values.append(psnr_value)
+            metadata["sample_idx"] = int(metadata.get("sample_idx", sample_idx))
 
-            combined_path = os.path.abspath(
-                self.save_video_with_naming(video_frames, metadata, video_type="val")
-            )
+            batch_psnr_values.append(psnr_value)
 
             if not hasattr(self, "_val_psnr_sum"):
                 self._val_psnr_sum = 0.0
                 self._val_count = 0
             self._val_psnr_sum += psnr_value
             self._val_count += 1
+
+            if not should_save:
+                continue
+            if self.val_save_limit is not None and getattr(self, "_val_saved", 0) >= self.val_save_limit:
+                continue
+
+            combined_path = os.path.abspath(
+                self.save_video_with_naming(video_frames, metadata, video_type="val")
+            )
+            self._val_saved = getattr(self, "_val_saved", 0) + 1
 
             sample_idx = metadata.get("sample_idx", 0)
             print(
@@ -774,6 +785,7 @@ class LightningModelForTrain(pl.LightningModule):
         # Reset accumulators
         self._val_psnr_sum = 0.0
         self._val_count = 0
+        self._val_saved = 0
         
     def on_validation_epoch_end(self):
         # Log average PSNR across the validation set

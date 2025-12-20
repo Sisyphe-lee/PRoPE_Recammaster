@@ -100,15 +100,43 @@ class Re10kSampleInfo:
 ### 需要先解析rel10k的数据格式，TODO.md有详写
 
 class TextVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
+    def __init__(
+        self,
+        base_path,
+        metadata_path,
+        max_num_frames=81,
+        frame_interval=1,
+        num_frames=81,
+        height=480,
+        width=832,
+        is_i2v=False,
+        tensor_suffix=".tensors.pth",
+        skip_existing=True,
+    ):
         metadata = pd.read_csv(metadata_path)
         raw_paths = metadata["video_absolute_path"].tolist()
-        self.path = [
-            p if os.path.isabs(p) else os.path.join(base_path, p)
-            for p in raw_paths
-        ]
-        self.text = metadata["caption"].to_list()
-        
+        raw_texts = metadata["caption"].to_list()
+
+        self.tensor_suffix = tensor_suffix
+        self.skip_existing = skip_existing
+        self.path: List[str] = []
+        self.text: List[str] = []
+        skipped = 0
+
+        for path_value, caption in zip(raw_paths, raw_texts):
+            abs_path = path_value if os.path.isabs(path_value) else os.path.join(base_path, path_value)
+            latent_path = abs_path + self.tensor_suffix
+            if self.skip_existing and os.path.exists(latent_path):
+                skipped += 1
+                continue
+            self.path.append(abs_path)
+            self.text.append(caption)
+
+        if self.skip_existing:
+            print(f"[multicam] 待处理样本: {len(self.path)} (已跳过 {skipped} 个已有缓存)")
+        if len(self.path) == 0:
+            raise ValueError("没有可处理的样本，检查 metadata 是否为空或全部已缓存（可用 --no_resume 重新生成）。")
+
         self.max_num_frames = max_num_frames
         self.frame_interval = frame_interval
         self.num_frames = num_frames
@@ -183,6 +211,9 @@ class TextVideoDataset(torch.utils.data.Dataset):
             try:
                 text = self.text[data_id]
                 path = self.path[data_id]
+                latent_path = path + self.tensor_suffix
+                if self.skip_existing and os.path.exists(latent_path):
+                    return {"text": "", "video": torch.empty(0), "path": path, "skip": True}
                 if self.is_image(path):
                     if self.is_i2v:
                         raise ValueError(f"{path} is not a video. I2V model doesn't support image-to-image training.")
@@ -452,6 +483,13 @@ class LightningModelForDataProcess(pl.LightningModule):
         video = batch["video"]
 
         self.pipe.device = self.device
+        skip_flag = batch.get("skip", False)
+        if isinstance(skip_flag, torch.Tensor):
+            skip_flag = bool(skip_flag.item())
+        if skip_flag or video is None or (isinstance(video, torch.Tensor) and video.numel() == 0):
+            tensor_path = path_value + self.tensor_suffix
+            print(f"File {tensor_path} already exists, skipping (late check).")
+            return
         if video is not None:
             tensor_path = path_value + self.tensor_suffix
             Path(tensor_path).parent.mkdir(parents=True, exist_ok=True)
@@ -843,6 +881,8 @@ def data_process(args):
             height=args.height,
             width=args.width,
             is_i2v=args.pipeline_type == "i2v",
+            tensor_suffix=tensor_suffix,
+            skip_existing=not args.no_resume,
         )
     else:
         if args.re10k_output_path is None:
