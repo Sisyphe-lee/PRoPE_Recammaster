@@ -6,7 +6,7 @@ Wan-AI
 
 # Folders with results and models
 GTA_result/
-models/
+/models/
 latents_debug/
 results/
 result/
