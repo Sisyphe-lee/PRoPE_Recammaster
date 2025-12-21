@@ -1,10 +1,11 @@
 # Change Log
-## v0.2.19 @codex - 2025-12-20
+## v0.2.21 @codex - 2025-12-20
 
 ### 新增
 - 统一推理拆成 registry（`base_handler.py`/`pipeline_loader.py`/`v2v_handler.py`/`i2v_handler.py`），新增 SDG I2V 数据集、可选 `--i2v_ckpt_type`，`inference_unified.py`/`scripts/inference_unified.sh` 支持 dataset_option 透传、默认 25 步并按时间戳落盘。
 - VAE 抽取管线支持跳过已缓存样本与 `--no_resume` 重新生成，`TextVideoDataset` 会返回 skip 标记且 Lightning 数据处理器提前退出；`scripts/extract_vae.sh` 默认更多 dataloader worker 并调整 GPU 预设。
 - 姿态评估脚本补充时间戳容差、静态序列可只算旋转误差、Top-K 误差 CSV 与视频拷贝（`evaluation/evaluate_with_evo.py`、`evaluation/top30error`），使用示例同步更新。
+- `tools/visualize/visualize_compare_trajectories.py` 重写为 viser 交互版，可按同名轨迹对加载 A/B 视锥并贴视频帧，支持平移 log 缩放、视锥/坐标轴缩放、点击视角跳转；`trajectory_viz_utils.py`/`visualize.md` 同步增补坐标轴重排、示例与配色说明。
 - 新增 JSON→NPZ 相机转换脚本移至 `tools/convert_camera_json_to_npz.py`，`tools/visualize/visualize.md`、`tools/viser_check.py` 增补示例与可视化开关。
 
 ### 变更

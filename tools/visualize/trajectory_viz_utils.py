@@ -15,22 +15,33 @@ from pytorch3d.renderer import PerspectiveCameras
 from pytorch3d.vis.plotly_vis import plot_scene
 
 
-def _normalize_c2w_matrix(mat: np.ndarray) -> np.ndarray:
+def reorder_c2w_axes(c2w: np.ndarray) -> np.ndarray:
     """
-    Convert RayDiffusion-style camera extrinsics to the PyTorch3D convention.
+    Remap axes: X_new=Y_old, Y_new=Z_old, Z_new=X_old; keep translation aligned.
+    """
+    c2w = np.asarray(c2w, dtype=float)
+    if c2w.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 matrix, got shape {c2w.shape}")
 
-    The source data encodes c2w transforms with axes ordered as (Z, X, Y) and
-    translations in centimetres. We reorder axes to (X, Y, Z), flip the Y axis
-    to match the expected handedness, and convert translations to metres.
+    # c2w = c2w[:, [1, 2, 0, 3]].copy()
+    # c2w = c2w[[1, 2, 0, 3], :]
+    c2w[:3, 1] *= -1.0
+    c2w[1, :3] *= -1.0
+    c2w[1, 3] *= -1.0
+    return c2w
+
+
+def _normalize_c2w_matrix(mat: np.ndarray, reorder_axes: bool = False) -> np.ndarray:
+    """
+    Optionally reorder camera extrinsics to match the expected coordinate system.
     """
     mat = np.asarray(mat, dtype=float)
     if mat.shape != (4, 4):
         raise ValueError(f"Expected 4x4 matrix, got shape {mat.shape}")
 
-    converted = mat[:, [1, 2, 0, 3]].copy()
-    converted[:3, 1] *= -1.0
-    converted[:3, 3] /= 100.0
-    return converted
+    if reorder_axes:
+        return reorder_c2w_axes(mat)
+    return mat.copy()
 
 
 def _recompute_T_from_positions(traj_entry: Dict[str, np.ndarray]) -> None:
@@ -70,7 +81,7 @@ def anchor_trajectories_at_origin(trajectories: Dict) -> None:
         _recompute_T_from_positions(traj)
 
 
-def parse_transformation_matrix(matrix_str: str) -> np.ndarray:
+def parse_transformation_matrix(matrix_str: str, reorder_axes: bool = False) -> np.ndarray:
     parts = matrix_str.strip().split('] ')
     cols = []
     for chunk in parts:
@@ -80,7 +91,7 @@ def parse_transformation_matrix(matrix_str: str) -> np.ndarray:
         values = [float(x) for x in chunk.split() if x]
         cols.append(values)
     mat = np.array(cols, dtype=float).T
-    return _normalize_c2w_matrix(mat)
+    return _normalize_c2w_matrix(mat, reorder_axes=reorder_axes)
 
 
 def extract_camera_pose(c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -92,19 +103,19 @@ def extract_camera_pose(c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.nda
     return R_p3d, T_p3d, pos, Rcw
 
 
-def load_trajectory_data(path: str) -> Dict:
+def load_trajectory_data(path: str, reorder_axes: bool = False) -> Dict:
     if os.path.isdir(path):
-        return _load_npz_directory(path)
+        return _load_npz_directory(path, reorder_axes=reorder_axes)
 
     ext = os.path.splitext(path)[1].lower()
     if ext == '.json':
-        return _load_json_trajectories(path)
+        return _load_json_trajectories(path, reorder_axes=reorder_axes)
     if ext == '.npz':
-        return _load_npz_trajectory(path)
+        return _load_npz_trajectory(path, reorder_axes=reorder_axes)
     raise ValueError(f"Unsupported trajectory format: {path}")
 
 
-def _load_json_trajectories(json_file: str) -> Dict:
+def _load_json_trajectories(json_file: str, reorder_axes: bool = False) -> Dict:
     with open(json_file, 'r') as f:
         data = json.load(f)
     trajectories: Dict[str, Dict[str, np.ndarray]] = {}
@@ -115,7 +126,7 @@ def _load_json_trajectories(json_file: str) -> Dict:
     for frame_name, frame_data in data.items():
         frame_idx = int(frame_name.replace('frame', ''))
         for cam_name, matrix_str in frame_data.items():
-            c2w = parse_transformation_matrix(matrix_str)
+            c2w = parse_transformation_matrix(matrix_str, reorder_axes=reorder_axes)
             R_p3d, T_p3d, pos, Rcw = extract_camera_pose(c2w)
             trajectories[cam_name]['R_p3d'].append(R_p3d)
             trajectories[cam_name]['T_p3d'].append(T_p3d)
@@ -128,7 +139,7 @@ def _load_json_trajectories(json_file: str) -> Dict:
     return trajectories
 
 
-def _load_npz_trajectory(npz_file: str) -> Dict:
+def _load_npz_trajectory(npz_file: str, reorder_axes: bool = False) -> Dict:
     with np.load(npz_file) as data:
         matrices = data['data']
         frame_indices = data['inds'] if 'inds' in data else np.arange(len(matrices))
@@ -137,7 +148,7 @@ def _load_npz_trajectory(npz_file: str) -> Dict:
     trajectory = {'R_p3d': [], 'T_p3d': [], 'pos': [], 'Rcw': [], 'frames': []}
 
     for mat, frame_idx in zip(matrices, frame_indices):
-        c2w = _normalize_c2w_matrix(mat)
+        c2w = _normalize_c2w_matrix(mat, reorder_axes=reorder_axes)
         R_p3d, T_p3d, pos, Rcw = extract_camera_pose(c2w)
         trajectory['R_p3d'].append(R_p3d)
         trajectory['T_p3d'].append(T_p3d)
@@ -157,7 +168,7 @@ def _load_npz_trajectory(npz_file: str) -> Dict:
     return {traj_name: trajectory}
 
 
-def _load_npz_directory(npz_dir: str) -> Dict:
+def _load_npz_directory(npz_dir: str, reorder_axes: bool = False) -> Dict:
     trajectories: Dict[str, Dict] = {}
     npz_files = sorted(
         [
@@ -171,7 +182,7 @@ def _load_npz_directory(npz_dir: str) -> Dict:
         raise ValueError(f"No .npz files found in directory: {npz_dir}")
 
     for npz_path in npz_files:
-        traj_dict = _load_npz_trajectory(npz_path)
+        traj_dict = _load_npz_trajectory(npz_path, reorder_axes=reorder_axes)
         overlap = set(traj_dict.keys()).intersection(trajectories.keys())
         if overlap:
             raise ValueError(f"Duplicate trajectory names detected: {overlap}")
